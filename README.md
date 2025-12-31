@@ -1,9 +1,9 @@
 # Tmux Deck
-tmux-deck is a tmux session manager.
+tmux-deck is a tmux session manager. 
+Monitoring multi session Realtime preview.
 
 # Features
-- ⚡ Fast
-- 🗂️ Tmux Session Management (New, Rename, Kill)
+- 🗂️ Tmux Session Management(New, Rename, Kill)
 - 👀 Realtime Preview
 - ⚙️ Easy Configure
 
