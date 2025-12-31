@@ -1,0 +1,11 @@
+[package]
+name = "tmux-deck"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.30"
+ansi-to-tui = "8"
+clap = { version = "4", features = ["derive"] }
+color-eyre = "0.6"
+crossterm = "0.29"
