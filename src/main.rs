@@ -1,3 +1,6 @@
+mod cli;
+
+use cli::Cli;
 use std::io;
 use std::process::Command;
 use std::time::Duration;
@@ -192,47 +195,46 @@ impl App {
                 ])
                 .output();
 
-            if let Ok(output) = windows_output {
-                if output.status.success() {
-                    let windows_str = String::from_utf8_lossy(&output.stdout);
-                    for window_line in windows_str.lines() {
-                        let w_parts: Vec<&str> = window_line.split(':').collect();
-                        if w_parts.len() >= 2 {
-                            let window_index: u32 = w_parts[0].parse().unwrap_or(0);
-                            let window_name = w_parts[1].to_string();
+            if let Ok(output) = windows_output
+                && output.status.success()
+            {
+                let windows_str = String::from_utf8_lossy(&output.stdout);
+                for window_line in windows_str.lines() {
+                    let w_parts: Vec<&str> = window_line.split(':').collect();
+                    if w_parts.len() >= 2 {
+                        let window_index: u32 = w_parts[0].parse().unwrap_or(0);
+                        let window_name = w_parts[1].to_string();
 
-                            // Get panes for this window
-                            let panes_output = Command::new("tmux")
-                                .args([
-                                    "list-panes",
-                                    "-t",
-                                    &format!("{}:{}", session_name, window_index),
-                                    "-F",
-                                    "#{pane_id}:#{pane_index}:#{pane_width}:#{pane_height}:#{pane_active}:#{pane_current_command}",
-                                ])
-                                .output();
-
-                            if let Ok(p_output) = panes_output {
-                                if p_output.status.success() {
-                                    let panes_str = String::from_utf8_lossy(&p_output.stdout);
-                                    for pane_line in panes_str.lines() {
-                                        let p_parts: Vec<&str> = pane_line.split(':').collect();
-                                        if p_parts.len() >= 6 {
-                                            let pane = PaneInfo {
-                                                session_name: session_name.to_string(),
-                                                window_index,
-                                                window_name: window_name.clone(),
-                                                pane_index: p_parts[1].parse().unwrap_or(0),
-                                                pane_id: p_parts[0].to_string(),
-                                                width: p_parts[2].parse().unwrap_or(80),
-                                                height: p_parts[3].parse().unwrap_or(24),
-                                                active: p_parts[4] == "1",
-                                                current_command: p_parts[5].to_string(),
-                                                content: String::new(),
-                                            };
-                                            self.panes.push(pane);
-                                        }
-                                    }
+                        // Get panes for this window
+                        let panes_output = Command::new("tmux")
+                            .args([
+                                "list-panes",
+                                "-t",
+                                &format!("{}:{}", session_name, window_index),
+                                "-F",
+                                "#{pane_id}:#{pane_index}:#{pane_width}:#{pane_height}:#{pane_active}:#{pane_current_command}",
+                            ])
+                            .output();
+                        if let Ok(p_output) = panes_output
+                            && p_output.status.success()
+                        {
+                            let panes_str = String::from_utf8_lossy(&p_output.stdout);
+                            for pane_line in panes_str.lines() {
+                                let p_parts: Vec<&str> = pane_line.split(':').collect();
+                                if p_parts.len() >= 6 {
+                                    let pane = PaneInfo {
+                                        session_name: session_name.to_string(),
+                                        window_index,
+                                        window_name: window_name.clone(),
+                                        pane_index: p_parts[1].parse().unwrap_or(0),
+                                        pane_id: p_parts[0].to_string(),
+                                        width: p_parts[2].parse().unwrap_or(80),
+                                        height: p_parts[3].parse().unwrap_or(24),
+                                        active: p_parts[4] == "1",
+                                        current_command: p_parts[5].to_string(),
+                                        content: String::new(),
+                                    };
+                                    self.panes.push(pane);
                                 }
                             }
                         }
@@ -247,10 +249,10 @@ impl App {
                 .args(["capture-pane", "-e", "-p", "-J", "-t", &pane.target()])
                 .output();
 
-            if let Ok(output) = result {
-                if output.status.success() {
-                    pane.content = String::from_utf8_lossy(&output.stdout).to_string();
-                }
+            if let Ok(output) = result
+                && output.status.success()
+            {
+                pane.content = String::from_utf8_lossy(&output.stdout).to_string();
             }
         }
 
@@ -431,13 +433,14 @@ fn shrink_styled_content<'a>(
 
 fn main() -> Result<()> {
     color_eyre::install()?;
+    let cmd = Cli::parse_with_color()?;
 
     // Initialize terminal
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    let mut app = App::new(200);
+    let mut app = App::new(cmd.interval);
     app.refresh_all();
     let result = run_app(&mut terminal, &mut app);
 
@@ -457,42 +460,42 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
 
         // Handle input with timeout for refresh
         if event::poll(app.interval)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match app.mode {
-                        AppMode::Normal => match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                            KeyCode::Char('r') => app.refresh_all(),
-                            KeyCode::Up | KeyCode::Char('k') => app.move_up(),
-                            KeyCode::Down | KeyCode::Char('j') => app.move_down(),
-                            KeyCode::Left | KeyCode::Char('h') => app.move_left(),
-                            KeyCode::Right | KeyCode::Char('l') => app.move_right(),
-                            KeyCode::Char('+') | KeyCode::Char('=') => app.increase_columns(),
-                            KeyCode::Char('-') | KeyCode::Char('_') => app.decrease_columns(),
-                            KeyCode::Char('i') => app.enter_input_mode(),
-                            KeyCode::Enter => {
-                                // Switch to selected pane
-                                if let Some(pane) = app.panes.get(app.selected) {
-                                    let _ = Command::new("tmux")
-                                        .args(["switch-client", "-t", &pane.target()])
-                                        .output();
-                                }
+            if let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                match app.mode {
+                    AppMode::Normal => match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('r') => app.refresh_all(),
+                        KeyCode::Up | KeyCode::Char('k') => app.move_up(),
+                        KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+                        KeyCode::Left | KeyCode::Char('h') => app.move_left(),
+                        KeyCode::Right | KeyCode::Char('l') => app.move_right(),
+                        KeyCode::Char('+') | KeyCode::Char('=') => app.increase_columns(),
+                        KeyCode::Char('-') | KeyCode::Char('_') => app.decrease_columns(),
+                        KeyCode::Char('i') => app.enter_input_mode(),
+                        KeyCode::Enter => {
+                            // Switch to selected pane
+                            if let Some(pane) = app.panes.get(app.selected) {
+                                let _ = Command::new("tmux")
+                                    .args(["switch-client", "-t", &pane.target()])
+                                    .output();
                             }
-                            _ => {}
-                        },
-                        AppMode::Input => match key.code {
-                            KeyCode::Esc => app.exit_input_mode(),
-                            KeyCode::Enter => app.send_input_to_pane(),
-                            KeyCode::Backspace => app.input_backspace(),
-                            KeyCode::Delete => app.input_delete(),
-                            KeyCode::Left => app.input_move_left(),
-                            KeyCode::Right => app.input_move_right(),
-                            KeyCode::Home => app.input_move_home(),
-                            KeyCode::End => app.input_move_end(),
-                            KeyCode::Char(c) => app.input_char(c),
-                            _ => {}
-                        },
-                    }
+                        }
+                        _ => {}
+                    },
+                    AppMode::Input => match key.code {
+                        KeyCode::Esc => app.exit_input_mode(),
+                        KeyCode::Enter => app.send_input_to_pane(),
+                        KeyCode::Backspace => app.input_backspace(),
+                        KeyCode::Delete => app.input_delete(),
+                        KeyCode::Left => app.input_move_left(),
+                        KeyCode::Right => app.input_move_right(),
+                        KeyCode::Home => app.input_move_home(),
+                        KeyCode::End => app.input_move_end(),
+                        KeyCode::Char(c) => app.input_char(c),
+                        _ => {}
+                    },
                 }
             }
         } else {
@@ -515,7 +518,8 @@ fn render_ui(frame: &mut Frame, app: &App) {
 
     // Calculate grid layout
     let columns = app.columns;
-    let rows = (app.panes.len() + columns - 1) / columns;
+    let var_name = app.panes.len() + columns - 1;
+    let rows = var_name / columns;
 
     if rows == 0 || app.panes.is_empty() {
         let block = Block::default()
@@ -559,7 +563,7 @@ fn render_ui(frame: &mut Frame, app: &App) {
         let selected_info = app
             .panes
             .get(app.selected)
-            .map(|p| format!("{}", p.target()))
+            .map(|p| p.target().to_string())
             .unwrap_or_else(|| "None".to_string());
 
         Line::from(vec![
@@ -601,7 +605,8 @@ fn render_ui(frame: &mut Frame, app: &App) {
 
 fn render_input_popup(frame: &mut Frame, app: &App, area: Rect) {
     // Calculate popup size and position (centered)
-    let popup_width = (area.width * 70 / 100).min(80).max(40);
+    // let popup_width = (area.width * 70 / 100).min(80).max(40);
+    let popup_width = (area.width * 70 / 100).clamp(80, 40);
     let popup_height = 7;
 
     let popup_x = (area.width.saturating_sub(popup_width)) / 2;
