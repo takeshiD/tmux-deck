@@ -9,7 +9,7 @@ use ansi_to_tui::IntoText;
 use color_eyre::Result;
 use crossterm::{
     ExecutableCommand,
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
@@ -94,6 +94,17 @@ enum InputMode {
     Input,
 }
 
+/// Popup mode for session operations
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PopupMode {
+    /// Creating a new session
+    NewSession,
+    /// Renaming the selected session
+    RenameSession,
+    /// Confirming session kill
+    ConfirmKill,
+}
+
 // =============================================================================
 // Application State
 // =============================================================================
@@ -126,6 +137,10 @@ struct App {
     input_mode: InputMode,
     input_buffer: String,
     input_cursor: usize,
+
+    // Popup state
+    popup_mode: Option<PopupMode>,
+    confirm_yes_selected: bool,
 }
 
 impl App {
@@ -152,6 +167,9 @@ impl App {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             input_cursor: 0,
+
+            popup_mode: None,
+            confirm_yes_selected: false,
         };
         app.session_list_state.select(Some(0));
         app.window_list_state.select(Some(0));
@@ -271,6 +289,126 @@ impl App {
 
     fn input_move_end(&mut self) {
         self.input_cursor = self.input_buffer.len();
+    }
+
+    // =========================================================================
+    // Session Operations (Popup)
+    // =========================================================================
+
+    fn open_new_session_popup(&mut self) {
+        self.popup_mode = Some(PopupMode::NewSession);
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+    }
+
+    fn open_rename_session_popup(&mut self) {
+        if let Some(session) = self.sessions.get(self.selected_session) {
+            self.popup_mode = Some(PopupMode::RenameSession);
+            self.input_buffer = session.name.clone();
+            self.input_cursor = self.input_buffer.len();
+        }
+    }
+
+    fn open_kill_session_popup(&mut self) {
+        if !self.sessions.is_empty() {
+            self.popup_mode = Some(PopupMode::ConfirmKill);
+            self.confirm_yes_selected = false; // Default to No
+        }
+    }
+
+    fn close_popup(&mut self) {
+        self.popup_mode = None;
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+        self.confirm_yes_selected = false;
+    }
+
+    fn confirm_new_session(&mut self) {
+        let session_name = self.input_buffer.trim().to_string();
+        if !session_name.is_empty() {
+            let result = Command::new("tmux")
+                .args(["new-session", "-d", "-s", &session_name])
+                .output();
+
+            match result {
+                Ok(output) => {
+                    if output.status.success() {
+                        self.refresh_all();
+                        // Select the new session
+                        if let Some(idx) = self.sessions.iter().position(|s| s.name == session_name) {
+                            self.selected_session = idx;
+                            self.session_list_state.select(Some(idx));
+                        }
+                    } else {
+                        self.last_error = Some(String::from_utf8_lossy(&output.stderr).to_string());
+                    }
+                }
+                Err(e) => {
+                    self.last_error = Some(format!("Failed to create session: {}", e));
+                }
+            }
+        }
+        self.close_popup();
+    }
+
+    fn confirm_rename_session(&mut self) {
+        let new_name = self.input_buffer.trim().to_string();
+        if !new_name.is_empty() {
+            if let Some(session) = self.sessions.get(self.selected_session) {
+                let old_name = session.name.clone();
+                let result = Command::new("tmux")
+                    .args(["rename-session", "-t", &old_name, &new_name])
+                    .output();
+
+                match result {
+                    Ok(output) => {
+                        if output.status.success() {
+                            self.refresh_all();
+                        } else {
+                            self.last_error = Some(String::from_utf8_lossy(&output.stderr).to_string());
+                        }
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Failed to rename session: {}", e));
+                    }
+                }
+            }
+        }
+        self.close_popup();
+    }
+
+    fn confirm_kill_session(&mut self) {
+        if self.confirm_yes_selected {
+            if let Some(session) = self.sessions.get(self.selected_session) {
+                let session_name = session.name.clone();
+                let result = Command::new("tmux")
+                    .args(["kill-session", "-t", &session_name])
+                    .output();
+
+                match result {
+                    Ok(output) => {
+                        if output.status.success() {
+                            self.refresh_all();
+                            // Adjust selection if needed
+                            if !self.sessions.is_empty() {
+                                self.selected_session = self.selected_session.min(self.sessions.len().saturating_sub(1));
+                                self.session_list_state.select(Some(self.selected_session));
+                            }
+                        } else {
+                            self.last_error = Some(String::from_utf8_lossy(&output.stderr).to_string());
+                        }
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Failed to kill session: {}", e));
+                    }
+                }
+            }
+        }
+        self.close_popup();
+    }
+
+    fn toggle_confirm_selection(&mut self) {
+        self.confirm_yes_selected = !self.confirm_yes_selected;
     }
 
     // =========================================================================
@@ -771,39 +909,96 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         if event::poll(app.interval)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    // Handle popup mode first
+                    if let Some(popup_mode) = app.popup_mode {
+                        match popup_mode {
+                            PopupMode::NewSession | PopupMode::RenameSession => {
+                                match key.code {
+                                    KeyCode::Esc => app.close_popup(),
+                                    KeyCode::Enter => {
+                                        if popup_mode == PopupMode::NewSession {
+                                            app.confirm_new_session();
+                                        } else {
+                                            app.confirm_rename_session();
+                                        }
+                                    }
+                                    KeyCode::Backspace => app.input_backspace(),
+                                    KeyCode::Delete => app.input_delete(),
+                                    KeyCode::Left => app.input_move_left(),
+                                    KeyCode::Right => app.input_move_right(),
+                                    KeyCode::Home => app.input_move_home(),
+                                    KeyCode::End => app.input_move_end(),
+                                    KeyCode::Char(c) => app.input_char(c),
+                                    _ => {}
+                                }
+                            }
+                            PopupMode::ConfirmKill => {
+                                match key.code {
+                                    KeyCode::Esc => app.close_popup(),
+                                    KeyCode::Enter => app.confirm_kill_session(),
+                                    KeyCode::Left | KeyCode::Right | KeyCode::Tab |
+                                    KeyCode::Char('h') | KeyCode::Char('l') |
+                                    KeyCode::Char('y') | KeyCode::Char('n') => {
+                                        if matches!(key.code, KeyCode::Char('y')) {
+                                            app.confirm_yes_selected = true;
+                                        } else if matches!(key.code, KeyCode::Char('n')) {
+                                            app.confirm_yes_selected = false;
+                                        } else {
+                                            app.toggle_confirm_selection();
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
                     match app.input_mode {
                         InputMode::Normal => {
-                            match key.code {
-                                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                                KeyCode::Char('r') => app.refresh_all(),
-                                KeyCode::Char(' ') => {
-                                    app.handle_space_press();
+                            // Check for Ctrl key modifiers
+                            let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+                            if is_ctrl {
+                                match key.code {
+                                    KeyCode::Char('n') => app.open_new_session_popup(),
+                                    KeyCode::Char('r') => app.open_rename_session_popup(),
+                                    KeyCode::Char('x') => app.open_kill_session_popup(),
+                                    _ => {}
                                 }
-                                KeyCode::Char('i') => app.enter_input_mode(),
-                                KeyCode::Enter => {
-                                    if app.switch_to_selected_pane() {
-                                        return Ok(());
+                            } else {
+                                match key.code {
+                                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                                    KeyCode::Char('r') => app.refresh_all(),
+                                    KeyCode::Char(' ') => {
+                                        app.handle_space_press();
                                     }
-                                }
-                                _ => {
-                                    // View-specific key handling
-                                    match app.view_mode {
-                                        ViewMode::TreeView => match key.code {
-                                            KeyCode::Up | KeyCode::Char('k') => app.tree_move_up(),
-                                            KeyCode::Down | KeyCode::Char('j') => app.tree_move_down(),
-                                            KeyCode::Tab => app.tree_next_focus(),
-                                            KeyCode::BackTab => app.tree_prev_focus(),
-                                            KeyCode::Left | KeyCode::Char('h') => app.tree_prev_focus(),
-                                            KeyCode::Right | KeyCode::Char('l') => app.tree_next_focus(),
-                                            _ => {}
-                                        },
-                                        ViewMode::MultiPreview => match key.code {
-                                            KeyCode::Up | KeyCode::Char('k') => app.multi_move_up(),
-                                            KeyCode::Down | KeyCode::Char('j') => app.multi_move_down(),
-                                            KeyCode::Left | KeyCode::Char('h') => app.multi_move_left(),
-                                            KeyCode::Right | KeyCode::Char('l') => app.multi_move_right(),
-                                            _ => {}
-                                        },
+                                    KeyCode::Char('i') => app.enter_input_mode(),
+                                    KeyCode::Enter => {
+                                        if app.switch_to_selected_pane() {
+                                            return Ok(());
+                                        }
+                                    }
+                                    _ => {
+                                        // View-specific key handling
+                                        match app.view_mode {
+                                            ViewMode::TreeView => match key.code {
+                                                KeyCode::Up | KeyCode::Char('k') => app.tree_move_up(),
+                                                KeyCode::Down | KeyCode::Char('j') => app.tree_move_down(),
+                                                KeyCode::Tab => app.tree_next_focus(),
+                                                KeyCode::BackTab => app.tree_prev_focus(),
+                                                KeyCode::Left | KeyCode::Char('h') => app.tree_prev_focus(),
+                                                KeyCode::Right | KeyCode::Char('l') => app.tree_next_focus(),
+                                                _ => {}
+                                            },
+                                            ViewMode::MultiPreview => match key.code {
+                                                KeyCode::Up | KeyCode::Char('k') => app.multi_move_up(),
+                                                KeyCode::Down | KeyCode::Char('j') => app.multi_move_down(),
+                                                KeyCode::Left | KeyCode::Char('h') => app.multi_move_left(),
+                                                KeyCode::Right | KeyCode::Char('l') => app.multi_move_right(),
+                                                _ => {}
+                                            },
+                                        }
                                     }
                                 }
                             }
@@ -825,7 +1020,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
             }
         } else {
             // Periodic refresh
-            if app.input_mode == InputMode::Normal {
+            if app.input_mode == InputMode::Normal && app.popup_mode.is_none() {
                 app.refresh_all();
             }
         }
@@ -845,6 +1040,15 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     // Render input popup if in input mode
     if app.input_mode == InputMode::Input {
         render_input_popup(frame, app, frame.area());
+    }
+
+    // Render session operation popups
+    if let Some(popup_mode) = app.popup_mode {
+        match popup_mode {
+            PopupMode::NewSession => render_session_name_popup(frame, app, "New Session", "Enter session name:"),
+            PopupMode::RenameSession => render_session_name_popup(frame, app, "Rename Session", "Enter new name:"),
+            PopupMode::ConfirmKill => render_confirm_kill_popup(frame, app),
+        }
     }
 }
 
@@ -1052,12 +1256,12 @@ fn render_tree_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(":focus "),
             Span::styled("Space×2", Style::default().fg(Color::Magenta)),
             Span::raw(":multi "),
-            Span::styled("i", Style::default().fg(Color::Yellow)),
-            Span::raw(":input "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(":switch "),
-            Span::styled("r", Style::default().fg(Color::Yellow)),
-            Span::raw(":refresh "),
+            Span::styled("C-n", Style::default().fg(Color::Green)),
+            Span::raw(":new "),
+            Span::styled("C-r", Style::default().fg(Color::Green)),
+            Span::raw(":rename "),
+            Span::styled("C-x", Style::default().fg(Color::Red)),
+            Span::raw(":kill "),
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::raw(":quit"),
         ])
@@ -1169,12 +1373,12 @@ fn render_multi_preview(frame: &mut Frame, app: &App) {
             Span::raw(":window "),
             Span::styled("Space×2", Style::default().fg(Color::Magenta)),
             Span::raw(":tree "),
-            Span::styled("i", Style::default().fg(Color::Yellow)),
-            Span::raw(":input "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(":switch "),
-            Span::styled("r", Style::default().fg(Color::Yellow)),
-            Span::raw(":refresh "),
+            Span::styled("C-n", Style::default().fg(Color::Green)),
+            Span::raw(":new "),
+            Span::styled("C-r", Style::default().fg(Color::Green)),
+            Span::raw(":rename "),
+            Span::styled("C-x", Style::default().fg(Color::Red)),
+            Span::raw(":kill "),
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::raw(":quit "),
             Span::raw("| "),
@@ -1303,4 +1507,152 @@ fn render_input_popup(frame: &mut Frame, app: &App, area: Rect) {
         .wrap(Wrap { trim: false });
 
     frame.render_widget(input_paragraph, input_area);
+}
+
+// -----------------------------------------------------------------------------
+// Session Operation Popups
+// -----------------------------------------------------------------------------
+
+fn render_session_name_popup(frame: &mut Frame, app: &App, title: &str, label: &str) {
+    let area = frame.area();
+    let popup_width = (area.width * 60 / 100).clamp(40, 70);
+    let popup_height = 7;
+
+    let popup_x = (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" {} ", title))
+        .title_bottom(Line::from(" Enter:confirm | Esc:cancel ").centered());
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let input_chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+
+    let label_widget = Paragraph::new(label).style(Style::default().fg(Color::White));
+    frame.render_widget(label_widget, input_chunks[0]);
+
+    let input_area = input_chunks[2];
+
+    // Render input with cursor
+    let before_cursor = &app.input_buffer[..app.input_cursor];
+    let cursor_char = app
+        .input_buffer
+        .chars()
+        .nth(app.input_cursor)
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| " ".to_string());
+    let after_cursor = if app.input_cursor < app.input_buffer.len() {
+        &app.input_buffer[app.input_cursor + cursor_char.len()..]
+    } else {
+        ""
+    };
+
+    let input_text = Line::from(vec![
+        Span::raw(before_cursor),
+        Span::styled(
+            cursor_char,
+            Style::default().bg(Color::White).fg(Color::Black),
+        ),
+        Span::raw(after_cursor),
+    ]);
+
+    let input_paragraph = Paragraph::new(input_text)
+        .style(Style::default().fg(Color::White).bg(Color::DarkGray))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(input_paragraph, input_area);
+}
+
+fn render_confirm_kill_popup(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let popup_width = (area.width * 50 / 100).clamp(40, 60);
+    let popup_height = 7;
+
+    let popup_x = (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    let session_name = app
+        .sessions
+        .get(app.selected_session)
+        .map(|s| s.name.as_str())
+        .unwrap_or("?");
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Kill Session ")
+        .title_bottom(Line::from(" Enter:confirm | Esc:cancel ").centered());
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let content_chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+
+    // Question text
+    let question = Paragraph::new(format!("Kill session '{}'?", session_name))
+        .style(Style::default().fg(Color::White))
+        .alignment(Alignment::Center);
+    frame.render_widget(question, content_chunks[0]);
+
+    // Yes/No buttons
+    let button_area = content_chunks[2];
+    let button_chunks = Layout::horizontal([
+        Constraint::Percentage(50),
+        Constraint::Percentage(50),
+    ])
+    .split(button_area);
+
+    let yes_style = if app.confirm_yes_selected {
+        Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let no_style = if !app.confirm_yes_selected {
+        Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let yes_button = Paragraph::new(" [Y]es ")
+        .style(yes_style)
+        .alignment(Alignment::Center);
+    let no_button = Paragraph::new(" [N]o ")
+        .style(no_style)
+        .alignment(Alignment::Center);
+
+    frame.render_widget(yes_button, button_chunks[0]);
+    frame.render_widget(no_button, button_chunks[1]);
 }
