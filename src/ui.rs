@@ -402,13 +402,13 @@ fn render_multi_preview(frame: &mut Frame, app: &App) {
         } else {
             let other_count = app.sessions.len() - 1;
             // Each non-selected session gets an equal share of 20%
-            let other_percentage = 20 / other_count as u16;
+            let other_percentage = 30 / other_count as u16;
             app.sessions
                 .iter()
                 .enumerate()
                 .map(|(idx, _)| {
                     if idx == app.multi_session {
-                        Constraint::Percentage(80)
+                        Constraint::Percentage(70)
                     } else {
                         Constraint::Percentage(other_percentage.max(1))
                     }
