@@ -396,11 +396,25 @@ fn render_multi_preview(frame: &mut Frame, app: &App) {
         frame.render_widget(block, preview_area);
     } else {
         // Create horizontal layout for sessions
-        let session_constraints: Vec<Constraint> = app
-            .sessions
-            .iter()
-            .map(|_| Constraint::Ratio(1, app.sessions.len() as u32))
-            .collect();
+        // Selected session gets 80%, others share 20%
+        let session_constraints: Vec<Constraint> = if app.sessions.len() == 1 {
+            vec![Constraint::Percentage(100)]
+        } else {
+            let other_count = app.sessions.len() - 1;
+            // Each non-selected session gets an equal share of 20%
+            let other_percentage = 20 / other_count as u16;
+            app.sessions
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| {
+                    if idx == app.multi_session {
+                        Constraint::Percentage(80)
+                    } else {
+                        Constraint::Percentage(other_percentage.max(1))
+                    }
+                })
+                .collect()
+        };
 
         let session_chunks = Layout::horizontal(session_constraints).split(preview_area);
 
