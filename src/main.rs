@@ -3,7 +3,7 @@ mod cli;
 use cli::Cli;
 use std::io;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use color_eyre::Result;
@@ -14,98 +14,216 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-/// A character with its associated style
+// =============================================================================
+// Data Structures
+// =============================================================================
+
+/// A character with its associated style (for ANSI rendering)
 #[derive(Clone, Default)]
 struct StyledChar {
     ch: char,
     style: Style,
 }
 
-/// Represents a tmux pane with its content
+/// Represents a tmux pane
 #[derive(Debug, Clone)]
-struct PaneInfo {
-    session_name: String,
-    window_index: u32,
-    window_name: String,
-    pane_index: u32,
-    pane_id: String,
+struct TmuxPane {
+    id: String,
+    index: u32,
     width: u32,
     height: u32,
     active: bool,
     current_command: String,
+}
+
+/// Represents a tmux window with captured content
+#[derive(Debug, Clone)]
+struct TmuxWindow {
+    index: u32,
+    name: String,
+    active: bool,
+    panes: Vec<TmuxPane>,
+    /// Captured content of the active pane (for preview)
     content: String,
+    /// Width of the active pane
+    pane_width: u32,
+    /// Height of the active pane
+    pane_height: u32,
 }
 
-impl PaneInfo {
-    fn target(&self) -> String {
-        format!(
-            "{}:{}.{}",
-            self.session_name, self.window_index, self.pane_index
-        )
-    }
-
-    fn title(&self) -> String {
-        format!(
-            "{}:{} [{}] {}",
-            self.session_name, self.window_name, self.pane_index, self.current_command
-        )
+impl TmuxWindow {
+    fn get_active_pane(&self) -> Option<&TmuxPane> {
+        self.panes.iter().find(|p| p.active).or(self.panes.first())
     }
 }
 
-/// Application mode
+/// Represents a tmux session
+#[derive(Debug, Clone)]
+struct TmuxSession {
+    name: String,
+    attached: bool,
+    windows: Vec<TmuxWindow>,
+}
+
+// =============================================================================
+// Enums
+// =============================================================================
+
+/// Main view mode
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum AppMode {
+enum ViewMode {
+    TreeView,
+    MultiPreview,
+}
+
+/// Focus area in TreeView mode
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Focus {
+    Sessions,
+    Windows,
+    Panes,
+}
+
+/// Application input mode
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum InputMode {
     Normal,
     Input,
 }
 
-/// Application state
+// =============================================================================
+// Application State
+// =============================================================================
+
 struct App {
-    panes: Vec<PaneInfo>,
-    selected: usize,
-    interval: Duration,
+    // View mode
+    view_mode: ViewMode,
+
+    // Space key tracking for double-press
+    last_space_press: Option<Instant>,
+
+    // TreeView state
+    sessions: Vec<TmuxSession>,
+    selected_session: usize,
+    selected_window: usize,
+    selected_pane: usize,
+    focus: Focus,
+    session_list_state: ListState,
+    window_list_state: ListState,
+    pane_list_state: ListState,
+
+    // MultiPreview state (session_idx, window_idx)
+    multi_session: usize,
+    multi_window: usize,
+
+    // Shared state
+    pane_content: String,
     last_error: Option<String>,
-    columns: usize,
-    mode: AppMode,
+    interval: Duration,
+    input_mode: InputMode,
     input_buffer: String,
     input_cursor: usize,
 }
 
 impl App {
     fn new(interval_ms: u64) -> Self {
-        Self {
-            panes: Vec::new(),
-            selected: 0,
-            interval: Duration::from_millis(interval_ms),
+        let mut app = Self {
+            view_mode: ViewMode::TreeView,
+            last_space_press: None,
+
+            sessions: Vec::new(),
+            selected_session: 0,
+            selected_window: 0,
+            selected_pane: 0,
+            focus: Focus::Sessions,
+            session_list_state: ListState::default(),
+            window_list_state: ListState::default(),
+            pane_list_state: ListState::default(),
+
+            multi_session: 0,
+            multi_window: 0,
+
+            pane_content: String::new(),
             last_error: None,
-            columns: 2, // Default to 2 columns
-            mode: AppMode::Normal,
+            interval: Duration::from_millis(interval_ms),
+            input_mode: InputMode::Normal,
             input_buffer: String::new(),
             input_cursor: 0,
-        }
+        };
+        app.session_list_state.select(Some(0));
+        app.window_list_state.select(Some(0));
+        app.pane_list_state.select(Some(0));
+        app
     }
 
+    // =========================================================================
+    // View Mode Switching
+    // =========================================================================
+
+    fn handle_space_press(&mut self) -> bool {
+        let now = Instant::now();
+        if let Some(last) = self.last_space_press {
+            if now.duration_since(last) < Duration::from_millis(300) {
+                // Double space detected
+                self.toggle_view_mode();
+                self.last_space_press = None;
+                return true;
+            }
+        }
+        self.last_space_press = Some(now);
+        false
+    }
+
+    fn toggle_view_mode(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::TreeView => {
+                // Sync multi selection with tree selection
+                self.multi_session = self.selected_session;
+                self.multi_window = self.selected_window;
+                ViewMode::MultiPreview
+            }
+            ViewMode::MultiPreview => {
+                // Sync tree selection with multi selection
+                self.selected_session = self.multi_session;
+                self.selected_window = self.multi_window;
+                self.selected_pane = 0;
+                self.session_list_state.select(Some(self.selected_session));
+                self.window_list_state.select(Some(self.selected_window));
+                self.pane_list_state.select(Some(0));
+                ViewMode::TreeView
+            }
+        };
+    }
+
+    // =========================================================================
+    // Input Mode
+    // =========================================================================
+
     fn enter_input_mode(&mut self) {
-        self.mode = AppMode::Input;
+        self.input_mode = InputMode::Input;
         self.input_buffer.clear();
         self.input_cursor = 0;
     }
 
     fn exit_input_mode(&mut self) {
-        self.mode = AppMode::Normal;
+        self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
         self.input_cursor = 0;
     }
 
-    fn send_input_to_pane(&mut self) {
-        if let Some(pane) = self.panes.get(self.selected) {
-            let target = pane.target();
-            let message = self.input_buffer.clone();
+    fn get_current_target(&self) -> Option<String> {
+        match self.view_mode {
+            ViewMode::TreeView => self.get_selected_pane_target(),
+            ViewMode::MultiPreview => self.get_multi_selected_target(),
+        }
+    }
 
-            // Send the message to the pane using tmux send-keys
+    fn send_input_to_pane(&mut self) {
+        if let Some(target) = self.get_current_target() {
+            let message = self.input_buffer.clone();
             let result = Command::new("tmux")
                 .args(["send-keys", "-t", &target, &message, "Enter"])
                 .output();
@@ -155,13 +273,20 @@ impl App {
         self.input_cursor = self.input_buffer.len();
     }
 
-    /// Refresh all pane information and content
+    // =========================================================================
+    // Data Refresh
+    // =========================================================================
+
     fn refresh_all(&mut self) {
-        self.panes.clear();
+        self.sessions.clear();
 
         // Get all sessions
         let sessions_output = Command::new("tmux")
-            .args(["list-sessions", "-F", "#{session_name}"])
+            .args([
+                "list-sessions",
+                "-F",
+                "#{session_name}:#{session_attached}",
+            ])
             .output();
 
         let sessions_str = match sessions_output {
@@ -178,133 +303,325 @@ impl App {
             }
         };
 
-        for session_name in sessions_str.lines() {
-            let session_name = session_name.trim();
-            if session_name.is_empty() {
-                continue;
-            }
+        for session_line in sessions_str.lines() {
+            let parts: Vec<&str> = session_line.split(':').collect();
+            if parts.len() >= 2 {
+                let session_name = parts[0].to_string();
+                let attached = parts[1] == "1";
 
-            // Get windows for this session
-            let windows_output = Command::new("tmux")
-                .args([
-                    "list-windows",
-                    "-t",
-                    session_name,
-                    "-F",
-                    "#{window_index}:#{window_name}",
-                ])
-                .output();
+                let mut session = TmuxSession {
+                    name: session_name.clone(),
+                    attached,
+                    windows: Vec::new(),
+                };
 
-            if let Ok(output) = windows_output
-                && output.status.success()
-            {
-                let windows_str = String::from_utf8_lossy(&output.stdout);
-                for window_line in windows_str.lines() {
-                    let w_parts: Vec<&str> = window_line.split(':').collect();
-                    if w_parts.len() >= 2 {
-                        let window_index: u32 = w_parts[0].parse().unwrap_or(0);
-                        let window_name = w_parts[1].to_string();
+                // Get windows for this session
+                let windows_output = Command::new("tmux")
+                    .args([
+                        "list-windows",
+                        "-t",
+                        &session_name,
+                        "-F",
+                        "#{window_index}:#{window_name}:#{window_active}",
+                    ])
+                    .output();
 
-                        // Get panes for this window
-                        let panes_output = Command::new("tmux")
-                            .args([
-                                "list-panes",
-                                "-t",
-                                &format!("{}:{}", session_name, window_index),
-                                "-F",
-                                "#{pane_id}:#{pane_index}:#{pane_width}:#{pane_height}:#{pane_active}:#{pane_current_command}",
-                            ])
-                            .output();
-                        if let Ok(p_output) = panes_output
-                            && p_output.status.success()
-                        {
-                            let panes_str = String::from_utf8_lossy(&p_output.stdout);
-                            for pane_line in panes_str.lines() {
-                                let p_parts: Vec<&str> = pane_line.split(':').collect();
-                                if p_parts.len() >= 6 {
-                                    let pane = PaneInfo {
-                                        session_name: session_name.to_string(),
-                                        window_index,
-                                        window_name: window_name.clone(),
-                                        pane_index: p_parts[1].parse().unwrap_or(0),
-                                        pane_id: p_parts[0].to_string(),
-                                        width: p_parts[2].parse().unwrap_or(80),
-                                        height: p_parts[3].parse().unwrap_or(24),
-                                        active: p_parts[4] == "1",
-                                        current_command: p_parts[5].to_string(),
-                                        content: String::new(),
-                                    };
-                                    self.panes.push(pane);
+                if let Ok(output) = windows_output {
+                    if output.status.success() {
+                        let windows_str = String::from_utf8_lossy(&output.stdout);
+                        for window_line in windows_str.lines() {
+                            let w_parts: Vec<&str> = window_line.split(':').collect();
+                            if w_parts.len() >= 3 {
+                                let window_index: u32 = w_parts[0].parse().unwrap_or(0);
+                                let window_name = w_parts[1].to_string();
+                                let window_active = w_parts[2] == "1";
+
+                                let mut window = TmuxWindow {
+                                    index: window_index,
+                                    name: window_name,
+                                    active: window_active,
+                                    panes: Vec::new(),
+                                    content: String::new(),
+                                    pane_width: 80,
+                                    pane_height: 24,
+                                };
+
+                                // Get panes for this window
+                                let panes_output = Command::new("tmux")
+                                    .args([
+                                        "list-panes",
+                                        "-t",
+                                        &format!("{}:{}", session_name, window_index),
+                                        "-F",
+                                        "#{pane_id}:#{pane_index}:#{pane_width}:#{pane_height}:#{pane_active}:#{pane_current_command}",
+                                    ])
+                                    .output();
+
+                                if let Ok(p_output) = panes_output {
+                                    if p_output.status.success() {
+                                        let panes_str = String::from_utf8_lossy(&p_output.stdout);
+                                        for pane_line in panes_str.lines() {
+                                            let p_parts: Vec<&str> = pane_line.split(':').collect();
+                                            if p_parts.len() >= 6 {
+                                                let pane_id = p_parts[0].to_string();
+                                                let pane_index: u32 = p_parts[1].parse().unwrap_or(0);
+                                                let width: u32 = p_parts[2].parse().unwrap_or(80);
+                                                let height: u32 = p_parts[3].parse().unwrap_or(24);
+                                                let pane_active = p_parts[4] == "1";
+                                                let current_command = p_parts[5].to_string();
+
+                                                let pane = TmuxPane {
+                                                    id: pane_id,
+                                                    index: pane_index,
+                                                    width,
+                                                    height,
+                                                    active: pane_active,
+                                                    current_command,
+                                                };
+
+                                                // Store active pane dimensions
+                                                if pane_active {
+                                                    window.pane_width = width;
+                                                    window.pane_height = height;
+                                                }
+
+                                                window.panes.push(pane);
+                                            }
+                                        }
+                                    }
                                 }
+
+                                // Capture content of active pane for this window
+                                let target = format!("{}:{}", session_name, window_index);
+                                if let Ok(output) = Command::new("tmux")
+                                    .args(["capture-pane", "-e", "-p", "-J", "-t", &target])
+                                    .output()
+                                {
+                                    if output.status.success() {
+                                        window.content = String::from_utf8_lossy(&output.stdout).to_string();
+                                    }
+                                }
+
+                                session.windows.push(window);
                             }
                         }
                     }
                 }
-            }
-        }
 
-        // Capture content for all panes
-        for pane in &mut self.panes {
-            let result = Command::new("tmux")
-                .args(["capture-pane", "-e", "-p", "-J", "-t", &pane.target()])
-                .output();
-
-            if let Ok(output) = result
-                && output.status.success()
-            {
-                pane.content = String::from_utf8_lossy(&output.stdout).to_string();
+                self.sessions.push(session);
             }
         }
 
         // Ensure selection is valid
-        if !self.panes.is_empty() {
-            self.selected = self.selected.min(self.panes.len() - 1);
-        }
-
+        self.validate_selections();
         self.last_error = None;
     }
 
-    fn move_selection(&mut self, delta: isize) {
-        if self.panes.is_empty() {
-            return;
-        }
-        let len = self.panes.len() as isize;
-        let new_idx = (self.selected as isize + delta).rem_euclid(len);
-        self.selected = new_idx as usize;
-    }
+    fn validate_selections(&mut self) {
+        if !self.sessions.is_empty() {
+            self.selected_session = self.selected_session.min(self.sessions.len() - 1);
+            self.multi_session = self.multi_session.min(self.sessions.len() - 1);
 
-    fn move_up(&mut self) {
-        self.move_selection(-(self.columns as isize));
-    }
+            if let Some(session) = self.sessions.get(self.selected_session) {
+                if !session.windows.is_empty() {
+                    self.selected_window = self.selected_window.min(session.windows.len() - 1);
+                    if let Some(window) = session.windows.get(self.selected_window) {
+                        if !window.panes.is_empty() {
+                            self.selected_pane = self.selected_pane.min(window.panes.len() - 1);
+                        }
+                    }
+                }
+            }
 
-    fn move_down(&mut self) {
-        self.move_selection(self.columns as isize);
-    }
-
-    fn move_left(&mut self) {
-        self.move_selection(-1);
-    }
-
-    fn move_right(&mut self) {
-        self.move_selection(1);
-    }
-
-    fn increase_columns(&mut self) {
-        if self.columns < 6 {
-            self.columns += 1;
+            if let Some(session) = self.sessions.get(self.multi_session) {
+                if !session.windows.is_empty() {
+                    self.multi_window = self.multi_window.min(session.windows.len() - 1);
+                }
+            }
         }
     }
 
-    fn decrease_columns(&mut self) {
-        if self.columns > 1 {
-            self.columns -= 1;
+    // =========================================================================
+    // TreeView Navigation
+    // =========================================================================
+
+    fn get_selected_pane_target(&self) -> Option<String> {
+        let session = self.sessions.get(self.selected_session)?;
+        let window = session.windows.get(self.selected_window)?;
+        let pane = window.panes.get(self.selected_pane)?;
+        Some(format!("{}:{}.{}", session.name, window.index, pane.index))
+    }
+
+    fn capture_selected_pane(&mut self) {
+        if let Some(target) = self.get_selected_pane_target() {
+            let result = Command::new("tmux")
+                .args(["capture-pane", "-e", "-p", "-J", "-t", &target])
+                .output();
+
+            match result {
+                Ok(output) => {
+                    if output.status.success() {
+                        self.pane_content = String::from_utf8_lossy(&output.stdout).to_string();
+                    } else {
+                        self.pane_content = format!(
+                            "Error capturing pane: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                }
+                Err(e) => {
+                    self.pane_content = format!("Failed to capture pane: {}", e);
+                }
+            }
+        } else {
+            self.pane_content = "No pane selected".to_string();
         }
+    }
+
+    fn tree_move_up(&mut self) {
+        match self.focus {
+            Focus::Sessions => {
+                if self.selected_session > 0 {
+                    self.selected_session -= 1;
+                    self.selected_window = 0;
+                    self.selected_pane = 0;
+                    self.window_list_state.select(Some(0));
+                    self.pane_list_state.select(Some(0));
+                }
+                self.session_list_state.select(Some(self.selected_session));
+            }
+            Focus::Windows => {
+                if self.selected_window > 0 {
+                    self.selected_window -= 1;
+                    self.selected_pane = 0;
+                    self.pane_list_state.select(Some(0));
+                }
+                self.window_list_state.select(Some(self.selected_window));
+            }
+            Focus::Panes => {
+                if self.selected_pane > 0 {
+                    self.selected_pane -= 1;
+                }
+                self.pane_list_state.select(Some(self.selected_pane));
+            }
+        }
+    }
+
+    fn tree_move_down(&mut self) {
+        match self.focus {
+            Focus::Sessions => {
+                if self.selected_session < self.sessions.len().saturating_sub(1) {
+                    self.selected_session += 1;
+                    self.selected_window = 0;
+                    self.selected_pane = 0;
+                    self.window_list_state.select(Some(0));
+                    self.pane_list_state.select(Some(0));
+                }
+                self.session_list_state.select(Some(self.selected_session));
+            }
+            Focus::Windows => {
+                if let Some(session) = self.sessions.get(self.selected_session) {
+                    if self.selected_window < session.windows.len().saturating_sub(1) {
+                        self.selected_window += 1;
+                        self.selected_pane = 0;
+                        self.pane_list_state.select(Some(0));
+                    }
+                }
+                self.window_list_state.select(Some(self.selected_window));
+            }
+            Focus::Panes => {
+                if let Some(session) = self.sessions.get(self.selected_session) {
+                    if let Some(window) = session.windows.get(self.selected_window) {
+                        if self.selected_pane < window.panes.len().saturating_sub(1) {
+                            self.selected_pane += 1;
+                        }
+                    }
+                }
+                self.pane_list_state.select(Some(self.selected_pane));
+            }
+        }
+    }
+
+    fn tree_next_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Sessions => Focus::Windows,
+            Focus::Windows => Focus::Panes,
+            Focus::Panes => Focus::Sessions,
+        };
+    }
+
+    fn tree_prev_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Sessions => Focus::Panes,
+            Focus::Windows => Focus::Sessions,
+            Focus::Panes => Focus::Windows,
+        };
+    }
+
+    // =========================================================================
+    // MultiPreview Navigation
+    // =========================================================================
+
+    fn get_multi_selected_target(&self) -> Option<String> {
+        let session = self.sessions.get(self.multi_session)?;
+        let window = session.windows.get(self.multi_window)?;
+        // Use window-level target (tmux will switch to the active pane)
+        Some(format!("{}:{}", session.name, window.index))
+    }
+
+    fn multi_move_left(&mut self) {
+        if self.multi_session > 0 {
+            self.multi_session -= 1;
+            // Reset window selection for new session
+            self.multi_window = 0;
+        }
+    }
+
+    fn multi_move_right(&mut self) {
+        if self.multi_session < self.sessions.len().saturating_sub(1) {
+            self.multi_session += 1;
+            // Reset window selection for new session
+            self.multi_window = 0;
+        }
+    }
+
+    fn multi_move_up(&mut self) {
+        if self.multi_window > 0 {
+            self.multi_window -= 1;
+        }
+    }
+
+    fn multi_move_down(&mut self) {
+        if let Some(session) = self.sessions.get(self.multi_session) {
+            if self.multi_window < session.windows.len().saturating_sub(1) {
+                self.multi_window += 1;
+            }
+        }
+    }
+
+    // =========================================================================
+    // Switch to Pane
+    // =========================================================================
+
+    /// Switch to the selected pane and return true if successful
+    fn switch_to_selected_pane(&self) -> bool {
+        if let Some(target) = self.get_current_target() {
+            if let Ok(output) = Command::new("tmux")
+                .args(["switch-client", "-t", &target])
+                .output()
+            {
+                return output.status.success();
+            }
+        }
+        false
     }
 }
 
-/// Convert ANSI content to a 2D grid of styled characters
+// =============================================================================
+// ANSI Content Processing
+// =============================================================================
+
 fn ansi_to_styled_grid(content: &str) -> Vec<Vec<StyledChar>> {
-    // Parse ANSI to ratatui Text
     let text = match content.as_bytes().into_text() {
         Ok(t) => t,
         Err(_) => {
@@ -340,9 +657,6 @@ fn ansi_to_styled_grid(content: &str) -> Vec<Vec<StyledChar>> {
     grid
 }
 
-/// Shrink styled content to fit within the given dimensions
-/// This samples lines and characters to create a thumbnail view while preserving colors
-/// Shows content from the bottom (most recent output) first
 fn shrink_styled_content<'a>(
     grid: &[Vec<StyledChar>],
     target_width: usize,
@@ -357,23 +671,16 @@ fn shrink_styled_content<'a>(
     let actual_lines = grid.len();
     let source_width = source_width as usize;
 
-    // Calculate column sampling ratio
     let col_ratio = if source_width > target_width {
         source_width as f64 / target_width as f64
     } else {
         1.0
     };
 
-    // Determine which source rows to display (from bottom)
-    // If we have fewer lines than target, show all from top
-    // If we have more lines, show the bottom portion with sampling
     let (start_row, row_ratio) = if actual_lines <= target_height {
-        // Show all lines, starting from the beginning
         (0, 1.0)
     } else {
-        // Sample from bottom portion
-        // Calculate how many source rows we need to cover
-        let rows_to_show = actual_lines.min(target_height * 2); // Show more context
+        let rows_to_show = actual_lines.min(target_height * 2);
         let start = actual_lines.saturating_sub(rows_to_show);
         let ratio = rows_to_show as f64 / target_height as f64;
         (start, ratio)
@@ -406,7 +713,6 @@ fn shrink_styled_content<'a>(
                 }
             };
 
-            // If style changes, push current span and start new one
             if styled_char.style != current_style && !current_text.is_empty() {
                 spans.push(Span::styled(current_text.clone(), current_style));
                 current_text.clear();
@@ -416,9 +722,7 @@ fn shrink_styled_content<'a>(
             current_text.push(styled_char.ch);
         }
 
-        // Push remaining text
         if !current_text.is_empty() {
-            // Trim trailing spaces from last span
             let trimmed = current_text.trim_end();
             if !trimmed.is_empty() {
                 spans.push(Span::styled(trimmed.to_string(), current_style));
@@ -431,11 +735,14 @@ fn shrink_styled_content<'a>(
     Text::from(lines)
 }
 
+// =============================================================================
+// Main
+// =============================================================================
+
 fn main() -> Result<()> {
     color_eyre::install()?;
     let cmd = Cli::parse_with_color()?;
 
-    // Initialize terminal
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -444,7 +751,6 @@ fn main() -> Result<()> {
     app.refresh_all();
     let result = run_app(&mut terminal, &mut app);
 
-    // Restore terminal
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
 
@@ -453,107 +759,399 @@ fn main() -> Result<()> {
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
-        // Draw UI
+        // Capture selected pane content for TreeView
+        if app.view_mode == ViewMode::TreeView {
+            app.capture_selected_pane();
+        }
+
         terminal.draw(|frame| {
             render_ui(frame, app);
         })?;
 
-        // Handle input with timeout for refresh
         if event::poll(app.interval)? {
-            if let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                match app.mode {
-                    AppMode::Normal => match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                        KeyCode::Char('r') => app.refresh_all(),
-                        KeyCode::Up | KeyCode::Char('k') => app.move_up(),
-                        KeyCode::Down | KeyCode::Char('j') => app.move_down(),
-                        KeyCode::Left | KeyCode::Char('h') => app.move_left(),
-                        KeyCode::Right | KeyCode::Char('l') => app.move_right(),
-                        KeyCode::Char('+') | KeyCode::Char('=') => app.increase_columns(),
-                        KeyCode::Char('-') | KeyCode::Char('_') => app.decrease_columns(),
-                        KeyCode::Char('i') => app.enter_input_mode(),
-                        KeyCode::Enter => {
-                            // Switch to selected pane
-                            if let Some(pane) = app.panes.get(app.selected) {
-                                let _ = Command::new("tmux")
-                                    .args(["switch-client", "-t", &pane.target()])
-                                    .output();
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match app.input_mode {
+                        InputMode::Normal => {
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                                KeyCode::Char('r') => app.refresh_all(),
+                                KeyCode::Char(' ') => {
+                                    app.handle_space_press();
+                                }
+                                KeyCode::Char('i') => app.enter_input_mode(),
+                                KeyCode::Enter => {
+                                    if app.switch_to_selected_pane() {
+                                        return Ok(());
+                                    }
+                                }
+                                _ => {
+                                    // View-specific key handling
+                                    match app.view_mode {
+                                        ViewMode::TreeView => match key.code {
+                                            KeyCode::Up | KeyCode::Char('k') => app.tree_move_up(),
+                                            KeyCode::Down | KeyCode::Char('j') => app.tree_move_down(),
+                                            KeyCode::Tab => app.tree_next_focus(),
+                                            KeyCode::BackTab => app.tree_prev_focus(),
+                                            KeyCode::Left | KeyCode::Char('h') => app.tree_prev_focus(),
+                                            KeyCode::Right | KeyCode::Char('l') => app.tree_next_focus(),
+                                            _ => {}
+                                        },
+                                        ViewMode::MultiPreview => match key.code {
+                                            KeyCode::Up | KeyCode::Char('k') => app.multi_move_up(),
+                                            KeyCode::Down | KeyCode::Char('j') => app.multi_move_down(),
+                                            KeyCode::Left | KeyCode::Char('h') => app.multi_move_left(),
+                                            KeyCode::Right | KeyCode::Char('l') => app.multi_move_right(),
+                                            _ => {}
+                                        },
+                                    }
+                                }
                             }
                         }
-                        _ => {}
-                    },
-                    AppMode::Input => match key.code {
-                        KeyCode::Esc => app.exit_input_mode(),
-                        KeyCode::Enter => app.send_input_to_pane(),
-                        KeyCode::Backspace => app.input_backspace(),
-                        KeyCode::Delete => app.input_delete(),
-                        KeyCode::Left => app.input_move_left(),
-                        KeyCode::Right => app.input_move_right(),
-                        KeyCode::Home => app.input_move_home(),
-                        KeyCode::End => app.input_move_end(),
-                        KeyCode::Char(c) => app.input_char(c),
-                        _ => {}
-                    },
+                        InputMode::Input => match key.code {
+                            KeyCode::Esc => app.exit_input_mode(),
+                            KeyCode::Enter => app.send_input_to_pane(),
+                            KeyCode::Backspace => app.input_backspace(),
+                            KeyCode::Delete => app.input_delete(),
+                            KeyCode::Left => app.input_move_left(),
+                            KeyCode::Right => app.input_move_right(),
+                            KeyCode::Home => app.input_move_home(),
+                            KeyCode::End => app.input_move_end(),
+                            KeyCode::Char(c) => app.input_char(c),
+                            _ => {}
+                        },
+                    }
                 }
             }
         } else {
-            // Periodic refresh (only in normal mode)
-            if app.mode == AppMode::Normal {
+            // Periodic refresh
+            if app.input_mode == InputMode::Normal {
                 app.refresh_all();
             }
         }
     }
 }
 
-fn render_ui(frame: &mut Frame, app: &App) {
+// =============================================================================
+// UI Rendering
+// =============================================================================
+
+fn render_ui(frame: &mut Frame, app: &mut App) {
+    match app.view_mode {
+        ViewMode::TreeView => render_tree_view(frame, app),
+        ViewMode::MultiPreview => render_multi_preview(frame, app),
+    }
+
+    // Render input popup if in input mode
+    if app.input_mode == InputMode::Input {
+        render_input_popup(frame, app, frame.area());
+    }
+}
+
+// -----------------------------------------------------------------------------
+// TreeView Rendering
+// -----------------------------------------------------------------------------
+
+fn render_tree_view(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
-    // Create main layout with status bar
+    // Main layout: left panel (lists) | right panel (preview)
+    let main_chunks =
+        Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
+
+    let left_panel = main_chunks[0];
+    let right_panel = main_chunks[1];
+
+    // Left panel: Sessions | Windows | Panes (vertical stack)
+    let left_chunks = Layout::vertical([
+        Constraint::Percentage(30),
+        Constraint::Percentage(35),
+        Constraint::Percentage(35),
+    ])
+    .split(left_panel);
+
+    render_sessions_list(frame, app, left_chunks[0]);
+    render_windows_list(frame, app, left_chunks[1]);
+    render_panes_list(frame, app, left_chunks[2]);
+
+    // Right panel: Preview with status bar
+    let right_chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(right_panel);
+    render_pane_preview_tree(frame, app, right_chunks[0]);
+    render_tree_status_bar(frame, app, right_chunks[1]);
+}
+
+fn render_sessions_list(frame: &mut Frame, app: &mut App, area: Rect) {
+    let is_focused = app.focus == Focus::Sessions;
+    let border_style = if is_focused {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let items: Vec<ListItem> = app
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(i, session)| {
+            let attached_marker = if session.attached { " ●" } else { "" };
+            let style = if i == app.selected_session {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            ListItem::new(format!("{}{}", session.name, attached_marker)).style(style)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(format!(" Sessions ({}) ", app.sessions.len())),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+        .highlight_symbol(if is_focused { "▶ " } else { "  " });
+
+    frame.render_stateful_widget(list, area, &mut app.session_list_state);
+}
+
+fn render_windows_list(frame: &mut Frame, app: &mut App, area: Rect) {
+    let is_focused = app.focus == Focus::Windows;
+    let border_style = if is_focused {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let empty_windows: Vec<TmuxWindow> = Vec::new();
+    let windows = app
+        .sessions
+        .get(app.selected_session)
+        .map(|s| &s.windows)
+        .unwrap_or(&empty_windows);
+
+    let items: Vec<ListItem> = windows
+        .iter()
+        .enumerate()
+        .map(|(i, window)| {
+            let active_marker = if window.active { " *" } else { "" };
+            let style = if i == app.selected_window {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            ListItem::new(format!("{}:{}{}", window.index, window.name, active_marker)).style(style)
+        })
+        .collect();
+
+    let title = app
+        .sessions
+        .get(app.selected_session)
+        .map(|s| format!(" Windows [{}] ({}) ", s.name, windows.len()))
+        .unwrap_or_else(|| " Windows ".to_string());
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(title),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+        .highlight_symbol(if is_focused { "▶ " } else { "  " });
+
+    frame.render_stateful_widget(list, area, &mut app.window_list_state);
+}
+
+fn render_panes_list(frame: &mut Frame, app: &mut App, area: Rect) {
+    let is_focused = app.focus == Focus::Panes;
+    let border_style = if is_focused {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let empty_panes: Vec<TmuxPane> = Vec::new();
+    let panes = app
+        .sessions
+        .get(app.selected_session)
+        .and_then(|s| s.windows.get(app.selected_window))
+        .map(|w| &w.panes)
+        .unwrap_or(&empty_panes);
+
+    let items: Vec<ListItem> = panes
+        .iter()
+        .enumerate()
+        .map(|(i, pane)| {
+            let active_marker = if pane.active { " *" } else { "" };
+            let style = if i == app.selected_pane {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            ListItem::new(format!(
+                "{}:{}{} [{}]",
+                pane.index, pane.id, active_marker, pane.current_command
+            ))
+            .style(style)
+        })
+        .collect();
+
+    let title = app
+        .sessions
+        .get(app.selected_session)
+        .and_then(|s| s.windows.get(app.selected_window))
+        .map(|w| format!(" Panes [{}] ({}) ", w.name, panes.len()))
+        .unwrap_or_else(|| " Panes ".to_string());
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(title),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+        .highlight_symbol(if is_focused { "▶ " } else { "  " });
+
+    frame.render_stateful_widget(list, area, &mut app.pane_list_state);
+}
+
+fn render_pane_preview_tree(frame: &mut Frame, app: &App, area: Rect) {
+    let title = app
+        .get_selected_pane_target()
+        .map(|t| format!(" Preview: {} ", t))
+        .unwrap_or_else(|| " Preview ".to_string());
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+
+    let text = match app.pane_content.as_bytes().into_text() {
+        Ok(text) => text,
+        Err(_) => Text::raw(&app.pane_content),
+    };
+
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_tree_status_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let status_text = if let Some(ref err) = app.last_error {
+        Line::from(vec![Span::styled(
+            format!(" Error: {} ", err),
+            Style::default().fg(Color::Red),
+        )])
+    } else {
+        Line::from(vec![
+            Span::styled("j/k", Style::default().fg(Color::Yellow)),
+            Span::raw(":move "),
+            Span::styled("Tab", Style::default().fg(Color::Yellow)),
+            Span::raw(":focus "),
+            Span::styled("Space×2", Style::default().fg(Color::Magenta)),
+            Span::raw(":multi "),
+            Span::styled("i", Style::default().fg(Color::Yellow)),
+            Span::raw(":input "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(":switch "),
+            Span::styled("r", Style::default().fg(Color::Yellow)),
+            Span::raw(":refresh "),
+            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::raw(":quit"),
+        ])
+    };
+
+    frame.render_widget(
+        Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray)),
+        area,
+    );
+}
+
+// -----------------------------------------------------------------------------
+// MultiPreview Rendering
+// -----------------------------------------------------------------------------
+
+fn render_multi_preview(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+
     let main_chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
 
     let preview_area = main_chunks[0];
     let status_area = main_chunks[1];
 
-    // Calculate grid layout
-    let columns = app.columns;
-    let var_name = app.panes.len() + columns - 1;
-    let rows = var_name / columns;
-
-    if rows == 0 || app.panes.is_empty() {
+    if app.sessions.is_empty() {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" No panes found ");
+            .title(" No sessions found ");
         frame.render_widget(block, preview_area);
     } else {
-        // Create row constraints
-        let row_constraints: Vec<Constraint> = (0..rows)
-            .map(|_| Constraint::Ratio(1, rows as u32))
+        // Create horizontal layout for sessions
+        let session_constraints: Vec<Constraint> = app
+            .sessions
+            .iter()
+            .map(|_| Constraint::Ratio(1, app.sessions.len() as u32))
             .collect();
 
-        let row_chunks = Layout::vertical(row_constraints).split(preview_area);
+        let session_chunks = Layout::horizontal(session_constraints).split(preview_area);
 
-        // Create column constraints
-        let col_constraints: Vec<Constraint> = (0..columns)
-            .map(|_| Constraint::Ratio(1, columns as u32))
-            .collect();
+        for (session_idx, (session, session_area)) in
+            app.sessions.iter().zip(session_chunks.iter()).enumerate()
+        {
+            let is_selected_session = session_idx == app.multi_session;
 
-        for (row_idx, row_area) in row_chunks.iter().enumerate() {
-            let col_chunks = Layout::horizontal(col_constraints.clone()).split(*row_area);
+            // Session block style
+            let session_border_style = if is_selected_session {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else if session.attached {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
 
-            for (col_idx, cell_area) in col_chunks.iter().enumerate() {
-                let pane_idx = row_idx * columns + col_idx;
+            let session_title = if session.attached {
+                format!(" {} ● ", session.name)
+            } else {
+                format!(" {} ", session.name)
+            };
 
-                if pane_idx < app.panes.len() {
-                    let pane = &app.panes[pane_idx];
-                    render_pane_preview(frame, pane, *cell_area, pane_idx == app.selected);
-                }
+            let session_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(session_border_style)
+                .title(session_title);
+
+            let inner_area = session_block.inner(*session_area);
+            frame.render_widget(session_block, *session_area);
+
+            if session.windows.is_empty() {
+                let no_windows = Paragraph::new("No windows")
+                    .style(Style::default().fg(Color::DarkGray));
+                frame.render_widget(no_windows, inner_area);
+                continue;
+            }
+
+            // Create vertical layout for windows within this session
+            let window_constraints: Vec<Constraint> = session
+                .windows
+                .iter()
+                .map(|_| Constraint::Ratio(1, session.windows.len() as u32))
+                .collect();
+
+            let window_chunks = Layout::vertical(window_constraints).split(inner_area);
+
+            for (window_idx, (window, window_area)) in
+                session.windows.iter().zip(window_chunks.iter()).enumerate()
+            {
+                let is_selected_window =
+                    is_selected_session && window_idx == app.multi_window;
+
+                render_window_preview(frame, window, *window_area, is_selected_window);
             }
         }
     }
 
-    // Render status bar
+    // Status bar
     let status_text = if let Some(ref err) = app.last_error {
         Line::from(vec![Span::styled(
             format!(" Error: {} ", err),
@@ -561,16 +1159,16 @@ fn render_ui(frame: &mut Frame, app: &App) {
         )])
     } else {
         let selected_info = app
-            .panes
-            .get(app.selected)
-            .map(|p| p.target().to_string())
+            .get_multi_selected_target()
             .unwrap_or_else(|| "None".to_string());
 
         Line::from(vec![
-            Span::styled(" ←→↑↓", Style::default().fg(Color::Yellow)),
-            Span::raw(":select "),
-            Span::styled("+/-", Style::default().fg(Color::Yellow)),
-            Span::raw(":columns "),
+            Span::styled("h/l", Style::default().fg(Color::Yellow)),
+            Span::raw(":session "),
+            Span::styled("j/k", Style::default().fg(Color::Yellow)),
+            Span::raw(":window "),
+            Span::styled("Space×2", Style::default().fg(Color::Magenta)),
+            Span::raw(":tree "),
             Span::styled("i", Style::default().fg(Color::Yellow)),
             Span::raw(":input "),
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
@@ -581,12 +1179,7 @@ fn render_ui(frame: &mut Frame, app: &App) {
             Span::raw(":quit "),
             Span::raw("| "),
             Span::styled(
-                format!(
-                    "Panes:{} Cols:{} Selected:{}",
-                    app.panes.len(),
-                    app.columns,
-                    selected_info
-                ),
+                format!("Sel:{}", selected_info),
                 Style::default().fg(Color::Cyan),
             ),
         ])
@@ -596,17 +1189,54 @@ fn render_ui(frame: &mut Frame, app: &App) {
         Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray)),
         status_area,
     );
-
-    // Render input popup if in input mode
-    if app.mode == AppMode::Input {
-        render_input_popup(frame, app, area);
-    }
 }
 
+fn render_window_preview(frame: &mut Frame, window: &TmuxWindow, area: Rect, is_selected: bool) {
+    let border_style = if is_selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if window.active {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let active_marker = if window.active { " *" } else { "" };
+    let cmd = window
+        .get_active_pane()
+        .map(|p| p.current_command.as_str())
+        .unwrap_or("");
+
+    let title = format!(" {}:{}{} [{}] ", window.index, window.name, active_marker, cmd);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+
+    let inner = block.inner(area);
+
+    let styled_grid = ansi_to_styled_grid(&window.content);
+    let shrunk_text = shrink_styled_content(
+        &styled_grid,
+        inner.width as usize,
+        inner.height as usize,
+        window.pane_width,
+        window.pane_height,
+    );
+
+    let paragraph = Paragraph::new(shrunk_text).block(block);
+
+    frame.render_widget(paragraph, area);
+}
+
+// -----------------------------------------------------------------------------
+// Input Popup
+// -----------------------------------------------------------------------------
+
 fn render_input_popup(frame: &mut Frame, app: &App, area: Rect) {
-    // Calculate popup size and position (centered)
-    // let popup_width = (area.width * 70 / 100).min(80).max(40);
-    let popup_width = (area.width * 70 / 100).clamp(80, 40);
+    let popup_width = (area.width * 70 / 100).clamp(40, 80);
     let popup_height = 7;
 
     let popup_x = (area.width.saturating_sub(popup_width)) / 2;
@@ -619,17 +1249,12 @@ fn render_input_popup(frame: &mut Frame, app: &App, area: Rect) {
         height: popup_height,
     };
 
-    // Get target pane info
     let target_info = app
-        .panes
-        .get(app.selected)
-        .map(|p| p.target())
+        .get_current_target()
         .unwrap_or_else(|| "None".to_string());
 
-    // Clear the popup area
     frame.render_widget(Clear, popup_area);
 
-    // Create the popup block
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -639,22 +1264,18 @@ fn render_input_popup(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
-    // Create input layout
     let input_chunks = Layout::vertical([
-        Constraint::Length(1), // Label
-        Constraint::Length(1), // Spacing
-        Constraint::Min(1),    // Input field
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
     ])
     .split(inner);
 
-    // Render label
     let label = Paragraph::new("Enter message:").style(Style::default().fg(Color::White));
     frame.render_widget(label, input_chunks[0]);
 
-    // Render input field with cursor
     let input_area = input_chunks[2];
 
-    // Build the input text with cursor
     let before_cursor = &app.input_buffer[..app.input_cursor];
     let cursor_char = app
         .input_buffer
@@ -682,48 +1303,4 @@ fn render_input_popup(frame: &mut Frame, app: &App, area: Rect) {
         .wrap(Wrap { trim: false });
 
     frame.render_widget(input_paragraph, input_area);
-}
-
-fn render_pane_preview(frame: &mut Frame, pane: &PaneInfo, area: Rect, is_selected: bool) {
-    let border_style = if is_selected {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else if pane.active {
-        Style::default().fg(Color::Green)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let title = if area.width > 30 {
-        format!(" {} ", pane.title())
-    } else if area.width > 15 {
-        format!(
-            " {}:{}.{} ",
-            pane.session_name, pane.window_index, pane.pane_index
-        )
-    } else {
-        format!(" {}.{} ", pane.window_index, pane.pane_index)
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(title);
-
-    let inner = block.inner(area);
-
-    // Convert ANSI to styled grid and shrink with color preservation
-    let styled_grid = ansi_to_styled_grid(&pane.content);
-    let shrunk_text = shrink_styled_content(
-        &styled_grid,
-        inner.width as usize,
-        inner.height as usize,
-        pane.width,
-        pane.height,
-    );
-
-    let paragraph = Paragraph::new(shrunk_text).block(block);
-
-    frame.render_widget(paragraph, area);
 }
