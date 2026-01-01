@@ -145,6 +145,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap-cargo"
+version = "0.18.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "936551935c8258754bb8216aec040957d261f977303754b9bf1a213518388006"
+dependencies = [
+ "anstyle",
+ "clap",
+]
+
+[[package]]
 name = "clap_builder"
 version = "4.5.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -773,10 +783,11 @@ dependencies = [
 
 [[package]]
 name = "tmux-deck"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ansi-to-tui",
  "clap",
+ "clap-cargo",
  "color-eyre",
  "crossterm",
  "ratatui",
