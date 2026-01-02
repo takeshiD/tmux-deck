@@ -2,6 +2,7 @@
 tmux-deck is a tmux session manager. 
 Monitoring multi session Realtime preview.
 
+
 # Features
 - 🗂️ Tmux Session Management(New, Rename, Kill)
 - 👀 Realtime Preview
@@ -9,6 +10,21 @@ Monitoring multi session Realtime preview.
 
 # Quick Start
 
+```bash
+tmux-deck
+```
+
+![session manager](assets/tmux-deck_session_manager.png)
+
+
+## Using in tmux popup
+Add following key-bind in your `.tmux.conf`, `tmux-deck` would start up on tmux popup.
+
+```bash
+bind SPACE run-shell "tmux popup -w80% -h80% -E tmux-deck"
+```
+
+![popup](assets/tmux-deck_popup.png)
 
 # Installation
 ## `cargo`
