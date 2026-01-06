@@ -37,20 +37,31 @@ cargo install tmux-deck
 nix run github:takeshid/tmux-deck
 ```
 
-## `npm`(Planed)
-```
-npm install -g markdown-peek
-```
-
 ## download prebuild-binary
 ```
 curl -SL https://github.com/takeshid/markdown-peek
 ```
 
 # Status
-- [ ] Session Management(New, Rename, Kill)
-- [ ] Realtime Preview
-- [ ] Multi Preview
+- [x] Session Management(New, Rename, Kill)
+    - [x] Realtime Preview
+    - [ ] Search and Filtering(fuzzy find)
+    - [ ] Saving and Restoring sessions
+    - [ ] Sort
+        - [ ] Most Recently Used
+        - [ ] Alphabet
+        - [ ] Pinning
+- [x] Multi Preview
+    - [ ] Injection command to pane
+    - [ ] Zoom preview
+    - [ ] Pinning
+- [ ] Configure
+    - [ ] Keybinding
+    - [ ] Layout
+    - [ ] Color Theme
+- Misc
+    - [ ] LLM Integration
+    - [ ] Installation for nix
 
 # License
 MIT License.
