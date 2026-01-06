@@ -1,0 +1,94 @@
+name: Release
+on:
+  push:
+    tags:
+      - "v*.*.*"
+permissions:
+  contents: write
+jobs:
+  tag-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check to match tag version and Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Tag validation"
+
+          # 1. Must be a tag and match the regex
+          [[ "${GITHUB_REF_TYPE}" == "tag" ]] \
+            || { echo "❌  Not a tag push"; exit 1; }
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta)(\.[0-9]+)?)?$ ]] \
+            || { echo "❌  Tag '${GITHUB_REF_NAME}' doesn't match expected format"; exit 1; }
+
+          # 2. Extract versions
+          tag_ver="${GITHUB_REF_NAME#v}"
+          cargo_ver="$(grep -m1 '^version' Cargo.toml \
+                        | sed -E 's/version *= *"([^"]+)".*/\1/')"
+
+          # 3. Compare
+          [[ "${tag_ver}" == "${cargo_ver}" ]] \
+            || { echo "❌  Tag ${tag_ver} ≠ Cargo.toml ${cargo_ver}"; exit 1; }
+
+          echo "✅  Tag and Cargo.toml agree (${tag_ver})"
+          echo "::endgroup::"
+  build:
+    needs: tag-check
+    name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          targets: ${{ matrix.target }}
+      - name: Run tests
+        run: cargo test --all
+      - name: Build
+        shell: bash
+        run: cargo build --target ${{ matrix.target }} --release
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          bin_name="$(cargo metadata --no-deps --format-version=1 \
+                    | jq -r '.packages[0].targets[] | select(.kind[]=="bin").name')"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            bin_file="${bin_name}".exe
+          else
+            bin_file="${bin_name}"
+          fi
+          cp target/${{ matrix.target }}/release/${bin_file} dist/
+          tar czf dist/${bin_name}-${{ matrix.target }}.tar.gz -C dist ${bin_file}
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+
+  release:
+    needs:
+      - tag-check
+      - build
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.tar.gz
