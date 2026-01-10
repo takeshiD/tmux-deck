@@ -1,3 +1,6 @@
+use std::fs::OpenOptions;
+use std::io::Write;
+
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -43,8 +46,24 @@ impl TmuxActor {
                 self.rename_session(&old_name, &new_name).await
             }
             TmuxCommand::KillSession { name } => self.kill_session(&name).await,
-            TmuxCommand::SendKeys { target, keys } => self.send_keys(&target, &keys).await,
-            TmuxCommand::SwitchClient { target } => self.switch_client(&target).await,
+            TmuxCommand::SendKeys {
+                target,
+                keys,
+                reply,
+            } => {
+                let response = self.send_keys(&target, &keys).await;
+                if let Some(tx) = reply {
+                    let _ = tx.send(response.clone());
+                }
+                response
+            }
+            TmuxCommand::SwitchClient { target, reply } => {
+                let response = self.switch_client(&target).await;
+                if let Some(tx) = reply {
+                    let _ = tx.send(response.clone());
+                }
+                response
+            }
         }
     }
 
@@ -57,7 +76,7 @@ impl TmuxActor {
             .args([
                 "list-sessions",
                 "-F",
-                "#{session_name}:#{session_attached}",
+                "#{session_name}\t#{session_attached}\t#{session_activity}",
             ])
             .output()
             .await;
@@ -81,20 +100,34 @@ impl TmuxActor {
         let mut sessions = Vec::new();
 
         for session_line in sessions_str.lines() {
-            let parts: Vec<&str> = session_line.split(':').collect();
-            if parts.len() >= 2 {
-                let session_name = parts[0].to_string();
-                let attached = parts[1] == "1";
-
-                let windows = self.get_windows(&session_name).await;
-
-                sessions.push(TmuxSession {
-                    name: session_name,
-                    attached,
-                    windows,
-                });
+            let parts: Vec<&str> = session_line.split('\t').collect();
+            if parts.len() < 3 {
+                continue;
             }
+
+            let session_name = parts[0].to_string();
+            let attached = parts[1] == "1";
+            let activity = parts[2].parse::<i64>().unwrap_or(0);
+
+            let windows = self.get_windows(&session_name).await;
+
+            sessions.push((activity, attached, session_name, windows));
         }
+
+        sessions.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+
+        let sessions = sessions
+            .into_iter()
+            .map(|(_, attached, name, windows)| TmuxSession {
+                name,
+                attached,
+                windows,
+            })
+            .collect();
 
         TmuxResponse::SessionsRefreshed { sessions }
     }
@@ -106,7 +139,7 @@ impl TmuxActor {
                 "-t",
                 session_name,
                 "-F",
-                "#{window_index}:#{window_name}:#{window_active}",
+                "#{window_index}\t#{window_name}\t#{window_active}\t#{window_activity}",
             ])
             .output()
             .await;
@@ -121,20 +154,27 @@ impl TmuxActor {
         let mut windows = Vec::new();
 
         for window_line in windows_str.lines() {
-            let w_parts: Vec<&str> = window_line.split(':').collect();
-            if w_parts.len() >= 3 {
-                let window_index: u32 = w_parts[0].parse().unwrap_or(0);
-                let window_name = w_parts[1].to_string();
-                let window_active = w_parts[2] == "1";
+            let w_parts: Vec<&str> = window_line.split('\t').collect();
+            if w_parts.len() < 4 {
+                continue;
+            }
 
-                let (panes, pane_width, pane_height) =
-                    self.get_panes(session_name, window_index).await;
+            let window_index: u32 = w_parts[0].parse().unwrap_or(0);
+            let window_name = w_parts[1].to_string();
+            let window_active = w_parts[2] == "1";
+            let window_activity = w_parts[3].parse::<i64>().unwrap_or(0);
 
-                let content = self
-                    .capture_window_content(session_name, window_index)
-                    .await;
+            let (panes, pane_width, pane_height) = self.get_panes(session_name, window_index).await;
 
-                windows.push(TmuxWindow {
+            let content = self
+                .capture_window_content(session_name, window_index)
+                .await;
+
+            windows.push((
+                window_activity,
+                window_active,
+                window_index,
+                TmuxWindow {
                     index: window_index,
                     name: window_name,
                     active: window_active,
@@ -142,11 +182,17 @@ impl TmuxActor {
                     content,
                     pane_width,
                     pane_height,
-                });
-            }
+                },
+            ));
         }
 
-        windows
+        windows.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+
+        windows.into_iter().map(|(_, _, _, w)| w).collect()
     }
 
     async fn get_panes(&self, session_name: &str, window_index: u32) -> (Vec<TmuxPane>, u32, u32) {
@@ -157,7 +203,7 @@ impl TmuxActor {
                 "-t",
                 &target,
                 "-F",
-                "#{pane_id}:#{pane_index}:#{pane_width}:#{pane_height}:#{pane_active}:#{pane_current_command}",
+                "#{pane_id}\t#{pane_index}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_last}\t#{pane_current_command}",
             ])
             .output()
             .await;
@@ -174,30 +220,46 @@ impl TmuxActor {
         let mut active_height = 24u32;
 
         for pane_line in panes_str.lines() {
-            let p_parts: Vec<&str> = pane_line.split(':').collect();
-            if p_parts.len() >= 6 {
-                let pane_id = p_parts[0].to_string();
-                let pane_index: u32 = p_parts[1].parse().unwrap_or(0);
-                let width: u32 = p_parts[2].parse().unwrap_or(80);
-                let height: u32 = p_parts[3].parse().unwrap_or(24);
-                let pane_active = p_parts[4] == "1";
-                let current_command = p_parts[5].to_string();
+            let p_parts: Vec<&str> = pane_line.split('\t').collect();
+            if p_parts.len() < 7 {
+                continue;
+            }
 
-                if pane_active {
-                    active_width = width;
-                    active_height = height;
-                }
+            let pane_id = p_parts[0].to_string();
+            let pane_index: u32 = p_parts[1].parse().unwrap_or(0);
+            let width: u32 = p_parts[2].parse().unwrap_or(80);
+            let height: u32 = p_parts[3].parse().unwrap_or(24);
+            let pane_active = p_parts[4] == "1";
+            let pane_last = p_parts[5] == "1";
+            let current_command = p_parts[6].to_string();
 
-                panes.push(TmuxPane {
+            if pane_active {
+                active_width = width;
+                active_height = height;
+            }
+
+            panes.push((
+                pane_active,
+                pane_last,
+                pane_index,
+                TmuxPane {
                     id: pane_id,
                     index: pane_index,
                     width,
                     height,
                     active: pane_active,
                     current_command,
-                });
-            }
+                },
+            ));
         }
+
+        panes.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+
+        let panes = panes.into_iter().map(|(_, _, _, p)| p).collect();
 
         (panes, active_width, active_height)
     }
@@ -341,16 +403,51 @@ impl TmuxActor {
     }
 
     async fn switch_client(&self, target: &str) -> TmuxResponse {
+        let log_path = "/tmp/tmux-deck.log";
         let output = Command::new("tmux")
             .args(["switch-client", "-t", target])
             .output()
             .await;
-
         match output {
-            Ok(output) => TmuxResponse::ClientSwitched {
-                success: output.status.success(),
-            },
-            Err(_) => TmuxResponse::ClientSwitched { success: false },
+            Ok(output) if output.status.success() => {
+                append_switch_log(log_path, target, true, None);
+                TmuxResponse::ClientSwitched {
+                    target: target.to_string(),
+                    success: true,
+                    error: None,
+                }
+            }
+            Ok(output) => {
+                let err = String::from_utf8_lossy(&output.stderr).to_string();
+                append_switch_log(log_path, target, false, Some(&err));
+                TmuxResponse::ClientSwitched {
+                    target: target.to_string(),
+                    success: false,
+                    error: Some(err),
+                }
+            }
+            Err(e) => {
+                let err = format!("Failed to switch client: {}", e);
+                append_switch_log(log_path, target, false, Some(&err));
+                TmuxResponse::ClientSwitched {
+                    target: target.to_string(),
+                    success: false,
+                    error: Some(err),
+                }
+            }
         }
     }
+}
+
+fn append_switch_log(path: &str, target: &str, success: bool, error: Option<&str>) {
+    let mut file = match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let error = error.unwrap_or("");
+    let _ = writeln!(
+        file,
+        "switch-client target=\"{}\" success={} error=\"{}\"",
+        target, success, error
+    );
 }

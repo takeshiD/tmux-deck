@@ -1,10 +1,11 @@
 use crate::app::TmuxSession;
+use tokio::sync::oneshot;
 
 // =============================================================================
 // TmuxActor Commands (UIActor/RefreshActor → TmuxActor)
 // =============================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum TmuxCommand {
     /// Refresh all sessions, windows, and panes
     RefreshAll,
@@ -22,10 +23,17 @@ pub enum TmuxCommand {
     KillSession { name: String },
 
     /// Send keys to a pane
-    SendKeys { target: String, keys: String },
+    SendKeys {
+        target: String,
+        keys: String,
+        reply: Option<oneshot::Sender<TmuxResponse>>,
+    },
 
     /// Switch client to a target
-    SwitchClient { target: String },
+    SwitchClient {
+        target: String,
+        reply: Option<oneshot::Sender<TmuxResponse>>,
+    },
 }
 
 // =============================================================================
@@ -73,7 +81,9 @@ pub enum TmuxResponse {
     /// Client switched result
     ClientSwitched {
         #[allow(dead_code)]
+        target: String,
         success: bool,
+        error: Option<String>,
     },
 
     /// Error occurred

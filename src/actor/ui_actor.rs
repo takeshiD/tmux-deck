@@ -5,7 +5,7 @@ use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::messages::{RefreshControl, TmuxCommand, TmuxResponse, UIEvent};
 use crate::app::{InputMode, PopupMode, UIState, ViewMode};
@@ -255,11 +255,16 @@ impl UIActor {
                     self.refresh_control.pause();
                 }
                 KeyCode::Enter => {
-                    if let Some(target) = self.state.get_current_target() {
+                    if let Some(target) = self.state.get_enter_target() {
+                        let (reply_tx, reply_rx) = oneshot::channel();
                         let _ = self
                             .tmux_tx
-                            .send(TmuxCommand::SwitchClient { target })
+                            .send(TmuxCommand::SwitchClient {
+                                target,
+                                reply: Some(reply_tx),
+                            })
                             .await;
+                        let _ = reply_rx.await;
                         return Ok(true); // Exit after switch
                     }
                 }
@@ -281,10 +286,16 @@ impl UIActor {
             KeyCode::Enter => {
                 if let Some(target) = self.state.get_current_target() {
                     let keys = self.state.input_buffer.clone();
+                    let (reply_tx, reply_rx) = oneshot::channel();
                     let _ = self
                         .tmux_tx
-                        .send(TmuxCommand::SendKeys { target, keys })
+                        .send(TmuxCommand::SendKeys {
+                            target,
+                            keys,
+                            reply: Some(reply_tx),
+                        })
                         .await;
+                    let _ = reply_rx.await;
                 }
                 self.state.exit_input_mode();
                 self.refresh_control.resume();
@@ -371,8 +382,20 @@ impl UIActor {
                     self.state.set_error(err);
                 }
             }
-            TmuxResponse::ClientSwitched { success: _ } => {
-                // Nothing to do
+            TmuxResponse::ClientSwitched {
+                target,
+                success,
+                error,
+            } => {
+                if !success {
+                    let message = match error {
+                        Some(err) if !err.trim().is_empty() => {
+                            format!("Failed to switch to {}: {}", target, err)
+                        }
+                        _ => format!("Failed to switch to {}", target),
+                    };
+                    self.state.set_error(message);
+                }
             }
             TmuxResponse::Error { message } => {
                 self.state.set_error(message);

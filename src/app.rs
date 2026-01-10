@@ -220,6 +220,24 @@ impl UIState {
         }
     }
 
+    pub fn get_enter_target(&self) -> Option<String> {
+        match self.view_mode {
+            ViewMode::TreeView => match self.focus {
+                Focus::Sessions => self
+                    .sessions
+                    .get(self.selected_session)
+                    .map(|s| s.name.clone()),
+                Focus::Windows => {
+                    let session = self.sessions.get(self.selected_session)?;
+                    let window = session.windows.get(self.selected_window)?;
+                    Some(format!("{}:{}", session.name, window.index))
+                }
+                Focus::Panes => self.get_selected_pane_target(),
+            },
+            ViewMode::MultiPreview => self.get_multi_selected_target(),
+        }
+    }
+
     pub fn input_char(&mut self, c: char) {
         self.input_buffer.insert(self.input_cursor, c);
         self.input_cursor += 1;
