@@ -378,6 +378,14 @@ impl UIState {
             {
                 self.multi_window = self.multi_window.min(session.windows.len() - 1);
             }
+
+            self.session_list_state.select(Some(self.selected_session));
+            self.window_list_state.select(Some(self.selected_window));
+            self.pane_list_state.select(Some(self.selected_pane));
+        } else {
+            self.session_list_state.select(None);
+            self.window_list_state.select(None);
+            self.pane_list_state.select(None);
         }
     }
 
