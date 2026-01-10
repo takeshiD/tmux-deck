@@ -4,7 +4,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
-use crate::app::{App, Focus, InputMode, PopupMode, TmuxPane, TmuxWindow, ViewMode};
+use crate::app::{Focus, InputMode, PopupMode, TmuxPane, TmuxWindow, UIState, ViewMode};
 
 // =============================================================================
 // ANSI Content Processing
@@ -135,23 +135,23 @@ fn shrink_styled_content<'a>(
 // Main UI Rendering
 // =============================================================================
 
-pub fn render_ui(frame: &mut Frame, app: &mut App) {
-    match app.view_mode {
-        ViewMode::TreeView => render_tree_view(frame, app),
-        ViewMode::MultiPreview => render_multi_preview(frame, app),
+pub fn render_ui(frame: &mut Frame, state: &mut UIState) {
+    match state.view_mode {
+        ViewMode::TreeView => render_tree_view(frame, state),
+        ViewMode::MultiPreview => render_multi_preview(frame, state),
     }
 
     // Render input popup if in input mode
-    if app.input_mode == InputMode::Input {
-        render_input_popup(frame, app, frame.area());
+    if state.input_mode == InputMode::Input {
+        render_input_popup(frame, state, frame.area());
     }
 
     // Render session operation popups
-    if let Some(popup_mode) = app.popup_mode {
+    if let Some(popup_mode) = state.popup_mode {
         match popup_mode {
-            PopupMode::NewSession => render_session_name_popup(frame, app, "New Session", "Enter session name:"),
-            PopupMode::RenameSession => render_session_name_popup(frame, app, "Rename Session", "Enter new name:"),
-            PopupMode::ConfirmKill => render_confirm_kill_popup(frame, app),
+            PopupMode::NewSession => render_session_name_popup(frame, state, "New Session", "Enter session name:"),
+            PopupMode::RenameSession => render_session_name_popup(frame, state, "Rename Session", "Enter new name:"),
+            PopupMode::ConfirmKill => render_confirm_kill_popup(frame, state),
         }
     }
 }
@@ -160,7 +160,7 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
 // TreeView Rendering
 // =============================================================================
 
-fn render_tree_view(frame: &mut Frame, app: &mut App) {
+fn render_tree_view(frame: &mut Frame, state: &mut UIState) {
     let area = frame.area();
 
     // Main layout: left panel (lists) | right panel (preview)
@@ -178,31 +178,31 @@ fn render_tree_view(frame: &mut Frame, app: &mut App) {
     ])
     .split(left_panel);
 
-    render_sessions_list(frame, app, left_chunks[0]);
-    render_windows_list(frame, app, left_chunks[1]);
-    render_panes_list(frame, app, left_chunks[2]);
+    render_sessions_list(frame, state, left_chunks[0]);
+    render_windows_list(frame, state, left_chunks[1]);
+    render_panes_list(frame, state, left_chunks[2]);
 
     // Right panel: Preview with status bar
     let right_chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(right_panel);
-    render_pane_preview_tree(frame, app, right_chunks[0]);
-    render_tree_status_bar(frame, app, right_chunks[1]);
+    render_pane_preview_tree(frame, state, right_chunks[0]);
+    render_tree_status_bar(frame, state, right_chunks[1]);
 }
 
-fn render_sessions_list(frame: &mut Frame, app: &mut App, area: Rect) {
-    let is_focused = app.focus == Focus::Sessions;
+fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
+    let is_focused = state.focus == Focus::Sessions;
     let border_style = if is_focused {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
-    let items: Vec<ListItem> = app
+    let items: Vec<ListItem> = state
         .sessions
         .iter()
         .enumerate()
         .map(|(i, session)| {
             let attached_marker = if session.attached { " ●" } else { "" };
-            let style = if i == app.selected_session {
+            let style = if i == state.selected_session {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
                 Style::default()
@@ -216,16 +216,16 @@ fn render_sessions_list(frame: &mut Frame, app: &mut App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title(format!(" Sessions ({}) ", app.sessions.len())),
+                .title(format!(" Sessions ({}) ", state.sessions.len())),
         )
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol(if is_focused { "▶ " } else { "  " });
 
-    frame.render_stateful_widget(list, area, &mut app.session_list_state);
+    frame.render_stateful_widget(list, area, &mut state.session_list_state);
 }
 
-fn render_windows_list(frame: &mut Frame, app: &mut App, area: Rect) {
-    let is_focused = app.focus == Focus::Windows;
+fn render_windows_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
+    let is_focused = state.focus == Focus::Windows;
     let border_style = if is_focused {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
     } else {
@@ -233,9 +233,9 @@ fn render_windows_list(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let empty_windows: Vec<TmuxWindow> = Vec::new();
-    let windows = app
+    let windows = state
         .sessions
-        .get(app.selected_session)
+        .get(state.selected_session)
         .map(|s| &s.windows)
         .unwrap_or(&empty_windows);
 
@@ -244,7 +244,7 @@ fn render_windows_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(i, window)| {
             let active_marker = if window.active { " *" } else { "" };
-            let style = if i == app.selected_window {
+            let style = if i == state.selected_window {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
                 Style::default()
@@ -253,9 +253,9 @@ fn render_windows_list(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let title = app
+    let title = state
         .sessions
-        .get(app.selected_session)
+        .get(state.selected_session)
         .map(|s| format!(" Windows [{}] ({}) ", s.name, windows.len()))
         .unwrap_or_else(|| " Windows ".to_string());
 
@@ -269,11 +269,11 @@ fn render_windows_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol(if is_focused { "▶ " } else { "  " });
 
-    frame.render_stateful_widget(list, area, &mut app.window_list_state);
+    frame.render_stateful_widget(list, area, &mut state.window_list_state);
 }
 
-fn render_panes_list(frame: &mut Frame, app: &mut App, area: Rect) {
-    let is_focused = app.focus == Focus::Panes;
+fn render_panes_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
+    let is_focused = state.focus == Focus::Panes;
     let border_style = if is_focused {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
     } else {
@@ -281,10 +281,10 @@ fn render_panes_list(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let empty_panes: Vec<TmuxPane> = Vec::new();
-    let panes = app
+    let panes = state
         .sessions
-        .get(app.selected_session)
-        .and_then(|s| s.windows.get(app.selected_window))
+        .get(state.selected_session)
+        .and_then(|s| s.windows.get(state.selected_window))
         .map(|w| &w.panes)
         .unwrap_or(&empty_panes);
 
@@ -293,7 +293,7 @@ fn render_panes_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(i, pane)| {
             let active_marker = if pane.active { " *" } else { "" };
-            let style = if i == app.selected_pane {
+            let style = if i == state.selected_pane {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
                 Style::default()
@@ -306,10 +306,10 @@ fn render_panes_list(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let title = app
+    let title = state
         .sessions
-        .get(app.selected_session)
-        .and_then(|s| s.windows.get(app.selected_window))
+        .get(state.selected_session)
+        .and_then(|s| s.windows.get(state.selected_window))
         .map(|w| format!(" Panes [{}] ({}) ", w.name, panes.len()))
         .unwrap_or_else(|| " Panes ".to_string());
 
@@ -323,11 +323,11 @@ fn render_panes_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol(if is_focused { "▶ " } else { "  " });
 
-    frame.render_stateful_widget(list, area, &mut app.pane_list_state);
+    frame.render_stateful_widget(list, area, &mut state.pane_list_state);
 }
 
-fn render_pane_preview_tree(frame: &mut Frame, app: &App, area: Rect) {
-    let title = app
+fn render_pane_preview_tree(frame: &mut Frame, state: &UIState, area: Rect) {
+    let title = state
         .get_selected_pane_target()
         .map(|t| format!(" Preview: {} ", t))
         .unwrap_or_else(|| " Preview ".to_string());
@@ -337,17 +337,17 @@ fn render_pane_preview_tree(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(title);
 
-    let text = match app.pane_content.as_bytes().into_text() {
+    let text = match state.pane_content.as_bytes().into_text() {
         Ok(text) => text,
-        Err(_) => Text::raw(&app.pane_content),
+        Err(_) => Text::raw(&state.pane_content),
     };
 
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, area);
 }
 
-fn render_tree_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let status_text = if let Some(ref err) = app.last_error {
+fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
+    let status_text = if let Some(ref err) = state.last_error {
         Line::from(vec![Span::styled(
             format!(" Error: {} ", err),
             Style::default().fg(Color::Red),
@@ -381,7 +381,7 @@ fn render_tree_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 // MultiPreview Rendering
 // =============================================================================
 
-fn render_multi_preview(frame: &mut Frame, app: &App) {
+fn render_multi_preview(frame: &mut Frame, state: &UIState) {
     let area = frame.area();
 
     let main_chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
@@ -389,7 +389,7 @@ fn render_multi_preview(frame: &mut Frame, app: &App) {
     let preview_area = main_chunks[0];
     let status_area = main_chunks[1];
 
-    if app.sessions.is_empty() {
+    if state.sessions.is_empty() {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" No sessions found ");
@@ -397,17 +397,17 @@ fn render_multi_preview(frame: &mut Frame, app: &App) {
     } else {
         // Create horizontal layout for sessions
         // Selected session gets 80%, others share 20%
-        let session_constraints: Vec<Constraint> = if app.sessions.len() == 1 {
+        let session_constraints: Vec<Constraint> = if state.sessions.len() == 1 {
             vec![Constraint::Percentage(100)]
         } else {
-            let other_count = app.sessions.len() - 1;
+            let other_count = state.sessions.len() - 1;
             // Each non-selected session gets an equal share of 20%
             let other_percentage = 30 / other_count as u16;
-            app.sessions
+            state.sessions
                 .iter()
                 .enumerate()
                 .map(|(idx, _)| {
-                    if idx == app.multi_session {
+                    if idx == state.multi_session {
                         Constraint::Percentage(70)
                     } else {
                         Constraint::Percentage(other_percentage.max(1))
@@ -419,9 +419,9 @@ fn render_multi_preview(frame: &mut Frame, app: &App) {
         let session_chunks = Layout::horizontal(session_constraints).split(preview_area);
 
         for (session_idx, (session, session_area)) in
-            app.sessions.iter().zip(session_chunks.iter()).enumerate()
+            state.sessions.iter().zip(session_chunks.iter()).enumerate()
         {
-            let is_selected_session = session_idx == app.multi_session;
+            let is_selected_session = session_idx == state.multi_session;
 
             // Session block style
             let session_border_style = if is_selected_session {
@@ -466,7 +466,7 @@ fn render_multi_preview(frame: &mut Frame, app: &App) {
                 session.windows.iter().zip(window_chunks.iter()).enumerate()
             {
                 let is_selected_window =
-                    is_selected_session && window_idx == app.multi_window;
+                    is_selected_session && window_idx == state.multi_window;
 
                 render_window_preview(frame, window, *window_area, is_selected_window);
             }
@@ -474,13 +474,13 @@ fn render_multi_preview(frame: &mut Frame, app: &App) {
     }
 
     // Status bar
-    let status_text = if let Some(ref err) = app.last_error {
+    let status_text = if let Some(ref err) = state.last_error {
         Line::from(vec![Span::styled(
             format!(" Error: {} ", err),
             Style::default().fg(Color::Red),
         )])
     } else {
-        let selected_info = app
+        let selected_info = state
             .get_multi_selected_target()
             .unwrap_or_else(|| "None".to_string());
 
@@ -557,7 +557,7 @@ fn render_window_preview(frame: &mut Frame, window: &TmuxWindow, area: Rect, is_
 // Input Popup
 // =============================================================================
 
-fn render_input_popup(frame: &mut Frame, app: &App, area: Rect) {
+fn render_input_popup(frame: &mut Frame, state: &UIState, area: Rect) {
     let popup_width = (area.width * 70 / 100).clamp(40, 80);
     let popup_height = 7;
 
@@ -571,7 +571,7 @@ fn render_input_popup(frame: &mut Frame, app: &App, area: Rect) {
         height: popup_height,
     };
 
-    let target_info = app
+    let target_info = state
         .get_current_target()
         .unwrap_or_else(|| "None".to_string());
 
@@ -598,15 +598,15 @@ fn render_input_popup(frame: &mut Frame, app: &App, area: Rect) {
 
     let input_area = input_chunks[2];
 
-    let before_cursor = &app.input_buffer[..app.input_cursor];
-    let cursor_char = app
+    let before_cursor = &state.input_buffer[..state.input_cursor];
+    let cursor_char = state
         .input_buffer
         .chars()
-        .nth(app.input_cursor)
+        .nth(state.input_cursor)
         .map(|c| c.to_string())
         .unwrap_or_else(|| " ".to_string());
-    let after_cursor = if app.input_cursor < app.input_buffer.len() {
-        &app.input_buffer[app.input_cursor + cursor_char.len()..]
+    let after_cursor = if state.input_cursor < state.input_buffer.len() {
+        &state.input_buffer[state.input_cursor + cursor_char.len()..]
     } else {
         ""
     };
@@ -631,7 +631,7 @@ fn render_input_popup(frame: &mut Frame, app: &App, area: Rect) {
 // Session Operation Popups
 // =============================================================================
 
-fn render_session_name_popup(frame: &mut Frame, app: &App, title: &str, label: &str) {
+fn render_session_name_popup(frame: &mut Frame, state: &UIState, title: &str, label: &str) {
     let area = frame.area();
     let popup_width = (area.width * 60 / 100).clamp(40, 70);
     let popup_height = 7;
@@ -670,15 +670,15 @@ fn render_session_name_popup(frame: &mut Frame, app: &App, title: &str, label: &
     let input_area = input_chunks[2];
 
     // Render input with cursor
-    let before_cursor = &app.input_buffer[..app.input_cursor];
-    let cursor_char = app
+    let before_cursor = &state.input_buffer[..state.input_cursor];
+    let cursor_char = state
         .input_buffer
         .chars()
-        .nth(app.input_cursor)
+        .nth(state.input_cursor)
         .map(|c| c.to_string())
         .unwrap_or_else(|| " ".to_string());
-    let after_cursor = if app.input_cursor < app.input_buffer.len() {
-        &app.input_buffer[app.input_cursor + cursor_char.len()..]
+    let after_cursor = if state.input_cursor < state.input_buffer.len() {
+        &state.input_buffer[state.input_cursor + cursor_char.len()..]
     } else {
         ""
     };
@@ -699,7 +699,7 @@ fn render_session_name_popup(frame: &mut Frame, app: &App, title: &str, label: &
     frame.render_widget(input_paragraph, input_area);
 }
 
-fn render_confirm_kill_popup(frame: &mut Frame, app: &App) {
+fn render_confirm_kill_popup(frame: &mut Frame, state: &UIState) {
     let area = frame.area();
     let popup_width = (area.width * 50 / 100).clamp(40, 60);
     let popup_height = 7;
@@ -716,9 +716,9 @@ fn render_confirm_kill_popup(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, popup_area);
 
-    let session_name = app
+    let session_name = state
         .sessions
-        .get(app.selected_session)
+        .get(state.selected_session)
         .map(|s| s.name.as_str())
         .unwrap_or("?");
 
@@ -752,13 +752,13 @@ fn render_confirm_kill_popup(frame: &mut Frame, app: &App) {
     ])
     .split(button_area);
 
-    let yes_style = if app.confirm_yes_selected {
+    let yes_style = if state.confirm_yes_selected {
         Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
-    let no_style = if !app.confirm_yes_selected {
+    let no_style = if !state.confirm_yes_selected {
         Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
