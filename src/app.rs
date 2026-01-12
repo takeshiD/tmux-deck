@@ -400,6 +400,17 @@ impl UIState {
         Some(format!("{}:{}.{}", session.name, window.index, pane.index))
     }
 
+    pub fn get_selected_pane_target_with_capture_range(&self) -> Option<(String, i32, i32)> {
+        let session = self.sessions.get(self.selected_session)?;
+        let window = session.windows.get(self.selected_window)?;
+        let pane = window.panes.get(self.selected_pane)?;
+        let target = format!("{}:{}.{}", session.name, window.index, pane.index);
+        let height = i32::try_from(pane.height).unwrap_or(i32::MAX);
+        let start = 0;
+        let end = height;
+        Some((target, start, end))
+    }
+
     pub fn tree_move_up(&mut self) {
         match self.focus {
             Focus::Sessions => {

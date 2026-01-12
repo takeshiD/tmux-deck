@@ -11,7 +11,7 @@ pub enum TmuxCommand {
     RefreshAll,
 
     /// Capture pane content
-    CapturePane { target: String },
+    CapturePane { target: String, start: i32, end: i32 },
 
     /// Create a new session
     NewSession { name: String },

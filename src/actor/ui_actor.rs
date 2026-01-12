@@ -19,7 +19,7 @@ fn spawn_key_event_poller(key_tx: mpsc::Sender<Event>) {
     std::thread::spawn(move || {
         loop {
             // Poll with moderate timeout for balance between responsiveness and CPU usage
-            if event::poll(Duration::from_millis(20)).unwrap_or(false)
+            if event::poll(Duration::from_millis(50)).unwrap_or(false)
                 && let Ok(evt) = event::read()
                 && key_tx.blocking_send(evt).is_err()
             {
@@ -101,16 +101,15 @@ impl UIActor {
                         UIEvent::Tick => {
                             // Request pane capture if in TreeView mode
                             if self.state.view_mode == ViewMode::TreeView
-                                && let Some(target) = self.state.get_selected_pane_target()
+                                && let Some((target, start, end)) =
+                                    self.state.get_selected_pane_target_with_capture_range()
                             {
-                                let _ = self.tmux_cmd_tx.send(TmuxCommand::CapturePane { target }).await;
+                                let _ = self
+                                    .tmux_cmd_tx
+                                    .send(TmuxCommand::CapturePane { target, start, end })
+                                    .await;
                             }
                         }
-                        // UIEvent::RequestCapture => {
-                        //     if let Some(target) = self.state.get_selected_pane_target() {
-                        //         let _ = self.tmux_tx.send(TmuxCommand::CapturePane { target }).await;
-                        //     }
-                        // }
                         UIEvent::Shutdown => {
                             break;
                         }
@@ -412,7 +411,6 @@ impl UIActor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     #[test]
     fn test_handle_key_event() {}
 }

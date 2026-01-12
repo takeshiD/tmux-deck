@@ -40,7 +40,9 @@ impl TmuxActor {
     async fn handle_command(&self, cmd: TmuxCommand) -> TmuxResponse {
         match cmd {
             TmuxCommand::RefreshAll => self.refresh_all().await,
-            TmuxCommand::CapturePane { target } => self.capture_pane(&target).await,
+            TmuxCommand::CapturePane { target, start, end } => {
+                self.capture_pane(&target, start, end).await
+            }
             TmuxCommand::NewSession { name } => self.new_session(&name).await,
             TmuxCommand::RenameSession { old_name, new_name } => {
                 self.rename_session(&old_name, &new_name).await
@@ -167,7 +169,7 @@ impl TmuxActor {
             let (panes, pane_width, pane_height) = self.get_panes(session_name, window_index).await;
 
             let content = self
-                .capture_window_content(session_name, window_index)
+                .capture_window_content(session_name, window_index, pane_height)
                 .await;
 
             windows.push((
@@ -264,10 +266,28 @@ impl TmuxActor {
         (panes, active_width, active_height)
     }
 
-    async fn capture_window_content(&self, session_name: &str, window_index: u32) -> String {
+    async fn capture_window_content(
+        &self,
+        session_name: &str,
+        window_index: u32,
+        pane_height: u32,
+    ) -> String {
         let target = format!("{}:{}", session_name, window_index);
+        let height = pane_height.max(1);
+        let start = format!("-{}", height);
         let output = Command::new("tmux")
-            .args(["capture-pane", "-e", "-p", "-J", "-t", &target])
+            .args([
+                "capture-pane",
+                "-e",
+                "-p",
+                "-J",
+                "-S",
+                &start,
+                "-E",
+                "-1",
+                "-t",
+                &target,
+            ])
             .output()
             .await;
 
@@ -283,9 +303,22 @@ impl TmuxActor {
     // Capture Pane
     // =========================================================================
 
-    async fn capture_pane(&self, target: &str) -> TmuxResponse {
+    async fn capture_pane(&self, target: &str, start: i32, end: i32) -> TmuxResponse {
+        let start = start.to_string();
+        let end = end.to_string();
         let output = Command::new("tmux")
-            .args(["capture-pane", "-e", "-p", "-J", "-t", target])
+            .args([
+                "capture-pane",
+                "-e",
+                "-p",
+                "-J",
+                "-S",
+                start.as_str(),
+                "-E",
+                end.as_str(),
+                "-t",
+                target,
+            ])
             .output()
             .await;
 
