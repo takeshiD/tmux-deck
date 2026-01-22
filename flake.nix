@@ -60,6 +60,7 @@
               cargo-edit
               cargo-watch
               rust-analyzer
+              rust-bin.stable.latest.default
             ];
 
             env = {
@@ -67,6 +68,7 @@
               RUST_SRC_PATH = "${pkgs.rustToolchain}/lib/rustlib/src/rust/library";
             };
           };
+          packages.default = pkgs.callPackage ./tmux-deck.nix { };
         }
       );
     };
