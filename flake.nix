@@ -68,8 +68,8 @@
               RUST_SRC_PATH = "${pkgs.rustToolchain}/lib/rustlib/src/rust/library";
             };
           };
-          packages.default = pkgs.callPackage ./tmux-deck.nix { };
         }
       );
+      packages = inputs.nixpkgs.callPackage ./tmux-deck.nix { };
     };
 }
