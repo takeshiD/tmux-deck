@@ -11,8 +11,10 @@ use crossterm::{
     ExecutableCommand,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use directories::ProjectDirs;
 use ratatui::prelude::*;
 use tokio::sync::mpsc;
+use tracing_subscriber::{EnvFilter, fmt::time};
 
 use actor::{RefreshActor, RefreshControl, TmuxActor, TmuxCommand, TmuxResponse, UIActor, UIEvent};
 use app::UIState;
@@ -26,6 +28,24 @@ use cli::Cli;
 async fn main() -> Result<()> {
     color_eyre::install()?;
     let cmd = Cli::parse_with_color()?;
+    let project_dir =
+        ProjectDirs::from("dev", "tkcd", "tmux-deck").expect("cannot determine project directory");
+    let log_dir = project_dir.state_dir().expect("failed to get log dir");
+    std::fs::create_dir_all(log_dir).expect("failed to create log dir");
+    let log_file_path = log_dir.join("tmux-deck.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+        .expect("failed to open log file");
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(log_file)
+        .with_ansi(false)
+        .with_timer(time::LocalTime::rfc_3339())
+        .init();
 
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
