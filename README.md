@@ -42,6 +42,44 @@ nix run github:takeshid/tmux-deck
 curl -SL https://github.com/takeshid/markdown-peek
 ```
 
+# Comparison with Similar Project
+
+`tmux-deck` takes a different approach compared to other tmux session managers.
+
+| Feature                     | tmux-deck            | tmuxinator         | tmuxp                   |
+| ---------                   | -----------          | ------------       | -------                 |
+| **Language**                | Rust                 | Ruby               | Python                  |
+| **Interface**               | TUI (Interactive)    | CLI                | CLI                     |
+| **Realtime Preview**        | ✅                   | ❌                 | ❌                      |
+| **Multi-session Preview**   | ✅                   | ❌                 | ❌                      |
+| **Runtime Dependencies**    | None (single binary) | Ruby runtime       | Python runtime          |
+| **Configuration Format**    | TOML                 | YAML               | YAML/JSON               |
+| **Session Definition**      | Interactive          | Declarative (YAML) | Declarative (YAML/JSON) |
+| **Save/Restore Sessions**   | Planned              | ✅                 | ✅                      |
+| **Freeze Existing Session** | -                    | ✅                 | ✅                      |
+
+## Why tmux-deck?
+
+### 🔴 Realtime Preview
+The most distinctive feature of tmux-deck. Preview the actual content of all your tmux sessions in real-time. No more blindly switching between sessions.
+
+### 🚀 Zero Configuration
+Start using immediately without writing any configuration files. Just run `tmux-deck` and manage your sessions visually.
+
+### 📦 Single Binary
+No runtime dependencies. No Ruby, no Python, no gem/pip packages. Just download and run.
+
+### 🎯 Interactive TUI
+Visual tree structure of sessions, windows, and panes. Navigate with keyboard shortcuts and see changes instantly.
+
+### ⚡ Fast & Lightweight
+Written in Rust for maximum performance and minimal resource usage.
+
+## When to use others?
+
+- **tmuxinator/tmuxp**: When you need declarative session definitions that can be version-controlled and shared across teams. Ideal for reproducible development environments.
+- **tmux-deck**: When you need real-time visibility into multiple sessions and prefer interactive management over configuration files.
+
 # Status
 - [x] Session Management(New, Rename, Kill)
     - [x] Realtime Preview
