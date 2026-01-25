@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::actor::messages::{TmuxCommand, TmuxResponse};
 use crate::app::{TmuxPane, TmuxSession, TmuxWindow};
+use tracing::debug;
 
 // =============================================================================
 // TmuxActor
@@ -39,20 +40,32 @@ impl TmuxActor {
 
     async fn handle_command(&self, cmd: TmuxCommand) -> TmuxResponse {
         match cmd {
-            TmuxCommand::RefreshAll => self.refresh_all().await,
+            TmuxCommand::RefreshAll => {
+                debug!("refresh all for tmux");
+                self.refresh_all().await
+            }
             TmuxCommand::CapturePane { target, start, end } => {
+                debug!("capture-pane for tmux");
                 self.capture_pane(&target, start, end).await
             }
-            TmuxCommand::NewSession { name } => self.new_session(&name).await,
+            TmuxCommand::NewSession { name } => {
+                debug!("new-session");
+                self.new_session(&name).await
+            }
             TmuxCommand::RenameSession { old_name, new_name } => {
+                debug!("rename-session");
                 self.rename_session(&old_name, &new_name).await
             }
-            TmuxCommand::KillSession { name } => self.kill_session(&name).await,
+            TmuxCommand::KillSession { name } => {
+                debug!("kile-session");
+                self.kill_session(&name).await
+            }
             TmuxCommand::SendKeys {
                 target,
                 keys,
                 reply,
             } => {
+                debug!("send keys");
                 let response = self.send_keys(&target, &keys).await;
                 if let Some(tx) = reply {
                     let _ = tx.send(response.clone());
@@ -60,6 +73,7 @@ impl TmuxActor {
                 response
             }
             TmuxCommand::SwitchClient { target, reply } => {
+                debug!("sqitch client");
                 let response = self.switch_client(&target).await;
                 if let Some(tx) = reply {
                     let _ = tx.send(response.clone());
@@ -168,9 +182,9 @@ impl TmuxActor {
 
             let (panes, pane_width, pane_height) = self.get_panes(session_name, window_index).await;
 
-            let content = self
-                .capture_window_content(session_name, window_index, pane_height)
-                .await;
+            // let content = self
+            //     .capture_window_content(session_name, window_index, pane_height)
+            //     .await;
 
             windows.push((
                 window_activity,
@@ -181,7 +195,7 @@ impl TmuxActor {
                     name: window_name,
                     active: window_active,
                     panes,
-                    content,
+                    // content,
                     pane_width,
                     pane_height,
                 },
@@ -272,9 +286,12 @@ impl TmuxActor {
         window_index: u32,
         pane_height: u32,
     ) -> String {
+        debug!(
+            "capture-pane: session={session_name}, window={window_index}, pane-height={pane_height}"
+        );
         let target = format!("{}:{}", session_name, window_index);
         let height = pane_height.max(1);
-        let start = format!("-{}", height);
+        let end = format!("{}", height);
         let output = Command::new("tmux")
             .args([
                 "capture-pane",
@@ -282,9 +299,9 @@ impl TmuxActor {
                 "-p",
                 "-J",
                 "-S",
-                &start,
+                0.to_string().as_str(),
                 "-E",
-                "-1",
+                &end,
                 "-t",
                 &target,
             ])
@@ -304,6 +321,7 @@ impl TmuxActor {
     // =========================================================================
 
     async fn capture_pane(&self, target: &str, start: i32, end: i32) -> TmuxResponse {
+        debug!("capture-pane: target={target}, range({start}, {end})");
         let start = start.to_string();
         let end = end.to_string();
         let output = Command::new("tmux")

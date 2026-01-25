@@ -81,7 +81,7 @@ impl UIActor {
             // Use select to handle multiple event sources
             // biased; ensures key events are checked first (top-to-bottom priority)
             tokio::select! {
-                // biased;
+                biased;
 
                 // Key events from dedicated poller thread (highest priority)
                 Some(event) = self.key_rx.recv() => {

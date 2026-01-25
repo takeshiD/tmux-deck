@@ -547,18 +547,18 @@ fn render_window_preview(frame: &mut Frame, window: &TmuxWindow, area: Rect, is_
 
     let inner = block.inner(area);
 
-    let styled_grid = ansi_to_styled_grid(&window.content);
-    let shrunk_text = shrink_styled_content(
-        &styled_grid,
-        inner.width as usize,
-        inner.height as usize,
-        window.pane_width,
-        window.pane_height,
-    );
+    // let styled_grid = ansi_to_styled_grid(&window.content);
+    // let shrunk_text = shrink_styled_content(
+    //     &styled_grid,
+    //     inner.width as usize,
+    //     inner.height as usize,
+    //     window.pane_width,
+    //     window.pane_height,
+    // );
 
-    let paragraph = Paragraph::new(shrunk_text).block(block);
+    // let paragraph = Paragraph::new(shrunk_text).block(block);
 
-    frame.render_widget(paragraph, area);
+    // frame.render_widget(paragraph, area);
 }
 
 // =============================================================================

@@ -15,7 +15,7 @@ pub struct Cli {
     #[arg(short, long)]
     pub target: Option<String>,
     /// Preview refresh interval in milliseconds
-    #[arg(short, long, default_value = "300")]
+    #[arg(short, long, default_value = "100")]
     pub interval: u64,
 }
 

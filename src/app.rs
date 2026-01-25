@@ -27,7 +27,7 @@ pub struct TmuxWindow {
     pub active: bool,
     pub panes: Vec<TmuxPane>,
     /// Captured content of the active pane (for preview)
-    pub content: String,
+    // pub content: String,
     /// Width of the active pane
     pub pane_width: u32,
     /// Height of the active pane
