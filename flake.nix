@@ -25,7 +25,7 @@
         };
         tmux-deck = pkgs.rustPlatform.buildRustPackage {
           pname = "tmux-deck";
-          version = "0.0.0";
+          # version = "0.0.0";
           src = ./.;
           cargoLock = {
             lockFile = ./Cargo.lock;
