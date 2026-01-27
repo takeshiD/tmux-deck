@@ -23,9 +23,10 @@
           inherit system;
           overlays = [ rust-overlay.overlays.default ];
         };
+        cargoToml = fromTOML (builtins.readFile ./Cargo.toml);
         tmux-deck = pkgs.rustPlatform.buildRustPackage {
-          pname = "tmux-deck";
-          version = "0.0.0";
+          pname = cargoToml.package.name;
+          version = cargoToml.package.version;
           src = ./.;
           cargoLock = {
             lockFile = ./Cargo.lock;
