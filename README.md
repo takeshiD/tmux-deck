@@ -5,6 +5,7 @@ Monitoring multi session Realtime preview.
 
 # Features
 - 🗂️ Tmux Session Management(New, Rename, Kill)
+- 📄 Easy management Windows and Panes between Sessions
 - 👀 Realtime Preview
 - ⚙️ Easy Configure
 
@@ -29,17 +30,37 @@ bind SPACE run-shell "tmux popup -w80% -h80% -E tmux-deck"
 # Installation
 ## `cargo`
 ```
-cargo install tmux-deck
+cargo install tmux-deck     # build from source
+cargo binstall tmux-deck    # prebuild-binary
 ```
 
-## `nix`(Planed)
+## `nix run`
+You can try `tmux-deck` easily following.
 ```
 nix run github:takeshid/tmux-deck
 ```
 
-## download prebuild-binary
+Also you can config it like following in your `.tmux.conf`.
+```bash
+bind SPACE run-shell "tmux popup -w80% -h80% -E nix run github:takeshid/tmux-deck"
 ```
-curl -SL https://github.com/takeshid/markdown-peek
+
+## `flake.nix`
+if youde use flake, you can add `tmux-deck` in your flake.nix
+
+```nix
+{
+  inputs = {
+    tmux-deck.url = "github:takeshid/tmux-deck";
+  };
+  outputs = {
+    devShells = nixpkgs.lib.mkShell {
+        packages = [
+        ]
+        ++ tmux-deck.packages.x86_64-linux
+    };
+  };
+}
 ```
 
 # Comparison with Similar Project
@@ -74,6 +95,7 @@ Visual tree structure of sessions, windows, and panes. Navigate with keyboard sh
 
 ### ⚡ Fast & Lightweight
 Written in Rust for maximum performance and minimal resource usage.
+
 
 ## When to use others?
 
