@@ -10,7 +10,7 @@ use crate::actor::messages::{RefreshControl, TmuxCommand, UIEvent};
 
 pub struct RefreshActor {
     tmux_tx: mpsc::Sender<TmuxCommand>,
-    ui_tx: mpsc::Sender<UIEvent>,
+    ui_event_tx: mpsc::Sender<UIEvent>,
     refresh_control: RefreshControl,
     interval: Duration,
 }
@@ -18,13 +18,13 @@ pub struct RefreshActor {
 impl RefreshActor {
     pub fn new(
         tmux_tx: mpsc::Sender<TmuxCommand>,
-        ui_tx: mpsc::Sender<UIEvent>,
+        ui_event_tx: mpsc::Sender<UIEvent>,
         refresh_control: RefreshControl,
         interval: Duration,
     ) -> Self {
         Self {
             tmux_tx,
-            ui_tx,
+            ui_event_tx,
             refresh_control,
             interval,
         }
@@ -48,7 +48,7 @@ impl RefreshActor {
             }
 
             // Notify UIActor about the tick (for capture request if needed)
-            if self.ui_tx.send(UIEvent::Tick).await.is_err() {
+            if self.ui_event_tx.send(UIEvent::Tick).await.is_err() {
                 // UIActor has been dropped, exit
                 break;
             }

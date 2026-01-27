@@ -337,9 +337,17 @@ fn render_pane_preview_tree(frame: &mut Frame, state: &UIState, area: Rect) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(title);
 
-    let text = match state.pane_content.as_bytes().into_text() {
+    let inner = block.inner(area);
+    let max_lines = inner.height as usize;
+    let mut lines: Vec<&str> = state.pane_content.lines().collect();
+    if lines.len() > max_lines {
+        lines = lines[lines.len().saturating_sub(max_lines)..].to_vec();
+    }
+    let preview = lines.join("\n");
+
+    let text = match preview.as_bytes().into_text() {
         Ok(text) => text,
-        Err(_) => Text::raw(&state.pane_content),
+        Err(_) => Text::raw(preview),
     };
 
     let paragraph = Paragraph::new(text).block(block);
@@ -539,18 +547,18 @@ fn render_window_preview(frame: &mut Frame, window: &TmuxWindow, area: Rect, is_
 
     let inner = block.inner(area);
 
-    let styled_grid = ansi_to_styled_grid(&window.content);
-    let shrunk_text = shrink_styled_content(
-        &styled_grid,
-        inner.width as usize,
-        inner.height as usize,
-        window.pane_width,
-        window.pane_height,
-    );
+    // let styled_grid = ansi_to_styled_grid(&window.content);
+    // let shrunk_text = shrink_styled_content(
+    //     &styled_grid,
+    //     inner.width as usize,
+    //     inner.height as usize,
+    //     window.pane_width,
+    //     window.pane_height,
+    // );
 
-    let paragraph = Paragraph::new(shrunk_text).block(block);
+    // let paragraph = Paragraph::new(shrunk_text).block(block);
 
-    frame.render_widget(paragraph, area);
+    // frame.render_widget(paragraph, area);
 }
 
 // =============================================================================
