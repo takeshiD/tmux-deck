@@ -42,10 +42,10 @@ impl RefreshActor {
             }
 
             // Send RefreshAll command to TmuxActor
-            if self.tmux_tx.send(TmuxCommand::RefreshAll).await.is_err() {
-                // TmuxActor has been dropped, exit
-                break;
-            }
+            // if self.tmux_tx.send(TmuxCommand::RefreshAll).await.is_err() {
+            //     // TmuxActor has been dropped, exit
+            //     break;
+            // }
 
             // Notify UIActor about the tick (for capture request if needed)
             if self.ui_event_tx.send(UIEvent::Tick).await.is_err() {

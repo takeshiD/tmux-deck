@@ -41,11 +41,11 @@ impl TmuxActor {
     async fn handle_command(&self, cmd: TmuxCommand) -> TmuxResponse {
         match cmd {
             TmuxCommand::RefreshAll => {
-                debug!("refresh all for tmux");
+                debug!("refresh all");
                 self.refresh_all().await
             }
             TmuxCommand::CapturePane { target, start, end } => {
-                debug!("capture-pane for tmux");
+                debug!("capture-pane: target={target} range({start}, {end})");
                 self.capture_pane(&target, start, end).await
             }
             TmuxCommand::NewSession { name } => {
