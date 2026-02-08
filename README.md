@@ -86,12 +86,12 @@ Written in Rust for maximum performance and minimal resource usage.
     - [ ] Search and Filtering(fuzzy find)
     - [ ] Saving and Restoring sessions
     - [ ] Sort
-        - [ ] Most Recently Used
+        - [x] Most Recently Used
         - [ ] Alphabet
         - [ ] Pinning
 - [x] Multi Preview
-    - [ ] Injection command to pane
-    - [ ] Zoom preview
+    - [x] Injection command to pane
+    - [x] Zoom preview
     - [ ] Pinning
 - [ ] Configure
     - [ ] Keybinding
