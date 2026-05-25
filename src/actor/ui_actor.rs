@@ -104,16 +104,7 @@ impl UIActor {
                 Some(event) = self.ui_event_rx.recv() => {
                     match event {
                         UIEvent::Tick => {
-                            // Request pane capture if in TreeView mode (low-priority channel)
-                            if self.state.view_mode == ViewMode::TreeView
-                                && let Some((target, start, end)) =
-                                    self.state.get_selected_pane_target_with_capture_range()
-                            {
-                                let _ = self
-                                    .tmux_capture_tx
-                                    .send(TmuxCommand::CapturePane { target, start, end })
-                                    .await;
-                            }
+                            self.dispatch_tick_captures().await;
                         }
                         UIEvent::Shutdown => {
                             break;
@@ -338,8 +329,51 @@ impl UIActor {
                 KeyCode::Down | KeyCode::Char('j') => self.state.multi_move_down(),
                 KeyCode::Left | KeyCode::Char('h') => self.state.multi_move_left(),
                 KeyCode::Right | KeyCode::Char('l') => self.state.multi_move_right(),
+                KeyCode::Tab | KeyCode::BackTab => self.state.multi_toggle_layout(),
+                KeyCode::Char('p') => self.state.multi_toggle_pin(),
+                KeyCode::Char('P') => self.state.multi_clear_pins(),
                 _ => {}
             },
+        }
+    }
+
+    /// Issue capture-pane requests appropriate for the current view mode.
+    /// TreeView: one capture for the selected pane.
+    /// MultiPreview: one capture per visible session (its active window).
+    async fn dispatch_tick_captures(&mut self) {
+        match self.state.view_mode {
+            ViewMode::TreeView => {
+                if let Some((target, start, end)) =
+                    self.state.get_selected_pane_target_with_capture_range()
+                {
+                    let _ = self
+                        .tmux_capture_tx
+                        .send(TmuxCommand::CapturePane { target, start, end })
+                        .await;
+                }
+            }
+            ViewMode::MultiPreview => {
+                for idx in self.state.visible_session_indices() {
+                    let Some(session) = self.state.sessions.get(idx) else { continue };
+                    // Capture the active window's active pane via window-level target.
+                    let Some(window) = session
+                        .windows
+                        .iter()
+                        .find(|w| w.active)
+                        .or_else(|| session.windows.first())
+                    else { continue };
+                    let target = format!("{}:{}", session.name, window.index);
+                    let height = i32::try_from(window.pane_height).unwrap_or(i32::MAX);
+                    let _ = self
+                        .tmux_capture_tx
+                        .send(TmuxCommand::CapturePane {
+                            target,
+                            start: 0,
+                            end: height,
+                        })
+                        .await;
+                }
+            }
         }
     }
 
