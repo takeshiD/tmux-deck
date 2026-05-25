@@ -1,23 +1,38 @@
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::time::Duration;
 
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
+use tracing::{debug, warn};
 
 use crate::actor::messages::{TmuxCommand, TmuxResponse};
 use crate::app::{TmuxPane, TmuxSession, TmuxWindow};
-use tracing::debug;
 
 // =============================================================================
-// TmuxActor
+// TmuxActor — control-mode based, with fork+exec fallback
 // =============================================================================
+//
+// A single persistent `tmux -C attach` process owns stdin/stdout. Each tmux
+// operation writes one command line and consumes one `%begin .. %end`
+// (or `%error`) block. Asynchronous notifications between blocks are skipped
+// (Step 5 will route them as events).
+//
+// If the control-mode process is missing or dies, the actor falls back to
+// per-operation fork+exec and retries connecting before subsequent calls.
 
 pub struct TmuxActor {
-    /// User-initiated commands (key input, session ops). Higher priority.
     command_rx: mpsc::Receiver<TmuxCommand>,
-    /// Periodic refresh / capture-pane requests. Lower priority.
     capture_rx: mpsc::Receiver<TmuxCommand>,
     response_tx: mpsc::Sender<TmuxResponse>,
+    ctrl: Option<ControlMode>,
+}
+
+struct ControlMode {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
 }
 
 impl TmuxActor {
@@ -30,10 +45,14 @@ impl TmuxActor {
             command_rx,
             capture_rx,
             response_tx,
+            ctrl: None,
         }
     }
 
     pub async fn run(mut self) {
+        // Try to connect control mode eagerly so the first refresh is fast.
+        self.ctrl = Self::try_connect_control().await;
+
         loop {
             let cmd = tokio::select! {
                 biased;
@@ -43,13 +62,17 @@ impl TmuxActor {
             };
             let response = self.handle_command(cmd).await;
             if self.response_tx.send(response).await.is_err() {
-                // UIActor has been dropped, exit
                 break;
             }
         }
+
+        // Best-effort shutdown of the control-mode child.
+        if let Some(mut ctrl) = self.ctrl.take() {
+            let _ = ctrl.child.kill().await;
+        }
     }
 
-    async fn handle_command(&self, cmd: TmuxCommand) -> TmuxResponse {
+    async fn handle_command(&mut self, cmd: TmuxCommand) -> TmuxResponse {
         match cmd {
             TmuxCommand::RefreshAll => {
                 debug!("refresh all");
@@ -68,7 +91,7 @@ impl TmuxActor {
                 self.rename_session(&old_name, &new_name).await
             }
             TmuxCommand::KillSession { name } => {
-                debug!("kile-session");
+                debug!("kill-session");
                 self.kill_session(&name).await
             }
             TmuxCommand::SendKeys {
@@ -76,7 +99,7 @@ impl TmuxActor {
                 keys,
                 reply,
             } => {
-                debug!("send keys");
+                debug!("send-keys");
                 let response = self.send_keys(&target, &keys).await;
                 if let Some(tx) = reply {
                     let _ = tx.send(response.clone());
@@ -84,7 +107,7 @@ impl TmuxActor {
                 response
             }
             TmuxCommand::SwitchClient { target, reply } => {
-                debug!("sqitch client");
+                debug!("switch-client");
                 let response = self.switch_client(&target).await;
                 if let Some(tx) = reply {
                     let _ = tx.send(response.clone());
@@ -97,43 +120,56 @@ impl TmuxActor {
     // =========================================================================
     // Refresh All Sessions
     // =========================================================================
-    //
-    // Single fork+exec via `\;`-chained tmux commands and `-a` flag.
-    // Each output line is tagged with SESS/WIN/PANE prefix for dispatch.
 
-    async fn refresh_all(&self) -> TmuxResponse {
-        let output = Command::new("tmux")
-            .args([
-                "list-sessions",
-                "-F",
-                "SESS\t#{session_name}\t#{session_attached}\t#{session_activity}",
-                ";",
-                "list-windows",
-                "-a",
-                "-F",
-                "WIN\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_activity}",
-                ";",
-                "list-panes",
-                "-a",
-                "-F",
-                "PANE\t#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_index}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_last}\t#{pane_current_command}",
-            ])
-            .output()
-            .await;
+    async fn refresh_all(&mut self) -> TmuxResponse {
+        // Three commands; outputs prefixed so they can be concatenated.
+        let s_args: &[&str] = &[
+            "list-sessions",
+            "-F",
+            "SESS\t#{session_name}\t#{session_attached}\t#{session_activity}",
+        ];
+        let w_args: &[&str] = &[
+            "list-windows",
+            "-a",
+            "-F",
+            "WIN\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_activity}",
+        ];
+        let p_args: &[&str] = &[
+            "list-panes",
+            "-a",
+            "-F",
+            "PANE\t#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_index}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_last}\t#{pane_current_command}",
+        ];
 
-        let stdout = match output {
-            Ok(output) if output.status.success() => {
-                String::from_utf8_lossy(&output.stdout).to_string()
+        // If control mode is up, send 3 commands as 3 blocks; otherwise one
+        // fork+exec with `;` chaining.
+        let stdout = if self.ctrl.is_some() {
+            let mut buf = String::new();
+            for args in [s_args, w_args, p_args] {
+                match self.exec_args(args).await {
+                    Ok(out) => {
+                        buf.push_str(&out);
+                        if !out.ends_with('\n') {
+                            buf.push('\n');
+                        }
+                    }
+                    Err(e) => {
+                        return TmuxResponse::Error { message: e };
+                    }
+                }
             }
-            Ok(output) => {
-                return TmuxResponse::Error {
-                    message: String::from_utf8_lossy(&output.stderr).to_string(),
-                };
-            }
-            Err(e) => {
-                return TmuxResponse::Error {
-                    message: format!("Failed to refresh: {}", e),
-                };
+            buf
+        } else {
+            // Single fork+exec with `;` chaining
+            let mut chained: Vec<&str> = Vec::with_capacity(s_args.len() + w_args.len() + p_args.len() + 2);
+            chained.extend_from_slice(s_args);
+            chained.push(";");
+            chained.extend_from_slice(w_args);
+            chained.push(";");
+            chained.extend_from_slice(p_args);
+            match Self::fork_exec(&chained).await {
+                Ok(out) => out,
+                Err(e) => return TmuxResponse::Error { message: e },
             }
         };
 
@@ -146,37 +182,18 @@ impl TmuxActor {
     // Capture Pane
     // =========================================================================
 
-    async fn capture_pane(&self, target: &str, start: i32, end: i32) -> TmuxResponse {
-        debug!("capture-pane: target={target}, range({start}, {end})");
+    async fn capture_pane(&mut self, target: &str, start: i32, end: i32) -> TmuxResponse {
         let start = start.to_string();
         let end = end.to_string();
-        let output = Command::new("tmux")
-            .args([
-                "capture-pane",
-                "-e",
-                "-p",
-                "-J",
-                "-S",
-                start.as_str(),
-                "-E",
-                end.as_str(),
-                "-t",
-                target,
-            ])
-            .output()
-            .await;
-
-        match output {
-            Ok(output) if output.status.success() => TmuxResponse::PaneCaptured {
+        let args: &[&str] = &[
+            "capture-pane", "-e", "-p", "-J", "-S", &start, "-E", &end, "-t", target,
+        ];
+        match self.exec_args(args).await {
+            Ok(out) => TmuxResponse::PaneCaptured {
                 target: target.to_string(),
-                content: String::from_utf8_lossy(&output.stdout).to_string(),
+                content: out,
             },
-            Ok(output) => TmuxResponse::Error {
-                message: String::from_utf8_lossy(&output.stderr).to_string(),
-            },
-            Err(e) => TmuxResponse::Error {
-                message: format!("Failed to capture pane: {}", e),
-            },
+            Err(e) => TmuxResponse::Error { message: e },
         }
     }
 
@@ -184,71 +201,46 @@ impl TmuxActor {
     // Session Operations
     // =========================================================================
 
-    async fn new_session(&self, name: &str) -> TmuxResponse {
-        let output = Command::new("tmux")
-            .args(["new-session", "-d", "-s", name])
-            .output()
-            .await;
-
-        match output {
-            Ok(output) if output.status.success() => TmuxResponse::SessionCreated {
+    async fn new_session(&mut self, name: &str) -> TmuxResponse {
+        let args: &[&str] = &["new-session", "-d", "-s", name];
+        match self.exec_args(args).await {
+            Ok(_) => TmuxResponse::SessionCreated {
                 name: name.to_string(),
                 success: true,
                 error: None,
-            },
-            Ok(output) => TmuxResponse::SessionCreated {
-                name: name.to_string(),
-                success: false,
-                error: Some(String::from_utf8_lossy(&output.stderr).to_string()),
             },
             Err(e) => TmuxResponse::SessionCreated {
                 name: name.to_string(),
                 success: false,
-                error: Some(format!("Failed to create session: {}", e)),
+                error: Some(e),
             },
         }
     }
 
-    async fn rename_session(&self, old_name: &str, new_name: &str) -> TmuxResponse {
-        let output = Command::new("tmux")
-            .args(["rename-session", "-t", old_name, new_name])
-            .output()
-            .await;
-
-        match output {
-            Ok(output) if output.status.success() => TmuxResponse::SessionRenamed {
+    async fn rename_session(&mut self, old_name: &str, new_name: &str) -> TmuxResponse {
+        let args: &[&str] = &["rename-session", "-t", old_name, new_name];
+        match self.exec_args(args).await {
+            Ok(_) => TmuxResponse::SessionRenamed {
                 success: true,
                 error: None,
-            },
-            Ok(output) => TmuxResponse::SessionRenamed {
-                success: false,
-                error: Some(String::from_utf8_lossy(&output.stderr).to_string()),
             },
             Err(e) => TmuxResponse::SessionRenamed {
                 success: false,
-                error: Some(format!("Failed to rename session: {}", e)),
+                error: Some(e),
             },
         }
     }
 
-    async fn kill_session(&self, name: &str) -> TmuxResponse {
-        let output = Command::new("tmux")
-            .args(["kill-session", "-t", name])
-            .output()
-            .await;
-
-        match output {
-            Ok(output) if output.status.success() => TmuxResponse::SessionKilled {
+    async fn kill_session(&mut self, name: &str) -> TmuxResponse {
+        let args: &[&str] = &["kill-session", "-t", name];
+        match self.exec_args(args).await {
+            Ok(_) => TmuxResponse::SessionKilled {
                 success: true,
                 error: None,
             },
-            Ok(output) => TmuxResponse::SessionKilled {
-                success: false,
-                error: Some(String::from_utf8_lossy(&output.stderr).to_string()),
-            },
             Err(e) => TmuxResponse::SessionKilled {
                 success: false,
-                error: Some(format!("Failed to kill session: {}", e)),
+                error: Some(e),
             },
         }
     }
@@ -257,36 +249,28 @@ impl TmuxActor {
     // Pane Operations
     // =========================================================================
 
-    async fn send_keys(&self, target: &str, keys: &str) -> TmuxResponse {
-        let output = Command::new("tmux")
-            .args(["send-keys", "-t", target, keys, "Enter"])
-            .output()
-            .await;
-
-        match output {
-            Ok(output) if output.status.success() => TmuxResponse::KeysSent {
+    async fn send_keys(&mut self, target: &str, keys: &str) -> TmuxResponse {
+        let args: &[&str] = &["send-keys", "-t", target, keys, "Enter"];
+        match self.exec_args(args).await {
+            Ok(_) => TmuxResponse::KeysSent {
                 success: true,
                 error: None,
             },
-            Ok(output) => TmuxResponse::KeysSent {
-                success: false,
-                error: Some(String::from_utf8_lossy(&output.stderr).to_string()),
-            },
             Err(e) => TmuxResponse::KeysSent {
                 success: false,
-                error: Some(format!("Failed to send keys: {}", e)),
+                error: Some(e),
             },
         }
     }
 
-    async fn switch_client(&self, target: &str) -> TmuxResponse {
+    async fn switch_client(&mut self, target: &str) -> TmuxResponse {
         let log_path = "/tmp/tmux-deck.log";
-        let output = Command::new("tmux")
-            .args(["switch-client", "-t", target])
-            .output()
-            .await;
-        match output {
-            Ok(output) if output.status.success() => {
+        // switch-client must always be issued from the user's interactive
+        // tmux client process — not from the control-mode client (which is
+        // attached to a session of its own). Always use fork+exec here.
+        let args: &[&str] = &["switch-client", "-t", target];
+        match Self::fork_exec(args).await {
+            Ok(_) => {
                 append_switch_log(log_path, target, true, None);
                 TmuxResponse::ClientSwitched {
                     target: target.to_string(),
@@ -294,27 +278,232 @@ impl TmuxActor {
                     error: None,
                 }
             }
-            Ok(output) => {
-                let err = String::from_utf8_lossy(&output.stderr).to_string();
-                append_switch_log(log_path, target, false, Some(&err));
-                TmuxResponse::ClientSwitched {
-                    target: target.to_string(),
-                    success: false,
-                    error: Some(err),
-                }
-            }
             Err(e) => {
-                let err = format!("Failed to switch client: {}", e);
-                append_switch_log(log_path, target, false, Some(&err));
+                append_switch_log(log_path, target, false, Some(&e));
                 TmuxResponse::ClientSwitched {
                     target: target.to_string(),
                     success: false,
-                    error: Some(err),
+                    error: Some(e),
                 }
             }
         }
     }
+
+    // =========================================================================
+    // Backend dispatch: control mode preferred, fork+exec fallback
+    // =========================================================================
+
+    async fn exec_args(&mut self, args: &[&str]) -> Result<String, String> {
+        // Ensure we have a connected control mode (lazy reconnect).
+        if self.ctrl.is_none() {
+            self.ctrl = Self::try_connect_control().await;
+        }
+
+        if self.ctrl.is_some() {
+            let cmd = args_to_control_command(args);
+            match self.exec_via_ctrl(&cmd).await {
+                Ok(out) => return Ok(out),
+                Err(ControlExecError::Protocol(msg)) => {
+                    return Err(msg);
+                }
+                Err(ControlExecError::Io(_)) => {
+                    // Pipe broke. Drop and fall through to fork+exec.
+                    if let Some(mut c) = self.ctrl.take() {
+                        let _ = c.child.kill().await;
+                    }
+                }
+            }
+        }
+
+        Self::fork_exec(args).await
+    }
+
+    async fn exec_via_ctrl(&mut self, cmd: &str) -> Result<String, ControlExecError> {
+        let ctrl = self
+            .ctrl
+            .as_mut()
+            .ok_or_else(|| ControlExecError::Io("not connected".to_string()))?;
+
+        // Empty command would detach the client — refuse defensively.
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            return Err(ControlExecError::Protocol("empty command".to_string()));
+        }
+
+        // Write command + newline.
+        ctrl.stdin
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ControlExecError::Io(e.to_string()))?;
+        ctrl.stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| ControlExecError::Io(e.to_string()))?;
+        ctrl.stdin
+            .flush()
+            .await
+            .map_err(|e| ControlExecError::Io(e.to_string()))?;
+
+        // Read until %begin, then collect lines until %end / %error.
+        let mut buf = String::new();
+        let mut in_block = false;
+
+        loop {
+            let line = ctrl
+                .stdout
+                .next_line()
+                .await
+                .map_err(|e| ControlExecError::Io(e.to_string()))?;
+            let line = match line {
+                Some(l) => l,
+                None => return Err(ControlExecError::Io("stdout closed".to_string())),
+            };
+
+            if !in_block {
+                if line.starts_with("%begin ") {
+                    in_block = true;
+                } else if line.starts_with('%') {
+                    // Notification outside block — skip for now (Step 5 will route).
+                    debug!("ctrl notify: {}", line);
+                }
+                // Any other content before a %begin is unexpected; ignore.
+            } else if line.starts_with("%end ") {
+                return Ok(buf);
+            } else if line.starts_with("%error ") {
+                return Err(ControlExecError::Protocol(buf));
+            } else {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        }
+    }
+
+    async fn try_connect_control() -> Option<ControlMode> {
+        // Pick any existing session to attach control mode to. Without a
+        // session, `tmux -C attach` errors and exits immediately.
+        let session = match Self::first_session_name().await {
+            Some(s) => s,
+            None => {
+                debug!("no tmux sessions; control mode disabled");
+                return None;
+            }
+        };
+
+        let mut child = match Command::new("tmux")
+            .args(["-C", "attach", "-t", &session])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("spawn tmux -C: {e}");
+                return None;
+            }
+        };
+
+        let stdin = child.stdin.take()?;
+        let stdout = BufReader::new(child.stdout.take()?).lines();
+
+        // Drain the initial attach %begin/%end and notifications until the
+        // pipe quiesces. A short timeout keeps startup snappy.
+        let mut ctrl = ControlMode { child, stdin, stdout };
+        if drain_initial(&mut ctrl).await.is_err() {
+            let _ = ctrl.child.kill().await;
+            return None;
+        }
+        debug!("control mode connected to ${}", session);
+        Some(ctrl)
+    }
+
+    async fn first_session_name() -> Option<String> {
+        let output = Command::new("tmux")
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&output.stdout);
+        s.lines().next().map(|l| l.to_string())
+    }
+
+    async fn fork_exec(args: &[&str]) -> Result<String, String> {
+        let output = Command::new("tmux")
+            .args(args)
+            .output()
+            .await
+            .map_err(|e| format!("tmux: {e}"))?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+    }
 }
+
+#[derive(Debug)]
+enum ControlExecError {
+    /// Pipe broken / IO failure — connection should be dropped.
+    /// (Wrapped message is logged but the variant alone drives the decision.)
+    Io(#[allow(dead_code)] String),
+    /// tmux returned %error or other protocol-level failure for this command.
+    Protocol(String),
+}
+
+/// Read any preamble lines (greeting/notifications) from a freshly-spawned
+/// control mode process until the pipe quiesces for ~50 ms.
+async fn drain_initial(ctrl: &mut ControlMode) -> Result<(), std::io::Error> {
+    loop {
+        let next = tokio::time::timeout(Duration::from_millis(50), ctrl.stdout.next_line()).await;
+        match next {
+            Ok(Ok(Some(line))) => {
+                debug!("ctrl preamble: {}", line);
+            }
+            Ok(Ok(None)) => {
+                return Err(std::io::Error::other("stdout closed during preamble"));
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(()), // timeout = quiesced
+        }
+    }
+}
+
+/// Render argv into a single tmux command line for control-mode stdin.
+fn args_to_control_command(args: &[&str]) -> String {
+    args.iter()
+        .map(|a| quote_for_control(a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote_for_control(arg: &str) -> String {
+    let needs_quote = arg.is_empty()
+        || arg.chars().any(|c| {
+            c.is_whitespace() || matches!(c, '\'' | '"' | '\\' | ';' | '#' | '$' | '`')
+        });
+    if !needs_quote {
+        return arg.to_string();
+    }
+    // POSIX-style single-quote escape: ' -> '\''
+    let mut s = String::with_capacity(arg.len() + 2);
+    s.push('\'');
+    for c in arg.chars() {
+        if c == '\'' {
+            s.push_str("'\\''");
+        } else {
+            s.push(c);
+        }
+    }
+    s.push('\'');
+    s
+}
+
+// =============================================================================
+// Refresh output parser (shared by both backends)
+// =============================================================================
 
 struct SessionAccum {
     activity: i64,
@@ -440,7 +629,6 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
         }
     }
 
-    // Sort sessions by (activity desc, attached desc, name asc) — match prior behavior
     let mut keys: Vec<String> = order.into_iter().filter(|k| sessions.contains_key(k)).collect();
     keys.sort_by(|a, b| {
         let sa = &sessions[a];
