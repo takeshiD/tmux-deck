@@ -348,8 +348,8 @@ impl UIActor {
             TmuxResponse::SessionsRefreshed { sessions } => {
                 self.state.update_sessions(sessions);
             }
-            TmuxResponse::PaneCaptured { target: _, content } => {
-                self.state.update_pane_content(content);
+            TmuxResponse::PaneCaptured { target, content } => {
+                self.state.update_pane_content(target, content);
             }
             TmuxResponse::SessionCreated {
                 name,

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
@@ -97,6 +98,26 @@ pub enum PopupMode {
     ConfirmKill,
 }
 
+/// MultiPreview layout
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MultiLayout {
+    /// Equal-sized tiles arranged in a grid (active window per tile).
+    Grid,
+    /// One focused session (70%) plus thumbnails for the rest (30%).
+    Focus,
+}
+
+/// Captured pane/window content with its parsed-ANSI cache.
+#[derive(Debug, Clone, Default)]
+pub struct CachedContent {
+    pub raw: String,
+    pub parsed: Option<Text<'static>>,
+    /// Size of the source pane at capture time; used by the shrink renderer
+    /// to keep aspect ratio when fitting into a thumbnail.
+    pub source_width: u32,
+    pub source_height: u32,
+}
+
 // =============================================================================
 // UI State (formerly App)
 // =============================================================================
@@ -118,11 +139,17 @@ pub struct UIState {
     pub window_list_state: ListState,
     pub pane_list_state: ListState,
 
-    // MultiPreview state (session_idx, window_idx)
+    // MultiPreview state.
+    // multi_session/window are indices into the *visible* (post-pin-filter)
+    // session list so navigation stays consistent under pin/unpin.
     pub multi_session: usize,
     pub multi_window: usize,
+    pub multi_layout: MultiLayout,
+    pub pinned_sessions: HashSet<String>,
+    /// Keyed by tmux window target ("session:idx"); used by MultiPreview tiles.
+    pub window_contents: HashMap<String, CachedContent>,
 
-    // Shared state
+    // Shared state — used by TreeView's single-pane preview.
     pub pane_content: String,
     pub pane_content_parsed: Option<Text<'static>>,
     pub last_error: Option<String>,
@@ -154,6 +181,9 @@ impl UIState {
 
             multi_session: 0,
             multi_window: 0,
+            multi_layout: MultiLayout::Grid,
+            pinned_sessions: HashSet::new(),
+            window_contents: HashMap::new(),
 
             pane_content: String::new(),
             pane_content_parsed: None,
@@ -363,9 +393,38 @@ impl UIState {
         self.last_error = None;
     }
 
-    pub fn update_pane_content(&mut self, content: String) {
-        self.pane_content_parsed = content.as_bytes().into_text().ok();
-        self.pane_content = content;
+    /// Route a captured content blob by target key:
+    ///   * pane-level target ("name:0.1") → TreeView single preview
+    ///   * window-level target ("name:0")  → MultiPreview tile cache
+    pub fn update_pane_content(&mut self, target: String, content: String) {
+        let parsed = content.as_bytes().into_text().ok();
+        let is_pane_target = target.split(':').nth(1).is_some_and(|s| s.contains('.'));
+
+        if is_pane_target {
+            self.pane_content_parsed = parsed;
+            self.pane_content = content;
+        } else {
+            let (source_width, source_height) = self
+                .find_window_size(&target)
+                .unwrap_or((80, 24));
+            self.window_contents.insert(
+                target,
+                CachedContent {
+                    raw: content,
+                    parsed,
+                    source_width,
+                    source_height,
+                },
+            );
+        }
+    }
+
+    fn find_window_size(&self, target: &str) -> Option<(u32, u32)> {
+        let (session_name, idx_str) = target.split_once(':')?;
+        let idx: u32 = idx_str.parse().ok()?;
+        let session = self.sessions.iter().find(|s| s.name == session_name)?;
+        let window = session.windows.iter().find(|w| w.index == idx)?;
+        Some((window.pane_width, window.pane_height))
     }
 
     pub fn set_error(&mut self, message: String) {
@@ -394,6 +453,27 @@ impl UIState {
                 self.multi_window = self.multi_window.min(session.windows.len() - 1);
             }
 
+            // Drop pins whose sessions disappeared, then snap selection back
+            // into the visible set.
+            let alive: HashSet<String> =
+                self.sessions.iter().map(|s| s.name.clone()).collect();
+            self.pinned_sessions.retain(|n| alive.contains(n));
+            self.multi_snap_to_visible();
+
+            // Drop cached window contents for sessions/windows that no longer exist.
+            self.window_contents.retain(|target, _| {
+                let Some((name, idx_str)) = target.split_once(':') else {
+                    return false;
+                };
+                let Ok(idx) = idx_str.parse::<u32>() else {
+                    return false;
+                };
+                self.sessions
+                    .iter()
+                    .find(|s| s.name == name)
+                    .is_some_and(|s| s.windows.iter().any(|w| w.index == idx))
+            });
+
             self.session_list_state.select(Some(self.selected_session));
             self.window_list_state.select(Some(self.selected_window));
             self.pane_list_state.select(Some(self.selected_pane));
@@ -401,6 +481,7 @@ impl UIState {
             self.session_list_state.select(None);
             self.window_list_state.select(None);
             self.pane_list_state.select(None);
+            self.window_contents.clear();
         }
     }
 
@@ -509,40 +590,156 @@ impl UIState {
     // MultiPreview Navigation
     // =========================================================================
 
+    /// Indices into `sessions` of sessions visible in MultiPreview.
+    /// Empty `pinned_sessions` means "show all".
+    pub fn visible_session_indices(&self) -> Vec<usize> {
+        if self.pinned_sessions.is_empty() {
+            (0..self.sessions.len()).collect()
+        } else {
+            self.sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| self.pinned_sessions.contains(&s.name))
+                .map(|(i, _)| i)
+                .collect()
+        }
+    }
+
+    /// Position of `multi_session` within the visible list, if visible.
+    fn multi_visible_pos(&self) -> Option<usize> {
+        let visible = self.visible_session_indices();
+        visible.iter().position(|&i| i == self.multi_session)
+    }
+
+    /// Grid columns for the current visible session count.
+    /// cols = ceil(sqrt(N)); rows derived from N / cols.
+    pub fn multi_grid_cols(&self) -> usize {
+        let n = self.visible_session_indices().len();
+        if n == 0 {
+            0
+        } else {
+            (n as f64).sqrt().ceil() as usize
+        }
+    }
+
     pub fn get_multi_selected_target(&self) -> Option<String> {
         let session = self.sessions.get(self.multi_session)?;
-        let window = session.windows.get(self.multi_window)?;
-        // Use window-level target (tmux will switch to the active pane)
+        let window = match self.multi_layout {
+            MultiLayout::Focus => session.windows.get(self.multi_window)?,
+            MultiLayout::Grid => session
+                .windows
+                .iter()
+                .find(|w| w.active)
+                .or_else(|| session.windows.first())?,
+        };
         Some(format!("{}:{}", session.name, window.index))
     }
 
-    pub fn multi_move_left(&mut self) {
-        if self.multi_session > 0 {
-            self.multi_session -= 1;
-            // Reset window selection for new session
+    pub fn multi_toggle_layout(&mut self) {
+        self.multi_layout = match self.multi_layout {
+            MultiLayout::Grid => MultiLayout::Focus,
+            MultiLayout::Focus => MultiLayout::Grid,
+        };
+        // Re-anchor multi_window to a valid value when entering Focus.
+        if let MultiLayout::Focus = self.multi_layout
+            && let Some(session) = self.sessions.get(self.multi_session)
+            && !session.windows.is_empty()
+        {
+            self.multi_window = self.multi_window.min(session.windows.len() - 1);
+        }
+    }
+
+    pub fn multi_toggle_pin(&mut self) {
+        if let Some(session) = self.sessions.get(self.multi_session) {
+            let name = session.name.clone();
+            if !self.pinned_sessions.insert(name.clone()) {
+                self.pinned_sessions.remove(&name);
+            }
+            self.multi_snap_to_visible();
+        }
+    }
+
+    pub fn multi_clear_pins(&mut self) {
+        self.pinned_sessions.clear();
+    }
+
+    /// Move `multi_session` to the nearest visible index when the current
+    /// selection got hidden by a pin operation.
+    fn multi_snap_to_visible(&mut self) {
+        let visible = self.visible_session_indices();
+        if visible.is_empty() {
+            return;
+        }
+        if !visible.contains(&self.multi_session) {
+            // Pick the visible index closest to current selection.
+            let target = self.multi_session;
+            let nearest = visible
+                .iter()
+                .min_by_key(|&&i| (i as isize - target as isize).abs())
+                .copied()
+                .unwrap_or(visible[0]);
+            self.multi_session = nearest;
             self.multi_window = 0;
+        }
+    }
+
+    pub fn multi_move_left(&mut self) {
+        match self.multi_layout {
+            MultiLayout::Focus => self.multi_step_visible(-1),
+            MultiLayout::Grid => self.multi_step_visible(-1),
         }
     }
 
     pub fn multi_move_right(&mut self) {
-        if self.multi_session < self.sessions.len().saturating_sub(1) {
-            self.multi_session += 1;
-            // Reset window selection for new session
-            self.multi_window = 0;
+        match self.multi_layout {
+            MultiLayout::Focus => self.multi_step_visible(1),
+            MultiLayout::Grid => self.multi_step_visible(1),
         }
     }
 
     pub fn multi_move_up(&mut self) {
-        if self.multi_window > 0 {
-            self.multi_window -= 1;
+        match self.multi_layout {
+            MultiLayout::Focus => {
+                if self.multi_window > 0 {
+                    self.multi_window -= 1;
+                }
+            }
+            MultiLayout::Grid => {
+                let cols = self.multi_grid_cols() as isize;
+                self.multi_step_visible(-cols);
+            }
         }
     }
 
     pub fn multi_move_down(&mut self) {
-        if let Some(session) = self.sessions.get(self.multi_session)
-            && self.multi_window < session.windows.len().saturating_sub(1)
-        {
-            self.multi_window += 1;
+        match self.multi_layout {
+            MultiLayout::Focus => {
+                if let Some(session) = self.sessions.get(self.multi_session)
+                    && self.multi_window < session.windows.len().saturating_sub(1)
+                {
+                    self.multi_window += 1;
+                }
+            }
+            MultiLayout::Grid => {
+                let cols = self.multi_grid_cols() as isize;
+                self.multi_step_visible(cols);
+            }
+        }
+    }
+
+    /// Move the selection by `delta` positions through `visible_session_indices`.
+    /// Saturates at the ends.
+    fn multi_step_visible(&mut self, delta: isize) {
+        let visible = self.visible_session_indices();
+        if visible.is_empty() {
+            return;
+        }
+        let cur = self.multi_visible_pos().unwrap_or(0) as isize;
+        let next = (cur + delta).clamp(0, visible.len() as isize - 1) as usize;
+        let new_idx = visible[next];
+        if new_idx != self.multi_session {
+            self.multi_session = new_idx;
+            self.multi_window = 0;
         }
     }
 }
