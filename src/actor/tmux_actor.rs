@@ -13,23 +13,34 @@ use tracing::debug;
 // =============================================================================
 
 pub struct TmuxActor {
+    /// User-initiated commands (key input, session ops). Higher priority.
     command_rx: mpsc::Receiver<TmuxCommand>,
+    /// Periodic refresh / capture-pane requests. Lower priority.
+    capture_rx: mpsc::Receiver<TmuxCommand>,
     response_tx: mpsc::Sender<TmuxResponse>,
 }
 
 impl TmuxActor {
     pub fn new(
         command_rx: mpsc::Receiver<TmuxCommand>,
+        capture_rx: mpsc::Receiver<TmuxCommand>,
         response_tx: mpsc::Sender<TmuxResponse>,
     ) -> Self {
         Self {
             command_rx,
+            capture_rx,
             response_tx,
         }
     }
 
     pub async fn run(mut self) {
-        while let Some(cmd) = self.command_rx.recv().await {
+        loop {
+            let cmd = tokio::select! {
+                biased;
+                Some(c) = self.command_rx.recv() => c,
+                Some(c) = self.capture_rx.recv() => c,
+                else => break,
+            };
             let response = self.handle_command(cmd).await;
             if self.response_tx.send(response).await.is_err() {
                 // UIActor has been dropped, exit

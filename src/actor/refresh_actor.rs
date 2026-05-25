@@ -9,6 +9,7 @@ use crate::actor::messages::{RefreshControl, TmuxCommand, UIEvent};
 // =============================================================================
 
 pub struct RefreshActor {
+    #[allow(dead_code)]
     tmux_tx: mpsc::Sender<TmuxCommand>,
     ui_event_tx: mpsc::Sender<UIEvent>,
     refresh_control: RefreshControl,
