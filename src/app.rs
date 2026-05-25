@@ -50,6 +50,16 @@ pub struct TmuxSession {
     pub windows: Vec<TmuxWindow>,
 }
 
+impl TmuxSession {
+    /// True when any pane in any window is running `claude`.
+    pub fn has_claude(&self) -> bool {
+        self.windows
+            .iter()
+            .flat_map(|w| &w.panes)
+            .any(|p| p.current_command == "claude")
+    }
+}
+
 // =============================================================================
 // Enums
 // =============================================================================

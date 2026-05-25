@@ -201,13 +201,23 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, session)| {
-            let attached_marker = if session.attached { " ●" } else { "" };
-            let style = if i == state.selected_session {
+            let row_style = if i == state.selected_session {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
                 Style::default()
             };
-            ListItem::new(format!("{}{}", session.name, attached_marker)).style(style)
+            let mut spans: Vec<Span> = vec![Span::styled(session.name.clone(), row_style)];
+            if session.has_claude() {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    "●",
+                    Style::default().fg(Color::Rgb(255, 165, 0)),
+                ));
+            }
+            if session.attached {
+                spans.push(Span::styled(" ●", row_style));
+            }
+            ListItem::new(Line::from(spans)).style(row_style)
         })
         .collect();
 
