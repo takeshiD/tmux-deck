@@ -37,7 +37,10 @@ fn spawn_key_event_poller(key_tx: mpsc::Sender<Event>) {
 pub struct UIActor {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     state: UIState,
+    /// High-priority channel: user-initiated commands.
     tmux_cmd_tx: mpsc::Sender<TmuxCommand>,
+    /// Low-priority channel: periodic capture-pane.
+    tmux_capture_tx: mpsc::Sender<TmuxCommand>,
     tmux_res_rx: mpsc::Receiver<TmuxResponse>,
     ui_event_rx: mpsc::Receiver<UIEvent>,
     key_rx: mpsc::Receiver<Event>,
@@ -49,6 +52,7 @@ impl UIActor {
         terminal: Terminal<CrosstermBackend<io::Stdout>>,
         state: UIState,
         tmux_cmd_tx: mpsc::Sender<TmuxCommand>,
+        tmux_capture_tx: mpsc::Sender<TmuxCommand>,
         tmux_res_rx: mpsc::Receiver<TmuxResponse>,
         ui_event_rx: mpsc::Receiver<UIEvent>,
         refresh_control: RefreshControl,
@@ -61,6 +65,7 @@ impl UIActor {
             terminal,
             state,
             tmux_cmd_tx,
+            tmux_capture_tx,
             tmux_res_rx,
             ui_event_rx,
             key_rx,
@@ -99,13 +104,13 @@ impl UIActor {
                 Some(event) = self.ui_event_rx.recv() => {
                     match event {
                         UIEvent::Tick => {
-                            // Request pane capture if in TreeView mode
+                            // Request pane capture if in TreeView mode (low-priority channel)
                             if self.state.view_mode == ViewMode::TreeView
                                 && let Some((target, start, end)) =
                                     self.state.get_selected_pane_target_with_capture_range()
                             {
                                 let _ = self
-                                    .tmux_cmd_tx
+                                    .tmux_capture_tx
                                     .send(TmuxCommand::CapturePane { target, start, end })
                                     .await;
                             }

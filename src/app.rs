@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use ansi_to_tui::IntoText;
+use ratatui::text::Text;
 use ratatui::widgets::ListState;
 
 // =============================================================================
@@ -112,6 +114,7 @@ pub struct UIState {
 
     // Shared state
     pub pane_content: String,
+    pub pane_content_parsed: Option<Text<'static>>,
     pub last_error: Option<String>,
     #[allow(dead_code)]
     pub interval: Duration,
@@ -143,6 +146,7 @@ impl UIState {
             multi_window: 0,
 
             pane_content: String::new(),
+            pane_content_parsed: None,
             last_error: None,
             interval: Duration::from_millis(interval_ms),
             input_mode: InputMode::Normal,
@@ -350,6 +354,7 @@ impl UIState {
     }
 
     pub fn update_pane_content(&mut self, content: String) {
+        self.pane_content_parsed = content.as_bytes().into_text().ok();
         self.pane_content = content;
     }
 

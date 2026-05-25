@@ -60,8 +60,11 @@ async fn main() -> Result<()> {
 }
 
 async fn run_app(terminal: Terminal<CrosstermBackend<io::Stdout>>, interval_ms: u64) -> Result<()> {
-    // Create channels
+    // Create channels.
+    // tmux_cmd_*: high-priority user-initiated commands.
+    // tmux_capture_*: low-priority periodic capture-pane requests.
     let (tmux_cmd_tx, tmux_cmd_rx) = mpsc::channel::<TmuxCommand>(32);
+    let (tmux_capture_tx, tmux_capture_rx) = mpsc::channel::<TmuxCommand>(32);
     let (tmux_resp_tx, tmux_resp_rx) = mpsc::channel::<TmuxResponse>(32);
     let (ui_event_tx, ui_event_rx) = mpsc::channel::<UIEvent>(32);
 
@@ -73,9 +76,9 @@ async fn run_app(terminal: Terminal<CrosstermBackend<io::Stdout>>, interval_ms: 
     let interval = Duration::from_millis(interval_ms);
 
     // Create actors
-    let tmux_actor = TmuxActor::new(tmux_cmd_rx, tmux_resp_tx);
+    let tmux_actor = TmuxActor::new(tmux_cmd_rx, tmux_capture_rx, tmux_resp_tx);
     let refresh_actor = RefreshActor::new(
-        tmux_cmd_tx.clone(),
+        tmux_capture_tx.clone(),
         ui_event_tx,
         refresh_control.clone(),
         interval,
@@ -84,6 +87,7 @@ async fn run_app(terminal: Terminal<CrosstermBackend<io::Stdout>>, interval_ms: 
         terminal,
         state,
         tmux_cmd_tx,
+        tmux_capture_tx,
         tmux_resp_rx,
         ui_event_rx,
         refresh_control,

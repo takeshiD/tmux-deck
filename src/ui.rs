@@ -339,15 +339,21 @@ fn render_pane_preview_tree(frame: &mut Frame, state: &UIState, area: Rect) {
 
     let inner = block.inner(area);
     let max_lines = inner.height as usize;
-    let mut lines: Vec<&str> = state.pane_content.lines().collect();
-    if lines.len() > max_lines {
-        lines = lines[lines.len().saturating_sub(max_lines)..].to_vec();
-    }
-    let preview = lines.join("\n");
 
-    let text = match preview.as_bytes().into_text() {
-        Ok(text) => text,
-        Err(_) => Text::raw(preview),
+    // Use cached parsed Text (rebuilt only when pane_content changes).
+    let text = if let Some(parsed) = state.pane_content_parsed.as_ref() {
+        if parsed.lines.len() > max_lines {
+            let start = parsed.lines.len().saturating_sub(max_lines);
+            Text::from(parsed.lines[start..].to_vec())
+        } else {
+            parsed.clone()
+        }
+    } else {
+        let mut raw: Vec<&str> = state.pane_content.lines().collect();
+        if raw.len() > max_lines {
+            raw = raw[raw.len().saturating_sub(max_lines)..].to_vec();
+        }
+        Text::raw(raw.join("\n"))
     };
 
     let paragraph = Paragraph::new(text).block(block);
