@@ -86,18 +86,31 @@ impl TmuxActor {
     // =========================================================================
     // Refresh All Sessions
     // =========================================================================
+    //
+    // Single fork+exec via `\;`-chained tmux commands and `-a` flag.
+    // Each output line is tagged with SESS/WIN/PANE prefix for dispatch.
 
     async fn refresh_all(&self) -> TmuxResponse {
         let output = Command::new("tmux")
             .args([
                 "list-sessions",
                 "-F",
-                "#{session_name}\t#{session_attached}\t#{session_activity}",
+                "SESS\t#{session_name}\t#{session_attached}\t#{session_activity}",
+                ";",
+                "list-windows",
+                "-a",
+                "-F",
+                "WIN\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_activity}",
+                ";",
+                "list-panes",
+                "-a",
+                "-F",
+                "PANE\t#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_index}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_last}\t#{pane_current_command}",
             ])
             .output()
             .await;
 
-        let sessions_str = match output {
+        let stdout = match output {
             Ok(output) if output.status.success() => {
                 String::from_utf8_lossy(&output.stdout).to_string()
             }
@@ -108,211 +121,13 @@ impl TmuxActor {
             }
             Err(e) => {
                 return TmuxResponse::Error {
-                    message: format!("Failed to list sessions: {}", e),
+                    message: format!("Failed to refresh: {}", e),
                 };
             }
         };
 
-        let mut sessions = Vec::new();
-
-        for session_line in sessions_str.lines() {
-            let parts: Vec<&str> = session_line.split('\t').collect();
-            if parts.len() < 3 {
-                continue;
-            }
-
-            let session_name = parts[0].to_string();
-            let attached = parts[1] == "1";
-            let activity = parts[2].parse::<i64>().unwrap_or(0);
-
-            let windows = self.get_windows(&session_name).await;
-
-            sessions.push((activity, attached, session_name, windows));
-        }
-
-        sessions.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| b.1.cmp(&a.1))
-                .then_with(|| a.2.cmp(&b.2))
-        });
-
-        let sessions = sessions
-            .into_iter()
-            .map(|(_, attached, name, windows)| TmuxSession {
-                name,
-                attached,
-                windows,
-            })
-            .collect();
-
-        TmuxResponse::SessionsRefreshed { sessions }
-    }
-
-    async fn get_windows(&self, session_name: &str) -> Vec<TmuxWindow> {
-        let output = Command::new("tmux")
-            .args([
-                "list-windows",
-                "-t",
-                session_name,
-                "-F",
-                "#{window_index}\t#{window_name}\t#{window_active}\t#{window_activity}",
-            ])
-            .output()
-            .await;
-
-        let windows_str = match output {
-            Ok(output) if output.status.success() => {
-                String::from_utf8_lossy(&output.stdout).to_string()
-            }
-            _ => return Vec::new(),
-        };
-
-        let mut windows = Vec::new();
-
-        for window_line in windows_str.lines() {
-            let w_parts: Vec<&str> = window_line.split('\t').collect();
-            if w_parts.len() < 4 {
-                continue;
-            }
-
-            let window_index: u32 = w_parts[0].parse().unwrap_or(0);
-            let window_name = w_parts[1].to_string();
-            let window_active = w_parts[2] == "1";
-            let window_activity = w_parts[3].parse::<i64>().unwrap_or(0);
-
-            let (panes, pane_width, pane_height) = self.get_panes(session_name, window_index).await;
-
-            // let content = self
-            //     .capture_window_content(session_name, window_index, pane_height)
-            //     .await;
-
-            windows.push((
-                window_activity,
-                window_active,
-                window_index,
-                TmuxWindow {
-                    index: window_index,
-                    name: window_name,
-                    active: window_active,
-                    panes,
-                    // content,
-                    pane_width,
-                    pane_height,
-                },
-            ));
-        }
-
-        windows.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| b.1.cmp(&a.1))
-                .then_with(|| a.2.cmp(&b.2))
-        });
-
-        windows.into_iter().map(|(_, _, _, w)| w).collect()
-    }
-
-    async fn get_panes(&self, session_name: &str, window_index: u32) -> (Vec<TmuxPane>, u32, u32) {
-        let target = format!("{}:{}", session_name, window_index);
-        let output = Command::new("tmux")
-            .args([
-                "list-panes",
-                "-t",
-                &target,
-                "-F",
-                "#{pane_id}\t#{pane_index}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_last}\t#{pane_current_command}",
-            ])
-            .output()
-            .await;
-
-        let panes_str = match output {
-            Ok(output) if output.status.success() => {
-                String::from_utf8_lossy(&output.stdout).to_string()
-            }
-            _ => return (Vec::new(), 80, 24),
-        };
-
-        let mut panes = Vec::new();
-        let mut active_width = 80u32;
-        let mut active_height = 24u32;
-
-        for pane_line in panes_str.lines() {
-            let p_parts: Vec<&str> = pane_line.split('\t').collect();
-            if p_parts.len() < 7 {
-                continue;
-            }
-
-            let pane_id = p_parts[0].to_string();
-            let pane_index: u32 = p_parts[1].parse().unwrap_or(0);
-            let width: u32 = p_parts[2].parse().unwrap_or(80);
-            let height: u32 = p_parts[3].parse().unwrap_or(24);
-            let pane_active = p_parts[4] == "1";
-            let pane_last = p_parts[5] == "1";
-            let current_command = p_parts[6].to_string();
-
-            if pane_active {
-                active_width = width;
-                active_height = height;
-            }
-
-            panes.push((
-                pane_active,
-                pane_last,
-                pane_index,
-                TmuxPane {
-                    id: pane_id,
-                    index: pane_index,
-                    width,
-                    height,
-                    active: pane_active,
-                    current_command,
-                },
-            ));
-        }
-
-        panes.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| b.1.cmp(&a.1))
-                .then_with(|| a.2.cmp(&b.2))
-        });
-
-        let panes = panes.into_iter().map(|(_, _, _, p)| p).collect();
-
-        (panes, active_width, active_height)
-    }
-
-    async fn capture_window_content(
-        &self,
-        session_name: &str,
-        window_index: u32,
-        pane_height: u32,
-    ) -> String {
-        debug!(
-            "capture-pane: session={session_name}, window={window_index}, pane-height={pane_height}"
-        );
-        let target = format!("{}:{}", session_name, window_index);
-        let height = pane_height.max(1);
-        let end = format!("{}", height);
-        let output = Command::new("tmux")
-            .args([
-                "capture-pane",
-                "-e",
-                "-p",
-                "-J",
-                "-S",
-                0.to_string().as_str(),
-                "-E",
-                &end,
-                "-t",
-                &target,
-            ])
-            .output()
-            .await;
-
-        match output {
-            Ok(output) if output.status.success() => {
-                String::from_utf8_lossy(&output.stdout).to_string()
-            }
-            _ => String::new(),
+        TmuxResponse::SessionsRefreshed {
+            sessions: build_sessions(&stdout),
         }
     }
 
@@ -488,6 +303,165 @@ impl TmuxActor {
             }
         }
     }
+}
+
+struct SessionAccum {
+    activity: i64,
+    attached: bool,
+    windows: Vec<WindowAccum>,
+}
+
+struct WindowAccum {
+    activity: i64,
+    active: bool,
+    index: u32,
+    name: String,
+    /// (active, last, index, pane) — sorted then unwrapped
+    panes_raw: Vec<(bool, bool, u32, TmuxPane)>,
+    pane_width: u32,
+    pane_height: u32,
+}
+
+fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
+    use std::collections::HashMap;
+
+    let mut sessions: HashMap<String, SessionAccum> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+
+    for line in stdout.lines() {
+        let mut it = line.split('\t');
+        let tag = match it.next() {
+            Some(t) => t,
+            None => continue,
+        };
+
+        match tag {
+            "SESS" => {
+                let name = it.next().unwrap_or("").to_string();
+                let attached = it.next() == Some("1");
+                let activity = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                if name.is_empty() {
+                    continue;
+                }
+                if !sessions.contains_key(&name) {
+                    order.push(name.clone());
+                }
+                sessions.insert(
+                    name,
+                    SessionAccum {
+                        activity,
+                        attached,
+                        windows: Vec::new(),
+                    },
+                );
+            }
+            "WIN" => {
+                let session = it.next().unwrap_or("");
+                let index: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let name = it.next().unwrap_or("").to_string();
+                let active = it.next() == Some("1");
+                let activity = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                if let Some(s) = sessions.get_mut(session) {
+                    s.windows.push(WindowAccum {
+                        activity,
+                        active,
+                        index,
+                        name,
+                        panes_raw: Vec::new(),
+                        pane_width: 80,
+                        pane_height: 24,
+                    });
+                }
+            }
+            "PANE" => {
+                let session = it.next().unwrap_or("");
+                let window_index: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let pane_id = it.next().unwrap_or("").to_string();
+                let pane_index: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let width: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(80);
+                let height: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(24);
+                let active = it.next() == Some("1");
+                let last = it.next() == Some("1");
+                let current_command = it.next().unwrap_or("").to_string();
+
+                if let Some(s) = sessions.get_mut(session)
+                    && let Some(w) = s.windows.iter_mut().find(|w| w.index == window_index)
+                {
+                    if active {
+                        w.pane_width = width;
+                        w.pane_height = height;
+                    }
+                    w.panes_raw.push((
+                        active,
+                        last,
+                        pane_index,
+                        TmuxPane {
+                            id: pane_id,
+                            index: pane_index,
+                            width,
+                            height,
+                            active,
+                            current_command,
+                        },
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for name in &order {
+        if let Some(s) = sessions.get_mut(name) {
+            for w in &mut s.windows {
+                // (active desc, last desc, index asc)
+                w.panes_raw.sort_by(|a, b| {
+                    b.0.cmp(&a.0)
+                        .then_with(|| b.1.cmp(&a.1))
+                        .then_with(|| a.2.cmp(&b.2))
+                });
+            }
+            s.windows.sort_by(|a, b| {
+                b.activity
+                    .cmp(&a.activity)
+                    .then_with(|| b.active.cmp(&a.active))
+                    .then_with(|| a.index.cmp(&b.index))
+            });
+        }
+    }
+
+    // Sort sessions by (activity desc, attached desc, name asc) — match prior behavior
+    let mut keys: Vec<String> = order.into_iter().filter(|k| sessions.contains_key(k)).collect();
+    keys.sort_by(|a, b| {
+        let sa = &sessions[a];
+        let sb = &sessions[b];
+        sb.activity
+            .cmp(&sa.activity)
+            .then_with(|| sb.attached.cmp(&sa.attached))
+            .then_with(|| a.cmp(b))
+    });
+
+    keys.into_iter()
+        .filter_map(|name| {
+            let s = sessions.remove(&name)?;
+            let windows: Vec<TmuxWindow> = s
+                .windows
+                .into_iter()
+                .map(|w| TmuxWindow {
+                    index: w.index,
+                    name: w.name,
+                    active: w.active,
+                    panes: w.panes_raw.into_iter().map(|(_, _, _, p)| p).collect(),
+                    pane_width: w.pane_width,
+                    pane_height: w.pane_height,
+                })
+                .collect();
+            Some(TmuxSession {
+                name,
+                attached: s.attached,
+                windows,
+            })
+        })
+        .collect()
 }
 
 fn append_switch_log(path: &str, target: &str, success: bool, error: Option<&str>) {
