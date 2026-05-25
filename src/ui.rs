@@ -1,10 +1,12 @@
-use ansi_to_tui::IntoText;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
-use crate::app::{Focus, InputMode, PopupMode, TmuxPane, TmuxWindow, UIState, ViewMode};
+use crate::app::{
+    CachedContent, Focus, InputMode, MultiLayout, PopupMode, TmuxPane, TmuxSession, TmuxWindow,
+    UIState, ViewMode,
+};
 
 // =============================================================================
 // ANSI Content Processing
@@ -17,29 +19,12 @@ struct StyledChar {
     style: Style,
 }
 
-fn ansi_to_styled_grid(content: &str) -> Vec<Vec<StyledChar>> {
-    let text = match content.as_bytes().into_text() {
-        Ok(t) => t,
-        Err(_) => {
-            return content
-                .lines()
-                .map(|line| {
-                    line.chars()
-                        .map(|ch| StyledChar {
-                            ch,
-                            style: Style::default(),
-                        })
-                        .collect()
-                })
-                .collect();
-        }
-    };
-
-    let mut grid: Vec<Vec<StyledChar>> = Vec::new();
-
-    for line in text.lines {
+/// Build a styled grid from a pre-parsed Text. Cheap; just iterates spans.
+fn text_to_styled_grid(text: &Text<'_>) -> Vec<Vec<StyledChar>> {
+    let mut grid: Vec<Vec<StyledChar>> = Vec::with_capacity(text.lines.len());
+    for line in &text.lines {
         let mut row: Vec<StyledChar> = Vec::new();
-        for span in line.spans {
+        for span in &line.spans {
             for ch in span.content.chars() {
                 row.push(StyledChar {
                     ch,
@@ -49,7 +34,6 @@ fn ansi_to_styled_grid(content: &str) -> Vec<Vec<StyledChar>> {
         }
         grid.push(row);
     }
-
     grid
 }
 
@@ -407,174 +391,298 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
 
 fn render_multi_preview(frame: &mut Frame, state: &UIState) {
     let area = frame.area();
-
     let main_chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
-
     let preview_area = main_chunks[0];
     let status_area = main_chunks[1];
 
-    if state.sessions.is_empty() {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" No sessions found ");
+    let visible: Vec<usize> = state.visible_session_indices();
+    if state.sessions.is_empty() || visible.is_empty() {
+        let title = if state.sessions.is_empty() {
+            " No sessions found "
+        } else {
+            " No pinned sessions — press P to clear pins "
+        };
+        let block = Block::default().borders(Borders::ALL).title(title);
         frame.render_widget(block, preview_area);
     } else {
-        // Create horizontal layout for sessions
-        // Selected session gets 80%, others share 20%
-        let session_constraints: Vec<Constraint> = if state.sessions.len() == 1 {
-            vec![Constraint::Percentage(100)]
-        } else {
-            let other_count = state.sessions.len() - 1;
-            // Each non-selected session gets an equal share of 20%
-            let other_percentage = 30 / other_count as u16;
-            state.sessions
-                .iter()
-                .enumerate()
-                .map(|(idx, _)| {
-                    if idx == state.multi_session {
-                        Constraint::Percentage(70)
-                    } else {
-                        Constraint::Percentage(other_percentage.max(1))
-                    }
-                })
-                .collect()
-        };
-
-        let session_chunks = Layout::horizontal(session_constraints).split(preview_area);
-
-        for (session_idx, (session, session_area)) in
-            state.sessions.iter().zip(session_chunks.iter()).enumerate()
-        {
-            let is_selected_session = session_idx == state.multi_session;
-
-            // Session block style
-            let session_border_style = if is_selected_session {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else if session.attached {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            let session_title = if session.attached {
-                format!(" {} ● ", session.name)
-            } else {
-                format!(" {} ", session.name)
-            };
-
-            let session_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(session_border_style)
-                .title(session_title);
-
-            let inner_area = session_block.inner(*session_area);
-            frame.render_widget(session_block, *session_area);
-
-            if session.windows.is_empty() {
-                let no_windows = Paragraph::new("No windows")
-                    .style(Style::default().fg(Color::DarkGray));
-                frame.render_widget(no_windows, inner_area);
-                continue;
-            }
-
-            // Create vertical layout for windows within this session
-            let window_constraints: Vec<Constraint> = session
-                .windows
-                .iter()
-                .map(|_| Constraint::Ratio(1, session.windows.len() as u32))
-                .collect();
-
-            let window_chunks = Layout::vertical(window_constraints).split(inner_area);
-
-            for (window_idx, (window, window_area)) in
-                session.windows.iter().zip(window_chunks.iter()).enumerate()
-            {
-                let is_selected_window =
-                    is_selected_session && window_idx == state.multi_window;
-
-                render_window_preview(frame, window, *window_area, is_selected_window);
-            }
+        match state.multi_layout {
+            MultiLayout::Grid => render_grid_layout(frame, state, &visible, preview_area),
+            MultiLayout::Focus => render_focus_layout(frame, state, &visible, preview_area),
         }
     }
 
-    // Status bar
-    let status_text = if let Some(ref err) = state.last_error {
-        Line::from(vec![Span::styled(
-            format!(" Error: {} ", err),
-            Style::default().fg(Color::Red),
-        )])
-    } else {
-        let selected_info = state
-            .get_multi_selected_target()
-            .unwrap_or_else(|| "None".to_string());
-
-        Line::from(vec![
-            Span::styled("h/l", Style::default().fg(Color::Yellow)),
-            Span::raw(":session "),
-            Span::styled("j/k", Style::default().fg(Color::Yellow)),
-            Span::raw(":window "),
-            Span::styled("Space×2", Style::default().fg(Color::Magenta)),
-            Span::raw(":tree "),
-            Span::styled("C-n", Style::default().fg(Color::Green)),
-            Span::raw(":new "),
-            Span::styled("C-r", Style::default().fg(Color::Green)),
-            Span::raw(":rename "),
-            Span::styled("C-x", Style::default().fg(Color::Red)),
-            Span::raw(":kill "),
-            Span::styled("q", Style::default().fg(Color::Yellow)),
-            Span::raw(":quit "),
-            Span::raw("| "),
-            Span::styled(
-                format!("Sel:{}", selected_info),
-                Style::default().fg(Color::Cyan),
-            ),
-        ])
-    };
-
-    frame.render_widget(
-        Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray)),
-        status_area,
-    );
+    render_multi_status_bar(frame, state, status_area);
 }
 
-fn render_window_preview(frame: &mut Frame, window: &TmuxWindow, area: Rect, is_selected: bool) {
+/// Equal-sized tiles in a cols × rows grid. One tile per visible session,
+/// showing that session's active window.
+fn render_grid_layout(frame: &mut Frame, state: &UIState, visible: &[usize], area: Rect) {
+    let n = visible.len();
+    let cols = state.multi_grid_cols().max(1);
+    let rows = n.div_ceil(cols);
+
+    let row_chunks = Layout::vertical(
+        (0..rows)
+            .map(|_| Constraint::Ratio(1, rows as u32))
+            .collect::<Vec<_>>(),
+    )
+    .split(area);
+
+    for r in 0..rows {
+        let cells_in_row = (n - r * cols).min(cols);
+        let col_chunks = Layout::horizontal(
+            (0..cells_in_row)
+                .map(|_| Constraint::Ratio(1, cells_in_row as u32))
+                .collect::<Vec<_>>(),
+        )
+        .split(row_chunks[r]);
+
+        for c in 0..cells_in_row {
+            let slot = r * cols + c;
+            let sess_idx = visible[slot];
+            let session = &state.sessions[sess_idx];
+            let is_selected = sess_idx == state.multi_session;
+            let is_pinned = state.pinned_sessions.contains(&session.name);
+            render_session_tile(frame, state, session, col_chunks[c], is_selected, is_pinned);
+        }
+    }
+}
+
+/// Selected session gets 70% width; the rest share 30% as thumbnails.
+/// Within the selected session, all windows are stacked.
+fn render_focus_layout(frame: &mut Frame, state: &UIState, visible: &[usize], area: Rect) {
+    let constraints: Vec<Constraint> = if visible.len() == 1 {
+        vec![Constraint::Percentage(100)]
+    } else {
+        let other_count = (visible.len() - 1) as u16;
+        let other_pct = (30 / other_count).max(1);
+        visible
+            .iter()
+            .map(|&i| {
+                if i == state.multi_session {
+                    Constraint::Percentage(70)
+                } else {
+                    Constraint::Percentage(other_pct)
+                }
+            })
+            .collect()
+    };
+    let chunks = Layout::horizontal(constraints).split(area);
+
+    for (slot, &sess_idx) in visible.iter().enumerate() {
+        let session = &state.sessions[sess_idx];
+        let is_selected = sess_idx == state.multi_session;
+        let is_pinned = state.pinned_sessions.contains(&session.name);
+        let session_area = chunks[slot];
+
+        let border_style = session_border_style(is_selected, session.attached);
+        let title = session_title(session, is_pinned);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(title);
+        let inner = block.inner(session_area);
+        frame.render_widget(block, session_area);
+
+        if session.windows.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No windows").style(Style::default().fg(Color::DarkGray)),
+                inner,
+            );
+            continue;
+        }
+
+        // Stack all windows vertically for the selected session; for the rest,
+        // show only the active window so thumbnails stay readable.
+        let windows_to_show: Vec<usize> = if is_selected {
+            (0..session.windows.len()).collect()
+        } else {
+            let active = session
+                .windows
+                .iter()
+                .position(|w| w.active)
+                .unwrap_or(0);
+            vec![active]
+        };
+
+        let win_chunks = Layout::vertical(
+            (0..windows_to_show.len())
+                .map(|_| Constraint::Ratio(1, windows_to_show.len() as u32))
+                .collect::<Vec<_>>(),
+        )
+        .split(inner);
+
+        for (slot, &widx) in windows_to_show.iter().enumerate() {
+            let window = &session.windows[widx];
+            let is_sel_window = is_selected && widx == state.multi_window;
+            let key = format!("{}:{}", session.name, window.index);
+            render_window_tile(
+                frame,
+                window,
+                state.window_contents.get(&key),
+                win_chunks[slot],
+                is_sel_window,
+            );
+        }
+    }
+}
+
+/// One tile = one session's active window. Used by Grid layout.
+fn render_session_tile(
+    frame: &mut Frame,
+    state: &UIState,
+    session: &TmuxSession,
+    area: Rect,
+    is_selected: bool,
+    is_pinned: bool,
+) {
+    let border_style = session_border_style(is_selected, session.attached);
+    let title = session_title(session, is_pinned);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(window) = session
+        .windows
+        .iter()
+        .find(|w| w.active)
+        .or_else(|| session.windows.first())
+    else {
+        frame.render_widget(
+            Paragraph::new("No windows").style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    };
+    let key = format!("{}:{}", session.name, window.index);
+    render_window_body(frame, window, state.window_contents.get(&key), inner, true);
+}
+
+/// A bordered window box with a title and inline content (used by Focus).
+fn render_window_tile(
+    frame: &mut Frame,
+    window: &TmuxWindow,
+    cached: Option<&CachedContent>,
+    area: Rect,
+    is_selected: bool,
+) {
     let border_style = if is_selected {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else if window.active {
         Style::default().fg(Color::Green)
     } else {
         Style::default().fg(Color::DarkGray)
     };
-
     let active_marker = if window.active { " *" } else { "" };
     let cmd = window
         .get_active_pane()
         .map(|p| p.current_command.as_str())
         .unwrap_or("");
-
     let title = format!(" {}:{}{} [{}] ", window.index, window.name, active_marker, cmd);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(title);
-
     let inner = block.inner(area);
+    frame.render_widget(block, area);
+    render_window_body(frame, window, cached, inner, false);
+}
 
-    // let styled_grid = ansi_to_styled_grid(&window.content);
-    // let shrunk_text = shrink_styled_content(
-    //     &styled_grid,
-    //     inner.width as usize,
-    //     inner.height as usize,
-    //     window.pane_width,
-    //     window.pane_height,
-    // );
+/// Render the captured content into `area`. Subsamples columns and rows to fit.
+/// `tile_header` adds a small "session:window" hint at the top when used by Grid.
+fn render_window_body(
+    frame: &mut Frame,
+    window: &TmuxWindow,
+    cached: Option<&CachedContent>,
+    area: Rect,
+    _tile_header: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let text = match cached.and_then(|c| c.parsed.as_ref()) {
+        Some(t) => {
+            let grid = text_to_styled_grid(t);
+            let src_w = cached.map(|c| c.source_width).unwrap_or(window.pane_width);
+            let src_h = cached.map(|c| c.source_height).unwrap_or(window.pane_height);
+            shrink_styled_content(&grid, area.width as usize, area.height as usize, src_w, src_h)
+        }
+        None => Text::raw("…"),
+    };
+    frame.render_widget(Paragraph::new(text), area);
+}
 
-    // let paragraph = Paragraph::new(shrunk_text).block(block);
+fn session_border_style(is_selected: bool, attached: bool) -> Style {
+    if is_selected {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else if attached {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
 
-    // frame.render_widget(paragraph, area);
+fn session_title(session: &TmuxSession, is_pinned: bool) -> String {
+    let pin = if is_pinned { "📌 " } else { "" };
+    let attached = if session.attached { " ●" } else { "" };
+    let claude = if session.has_claude() { " ◉" } else { "" };
+    format!(" {}{}{}{} ", pin, session.name, attached, claude)
+}
+
+fn render_multi_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
+    let status_text = if let Some(ref err) = state.last_error {
+        Line::from(vec![Span::styled(
+            format!(" Error: {} ", err),
+            Style::default().fg(Color::Red),
+        )])
+    } else {
+        let layout_label = match state.multi_layout {
+            MultiLayout::Grid => "Grid",
+            MultiLayout::Focus => "Focus",
+        };
+        let pin_label = if state.pinned_sessions.is_empty() {
+            "all".to_string()
+        } else {
+            format!("{} pinned", state.pinned_sessions.len())
+        };
+        let selected_info = state
+            .get_multi_selected_target()
+            .unwrap_or_else(|| "None".to_string());
+
+        Line::from(vec![
+            Span::styled("h/j/k/l", Style::default().fg(Color::Yellow)),
+            Span::raw(":nav "),
+            Span::styled("Tab", Style::default().fg(Color::Yellow)),
+            Span::raw(":layout "),
+            Span::styled("p/P", Style::default().fg(Color::Yellow)),
+            Span::raw(":pin "),
+            Span::styled("Space×2", Style::default().fg(Color::Magenta)),
+            Span::raw(":tree "),
+            Span::styled("C-n", Style::default().fg(Color::Green)),
+            Span::raw("/"),
+            Span::styled("C-r", Style::default().fg(Color::Green)),
+            Span::raw("/"),
+            Span::styled("C-x", Style::default().fg(Color::Red)),
+            Span::raw(":session "),
+            Span::raw("| "),
+            Span::styled(layout_label, Style::default().fg(Color::Cyan)),
+            Span::raw(" / "),
+            Span::styled(pin_label, Style::default().fg(Color::Cyan)),
+            Span::raw(" | "),
+            Span::styled(
+                format!("Sel:{}", selected_info),
+                Style::default().fg(Color::Cyan),
+            ),
+        ])
+    };
+    frame.render_widget(
+        Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray)),
+        area,
+    );
 }
 
 // =============================================================================

@@ -110,7 +110,6 @@ pub enum MultiLayout {
 /// Captured pane/window content with its parsed-ANSI cache.
 #[derive(Debug, Clone, Default)]
 pub struct CachedContent {
-    pub raw: String,
     pub parsed: Option<Text<'static>>,
     /// Size of the source pane at capture time; used by the shrink renderer
     /// to keep aspect ratio when fitting into a thumbnail.
@@ -407,10 +406,11 @@ impl UIState {
             let (source_width, source_height) = self
                 .find_window_size(&target)
                 .unwrap_or((80, 24));
+            // raw String is dropped — only the parsed Text is needed for render
+            let _ = content;
             self.window_contents.insert(
                 target,
                 CachedContent {
-                    raw: content,
                     parsed,
                     source_width,
                     source_height,
