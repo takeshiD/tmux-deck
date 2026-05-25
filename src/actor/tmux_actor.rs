@@ -2,9 +2,10 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::actor::messages::{TmuxCommand, TmuxResponse};
@@ -14,10 +15,11 @@ use crate::app::{TmuxPane, TmuxSession, TmuxWindow};
 // TmuxActor — control-mode based, with fork+exec fallback
 // =============================================================================
 //
-// A single persistent `tmux -C attach` process owns stdin/stdout. Each tmux
-// operation writes one command line and consumes one `%begin .. %end`
-// (or `%error`) block. Asynchronous notifications between blocks are skipped
-// (Step 5 will route them as events).
+// A single persistent `tmux -C attach` process owns stdin/stdout. A background
+// reader task partitions lines into command-response events (Begin/Output/End/
+// Error) and asynchronous notifications. exec_via_ctrl consumes one block at a
+// time; structural notifications (window-add, session-renamed, …) trigger an
+// internal RefreshAll without waiting for the next periodic tick.
 //
 // If the control-mode process is missing or dies, the actor falls back to
 // per-operation fork+exec and retries connecting before subsequent calls.
@@ -32,7 +34,29 @@ pub struct TmuxActor {
 struct ControlMode {
     child: Child,
     stdin: ChildStdin,
-    stdout: Lines<BufReader<ChildStdout>>,
+    /// Per-line events from the reader task for the currently-pending command.
+    response_rx: mpsc::Receiver<CtrlEvent>,
+    /// Asynchronous structural-change notifications (best-effort, coalesced).
+    notify_rx: mpsc::Receiver<()>,
+    /// Reader task; aborted on drop.
+    reader_handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for ControlMode {
+    fn drop(&mut self) {
+        if let Some(h) = self.reader_handle.take() {
+            h.abort();
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CtrlEvent {
+    Begin,
+    End,
+    Error,
+    Line(String),
+    Closed,
 }
 
 impl TmuxActor {
@@ -54,11 +78,32 @@ impl TmuxActor {
         self.ctrl = Self::try_connect_control().await;
 
         loop {
-            let cmd = tokio::select! {
-                biased;
-                Some(c) = self.command_rx.recv() => c,
-                Some(c) = self.capture_rx.recv() => c,
-                else => break,
+            // tokio::select! requires the future inside notify_rx.recv() to be
+            // present; build it as a guarded branch so it's only polled when a
+            // connection exists.
+            let cmd = {
+                let notify_available = self.ctrl.is_some();
+                tokio::select! {
+                    biased;
+                    Some(c) = self.command_rx.recv() => c,
+                    Some(c) = self.capture_rx.recv() => c,
+                    Some(()) = async {
+                        if notify_available {
+                            self.ctrl.as_mut().unwrap().notify_rx.recv().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        // Coalesce any other pending notifications into a single
+                        // refresh — bursts (window-add + layout-change + …) for
+                        // one user action would otherwise queue N refreshes.
+                        if let Some(ctrl) = self.ctrl.as_mut() {
+                            while ctrl.notify_rx.try_recv().is_ok() {}
+                        }
+                        TmuxCommand::RefreshAll
+                    }
+                    else => break,
+                }
             };
             let response = self.handle_command(cmd).await;
             if self.response_tx.send(response).await.is_err() {
@@ -344,36 +389,26 @@ impl TmuxActor {
             .await
             .map_err(|e| ControlExecError::Io(e.to_string()))?;
 
-        // Read until %begin, then collect lines until %end / %error.
+        // Consume events from the reader task until End / Error / Closed.
         let mut buf = String::new();
         let mut in_block = false;
-
         loop {
-            let line = ctrl
-                .stdout
-                .next_line()
-                .await
-                .map_err(|e| ControlExecError::Io(e.to_string()))?;
-            let line = match line {
-                Some(l) => l,
-                None => return Err(ControlExecError::Io("stdout closed".to_string())),
+            let event = match ctrl.response_rx.recv().await {
+                Some(e) => e,
+                None => return Err(ControlExecError::Io("reader task gone".to_string())),
             };
-
-            if !in_block {
-                if line.starts_with("%begin ") {
-                    in_block = true;
-                } else if line.starts_with('%') {
-                    // Notification outside block — skip for now (Step 5 will route).
-                    debug!("ctrl notify: {}", line);
+            match event {
+                CtrlEvent::Begin => in_block = true,
+                CtrlEvent::Line(l) if in_block => {
+                    buf.push_str(&l);
+                    buf.push('\n');
                 }
-                // Any other content before a %begin is unexpected; ignore.
-            } else if line.starts_with("%end ") {
-                return Ok(buf);
-            } else if line.starts_with("%error ") {
-                return Err(ControlExecError::Protocol(buf));
-            } else {
-                buf.push_str(&line);
-                buf.push('\n');
+                CtrlEvent::Line(_) => {
+                    // Out-of-block content is unexpected; ignore.
+                }
+                CtrlEvent::End => return Ok(buf),
+                CtrlEvent::Error => return Err(ControlExecError::Protocol(buf)),
+                CtrlEvent::Closed => return Err(ControlExecError::Io("stdout closed".to_string())),
             }
         }
     }
@@ -404,17 +439,51 @@ impl TmuxActor {
         };
 
         let stdin = child.stdin.take()?;
-        let stdout = BufReader::new(child.stdout.take()?).lines();
+        let stdout = child.stdout.take()?;
 
-        // Drain the initial attach %begin/%end and notifications until the
-        // pipe quiesces. A short timeout keeps startup snappy.
-        let mut ctrl = ControlMode { child, stdin, stdout };
-        if drain_initial(&mut ctrl).await.is_err() {
-            let _ = ctrl.child.kill().await;
-            return None;
+        let (response_tx, response_rx) = mpsc::channel::<CtrlEvent>(64);
+        let (notify_tx, notify_rx) = mpsc::channel::<()>(16);
+
+        // Spawn the reader task. It partitions stdout into command-block events
+        // and (filtered) structural notifications. The initial attach also
+        // produces a %begin..%end block; that first block belongs to the
+        // implicit attach command and is drained here before we hand control
+        // back to the actor.
+        let mut reader_stdout = BufReader::new(stdout).lines();
+        // Wait for the implicit attach block to complete.
+        let mut saw_first_block = false;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(500), reader_stdout.next_line()).await {
+                Ok(Ok(Some(line))) => {
+                    if line.starts_with("%begin ") {
+                        saw_first_block = true;
+                    } else if saw_first_block && (line.starts_with("%end ") || line.starts_with("%error ")) {
+                        break;
+                    }
+                    // Drop notifications during preamble — they relate to our
+                    // own attach (%session-changed, etc).
+                }
+                Ok(Ok(None)) => {
+                    let _ = child.kill().await;
+                    return None;
+                }
+                Ok(Err(_)) | Err(_) => {
+                    let _ = child.kill().await;
+                    return None;
+                }
+            }
         }
+
+        let reader_handle = tokio::spawn(reader_task(reader_stdout, response_tx, notify_tx));
+
         debug!("control mode connected to ${}", session);
-        Some(ctrl)
+        Some(ControlMode {
+            child,
+            stdin,
+            response_rx,
+            notify_rx,
+            reader_handle: Some(reader_handle),
+        })
     }
 
     async fn first_session_name() -> Option<String> {
@@ -453,22 +522,76 @@ enum ControlExecError {
     Protocol(String),
 }
 
-/// Read any preamble lines (greeting/notifications) from a freshly-spawned
-/// control mode process until the pipe quiesces for ~50 ms.
-async fn drain_initial(ctrl: &mut ControlMode) -> Result<(), std::io::Error> {
+/// Long-lived task that owns the control-mode stdout. Lines inside a command
+/// block are forwarded as CtrlEvent::{Begin,Line,End,Error}; lines outside a
+/// block are classified as notifications and the structural ones produce a
+/// best-effort tick on `notify_tx`.
+///
+/// The task exits when stdout closes or either downstream channel is dropped.
+async fn reader_task(
+    mut stdout: tokio::io::Lines<BufReader<ChildStdout>>,
+    response_tx: mpsc::Sender<CtrlEvent>,
+    notify_tx: mpsc::Sender<()>,
+) {
+    let mut in_block = false;
     loop {
-        let next = tokio::time::timeout(Duration::from_millis(50), ctrl.stdout.next_line()).await;
-        match next {
-            Ok(Ok(Some(line))) => {
-                debug!("ctrl preamble: {}", line);
+        let line = match stdout.next_line().await {
+            Ok(Some(l)) => l,
+            _ => {
+                let _ = response_tx.send(CtrlEvent::Closed).await;
+                return;
             }
-            Ok(Ok(None)) => {
-                return Err(std::io::Error::other("stdout closed during preamble"));
+        };
+
+        if in_block {
+            if line.starts_with("%end ") {
+                if response_tx.send(CtrlEvent::End).await.is_err() {
+                    return;
+                }
+                in_block = false;
+            } else if line.starts_with("%error ") {
+                if response_tx.send(CtrlEvent::Error).await.is_err() {
+                    return;
+                }
+                in_block = false;
+            } else if response_tx.send(CtrlEvent::Line(line)).await.is_err() {
+                return;
             }
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Ok(()), // timeout = quiesced
+        } else if line.starts_with("%begin ") {
+            if response_tx.send(CtrlEvent::Begin).await.is_err() {
+                return;
+            }
+            in_block = true;
+        } else if line.starts_with('%') && is_structural_notification(&line) {
+            // try_send: if the channel is full the consumer is already going
+            // to refresh, so dropping is harmless (coalesced upstream).
+            let _ = notify_tx.try_send(());
         }
+        // else: non-structural notification (%output, %pane-mode-changed, …)
+        // is dropped silently.
     }
+}
+
+/// Returns true for notifications whose arrival indicates the cached
+/// session/window/pane tree may be stale.
+fn is_structural_notification(line: &str) -> bool {
+    // Match by leading token followed by space or end-of-line.
+    const PREFIXES: &[&str] = &[
+        "%sessions-changed",
+        "%session-renamed",
+        "%session-window-changed",
+        "%window-add",
+        "%window-close",
+        "%window-renamed",
+        "%window-pane-changed",
+        "%layout-change",
+        "%unlinked-window-add",
+        "%unlinked-window-close",
+        "%unlinked-window-renamed",
+    ];
+    PREFIXES.iter().any(|p| {
+        line.len() == p.len() || line.starts_with(&format!("{} ", p))
+    })
 }
 
 /// Render argv into a single tmux command line for control-mode stdin.
