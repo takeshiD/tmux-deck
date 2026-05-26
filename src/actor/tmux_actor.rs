@@ -310,11 +310,20 @@ impl TmuxActor {
 
     async fn switch_client(&mut self, target: &str) -> TmuxResponse {
         let log_path = "/tmp/tmux-deck.log";
-        // switch-client must always be issued from the user's interactive
-        // tmux client process — not from the control-mode client (which is
-        // attached to a session of its own). Always use fork+exec here.
-        let args: &[&str] = &["switch-client", "-t", target];
-        match Self::fork_exec(args).await {
+        // We attach a control-mode client of our own for IPC; without `-c`,
+        // tmux's "current client" resolution can land on that control-mode
+        // client and the user's interactive terminal stays put (even though
+        // the command returns success). Always pin `-c` to a non-control-mode
+        // client when one is reachable.
+        let user_tty = Self::find_user_client_tty().await;
+        let result = if let Some(tty) = user_tty.as_deref() {
+            let args: &[&str] = &["switch-client", "-c", tty, "-t", target];
+            Self::fork_exec(args).await
+        } else {
+            let args: &[&str] = &["switch-client", "-t", target];
+            Self::fork_exec(args).await
+        };
+        match result {
             Ok(_) => {
                 append_switch_log(log_path, target, true, None);
                 TmuxResponse::ClientSwitched {
@@ -332,6 +341,62 @@ impl TmuxActor {
                 }
             }
         }
+    }
+
+    /// Pick a tty to pass to `switch-client -c`. Prefers a non-control-mode
+    /// client whose session matches the pane that launched tmux-deck (so the
+    /// user's actual terminal is the one that switches). Falls back to any
+    /// non-control-mode client, then to None (caller drops `-c`).
+    async fn find_user_client_tty() -> Option<String> {
+        let list = Command::new("tmux")
+            .args([
+                "list-clients",
+                "-F",
+                "#{client_tty}\t#{client_control_mode}\t#{client_session}",
+            ])
+            .output()
+            .await
+            .ok()?;
+        if !list.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&list.stdout);
+
+        // Look up the session of $TMUX_PANE to prefer the matching client.
+        let preferred_session = match std::env::var("TMUX_PANE") {
+            Ok(pane) if !pane.is_empty() => Command::new("tmux")
+                .args(["display-message", "-p", "-t", &pane, "#{session_name}"])
+                .output()
+                .await
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if s.is_empty() { None } else { Some(s) }
+                    } else {
+                        None
+                    }
+                }),
+            _ => None,
+        };
+
+        let mut fallback: Option<String> = None;
+        for line in stdout.lines() {
+            let mut parts = line.split('\t');
+            let tty = parts.next().unwrap_or("").trim();
+            let control = parts.next().unwrap_or("").trim();
+            let session = parts.next().unwrap_or("").trim();
+            if tty.is_empty() || control != "0" {
+                continue;
+            }
+            if preferred_session.as_deref() == Some(session) {
+                return Some(tty.to_string());
+            }
+            if fallback.is_none() {
+                fallback = Some(tty.to_string());
+            }
+        }
+        fallback
     }
 
     // =========================================================================
