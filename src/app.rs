@@ -59,6 +59,10 @@ pub struct TmuxSession {
     pub windows: Vec<TmuxWindow>,
     /// True if any window in this session has claude running.
     pub has_claude: bool,
+    /// Epoch seconds — kept on the struct so [`SessionSort`] can reorder
+    /// the list without re-querying tmux.
+    pub last_attached: i64,
+    pub activity: i64,
 }
 
 // =============================================================================
@@ -85,6 +89,131 @@ pub enum Focus {
 pub enum InputMode {
     Normal,
     Input,
+}
+
+/// What attribute to sort sessions by.
+///
+/// To add a new sort attribute:
+///   1. Add a variant here.
+///   2. Add a comparator branch in [`SessionSortKey::cmp_ascending`].
+///   3. Add a short label in [`SessionSortKey::label`].
+///   4. Add `SessionSort` entries (one per direction) to [`SessionSort::ALL`]
+///      at the position you want users to land on when cycling with `s`.
+/// Direction handling, UI display and key wiring are all generic over key —
+/// no further code needs to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSortKey {
+    /// Most recently attached time (`last_attached`, tie-broken by `activity`).
+    LastAttached,
+    /// Case-insensitive session name.
+    Alphabet,
+}
+
+impl SessionSortKey {
+    /// Short label fragment shown in the Sessions list title.
+    pub fn label(self) -> &'static str {
+        match self {
+            SessionSortKey::LastAttached => "recent",
+            SessionSortKey::Alphabet => "abc",
+        }
+    }
+
+    /// Compare two sessions by this key, with smaller raw values first.
+    /// [`SessionSort`] flips this for the [`SortDirection::Desc`] case so the
+    /// key implementer only ever has to think about the natural ordering.
+    fn cmp_ascending(self, a: &TmuxSession, b: &TmuxSession) -> std::cmp::Ordering {
+        match self {
+            SessionSortKey::LastAttached => a
+                .last_attached
+                .cmp(&b.last_attached)
+                .then_with(|| a.activity.cmp(&b.activity)),
+            SessionSortKey::Alphabet => a
+                .name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    /// Largest value first — top of the list has the highest raw key.
+    /// e.g. `LastAttached + Desc` = newest first; `Alphabet + Desc` = Z first.
+    Desc,
+    /// Smallest value first — top of the list has the lowest raw key.
+    /// e.g. `LastAttached + Asc` = oldest first; `Alphabet + Asc` = A first.
+    Asc,
+}
+
+impl SortDirection {
+    pub fn arrow(self) -> char {
+        match self {
+            SortDirection::Desc => '↓',
+            SortDirection::Asc => '↑',
+        }
+    }
+}
+
+/// A complete sort spec: which attribute, in which direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSort {
+    pub key: SessionSortKey,
+    pub direction: SortDirection,
+}
+
+impl SessionSort {
+    /// All sort modes in the order the `s` key cycles through. Default is the
+    /// first entry. To add a new key, expand this list with one entry per
+    /// direction (typically `Desc` then `Asc`).
+    pub const ALL: &'static [SessionSort] = &[
+        SessionSort {
+            key: SessionSortKey::LastAttached,
+            direction: SortDirection::Desc,
+        },
+        SessionSort {
+            key: SessionSortKey::LastAttached,
+            direction: SortDirection::Asc,
+        },
+        SessionSort {
+            key: SessionSortKey::Alphabet,
+            direction: SortDirection::Desc,
+        },
+        SessionSort {
+            key: SessionSortKey::Alphabet,
+            direction: SortDirection::Asc,
+        },
+    ];
+
+    /// Label shown in the Sessions list title, e.g. "recent↓" / "abc↑".
+    pub fn label(self) -> String {
+        format!("{}{}", self.key.label(), self.direction.arrow())
+    }
+
+    /// Next mode in [`Self::ALL`], wrapping around.
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    /// Sort `sessions` in-place.
+    pub fn apply(self, sessions: &mut [TmuxSession]) {
+        sessions.sort_by(|a, b| {
+            let ord = self.key.cmp_ascending(a, b);
+            let ord = match self.direction {
+                SortDirection::Desc => ord.reverse(),
+                SortDirection::Asc => ord,
+            };
+            // Stable, deterministic tie-break — always by name ascending so
+            // the list does not jiggle on refresh when the primary key ties.
+            ord.then_with(|| a.name.cmp(&b.name))
+        });
+    }
+}
+
+impl Default for SessionSort {
+    fn default() -> Self {
+        Self::ALL[0]
+    }
 }
 
 /// Popup mode for session operations
@@ -118,6 +247,7 @@ pub struct UIState {
     pub session_list_state: ListState,
     pub window_list_state: ListState,
     pub pane_list_state: ListState,
+    pub session_sort: SessionSort,
 
     // MultiPreview state (session_idx, window_idx)
     pub multi_session: usize,
@@ -152,6 +282,7 @@ impl UIState {
             session_list_state: ListState::default(),
             window_list_state: ListState::default(),
             pane_list_state: ListState::default(),
+            session_sort: SessionSort::default(),
 
             multi_session: 0,
             multi_window: 0,
@@ -359,9 +490,49 @@ impl UIState {
     // =========================================================================
 
     pub fn update_sessions(&mut self, sessions: Vec<TmuxSession>) {
+        // Preserve the user's currently-highlighted session across the refresh:
+        // it may move to a new index once the new order is applied (e.g. when
+        // sort is Alphabet and a session was renamed).
+        let current_name = self
+            .sessions
+            .get(self.selected_session)
+            .map(|s| s.name.clone());
+
         self.sessions = sessions;
+        self.session_sort.apply(&mut self.sessions);
+
+        if let Some(name) = current_name
+            && let Some(idx) = self.sessions.iter().position(|s| s.name == name)
+        {
+            self.selected_session = idx;
+        }
+
         self.validate_selections();
         self.last_error = None;
+    }
+
+    /// Advance to the next [`SessionSort`] and re-sort the list in place,
+    /// keeping the currently-highlighted session highlighted.
+    pub fn cycle_session_sort(&mut self) {
+        self.session_sort = self.session_sort.next();
+        self.resort_sessions_preserve_selection();
+    }
+
+    fn resort_sessions_preserve_selection(&mut self) {
+        let current_name = self
+            .sessions
+            .get(self.selected_session)
+            .map(|s| s.name.clone());
+
+        self.session_sort.apply(&mut self.sessions);
+
+        if let Some(name) = current_name
+            && let Some(idx) = self.sessions.iter().position(|s| s.name == name)
+        {
+            self.selected_session = idx;
+            self.multi_session = self.multi_session.min(self.sessions.len().saturating_sub(1));
+            self.session_list_state.select(Some(idx));
+        }
     }
 
     pub fn update_pane_content(&mut self, content: String) {

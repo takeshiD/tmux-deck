@@ -834,6 +834,8 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                 unread,
                 windows,
                 has_claude: false,
+                last_attached: s.last_attached,
+                activity: s.activity,
             })
         })
         .collect()
