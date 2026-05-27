@@ -171,7 +171,7 @@ impl TmuxActor {
         let s_args: &[&str] = &[
             "list-sessions",
             "-F",
-            "SESS\t#{session_name}\t#{session_attached}\t#{session_activity}",
+            "SESS\t#{session_name}\t#{session_attached}\t#{session_activity}\t#{session_last_attached}",
         ];
         let w_args: &[&str] = &[
             "list-windows",
@@ -183,7 +183,7 @@ impl TmuxActor {
             "list-panes",
             "-a",
             "-F",
-            "PANE\t#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_index}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_last}\t#{pane_current_command}",
+            "PANE\t#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_index}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_last}\t#{pane_current_command}\t#{pane_pid}",
         ];
 
         // If control mode is up, send 3 commands as 3 blocks; otherwise one
@@ -218,9 +218,9 @@ impl TmuxActor {
             }
         };
 
-        TmuxResponse::SessionsRefreshed {
-            sessions: build_sessions(&stdout),
-        }
+        let mut sessions = build_sessions(&stdout);
+        annotate_claude_panes(&mut sessions).await;
+        TmuxResponse::SessionsRefreshed { sessions }
     }
 
     // =========================================================================
@@ -310,11 +310,26 @@ impl TmuxActor {
 
     async fn switch_client(&mut self, target: &str) -> TmuxResponse {
         let log_path = "/tmp/tmux-deck.log";
-        // switch-client must always be issued from the user's interactive
-        // tmux client process — not from the control-mode client (which is
-        // attached to a session of its own). Always use fork+exec here.
-        let args: &[&str] = &["switch-client", "-t", target];
-        match Self::fork_exec(args).await {
+        // Without -c, tmux's default target-client is the most recently
+        // active client. Our own control-mode client is constantly active
+        // (it services refresh queries), so it wins that heuristic and
+        // switch-client silently retargets the control-mode client —
+        // leaving the user's interactive session unchanged. Resolve the
+        // interactive client tty up-front and pass it explicitly.
+        let interactive_tty = self.find_interactive_client_tty().await;
+        let mut args: Vec<&str> = Vec::with_capacity(5);
+        args.push("switch-client");
+        if let Some(tty) = interactive_tty.as_deref() {
+            args.push("-c");
+            args.push(tty);
+        }
+        args.push("-t");
+        args.push(target);
+
+        // switch-client itself must still go via fork+exec — running it
+        // through the control-mode pipe would just switch the control
+        // client.
+        match Self::fork_exec(&args).await {
             Ok(_) => {
                 append_switch_log(log_path, target, true, None);
                 TmuxResponse::ClientSwitched {
@@ -332,6 +347,35 @@ impl TmuxActor {
                 }
             }
         }
+    }
+
+    /// Resolve the user's interactive tmux client by querying list-clients
+    /// and picking the most-recently-active client that is NOT a control
+    /// mode client and has a tty. Returns None if no such client exists
+    /// (e.g. no one is attached) — the caller then falls back to running
+    /// switch-client without -c.
+    async fn find_interactive_client_tty(&mut self) -> Option<String> {
+        let args: &[&str] = &[
+            "list-clients",
+            "-F",
+            "#{client_tty}\t#{client_control_mode}\t#{client_activity}",
+        ];
+        let out = self.exec_args(args).await.ok()?;
+        let mut best: Option<(i64, String)> = None;
+        for line in out.lines() {
+            let mut it = line.split('\t');
+            let tty = it.next().unwrap_or("");
+            let control = it.next().unwrap_or("0");
+            let activity: i64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            if control == "1" || tty.is_empty() {
+                continue;
+            }
+            match &best {
+                Some((a, _)) if *a >= activity => {}
+                _ => best = Some((activity, tty.to_string())),
+            }
+        }
+        best.map(|(_, t)| t)
     }
 
     // =========================================================================
@@ -630,6 +674,7 @@ fn quote_for_control(arg: &str) -> String {
 
 struct SessionAccum {
     activity: i64,
+    last_attached: i64,
     attached: bool,
     windows: Vec<WindowAccum>,
 }
@@ -663,6 +708,7 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                 let name = it.next().unwrap_or("").to_string();
                 let attached = it.next() == Some("1");
                 let activity = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let last_attached = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                 if name.is_empty() {
                     continue;
                 }
@@ -673,6 +719,7 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                     name,
                     SessionAccum {
                         activity,
+                        last_attached,
                         attached,
                         windows: Vec::new(),
                     },
@@ -706,6 +753,7 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                 let active = it.next() == Some("1");
                 let last = it.next() == Some("1");
                 let current_command = it.next().unwrap_or("").to_string();
+                let pid: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
                 if let Some(s) = sessions.get_mut(session)
                     && let Some(w) = s.windows.iter_mut().find(|w| w.index == window_index)
@@ -725,6 +773,8 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                             height,
                             active,
                             current_command,
+                            pid,
+                            has_claude: false,
                         },
                     ));
                 }
@@ -756,10 +806,9 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
     keys.sort_by(|a, b| {
         let sa = &sessions[a];
         let sb = &sessions[b];
-        sb.activity
-            .cmp(&sa.activity)
-            .then_with(|| sb.attached.cmp(&sa.attached))
-            .then_with(|| a.cmp(b))
+        sb.last_attached
+            .cmp(&sa.last_attached)
+            .then_with(|| sb.activity.cmp(&sa.activity))
     });
 
     keys.into_iter()
@@ -775,15 +824,121 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                     panes: w.panes_raw.into_iter().map(|(_, _, _, p)| p).collect(),
                     pane_width: w.pane_width,
                     pane_height: w.pane_height,
+                    has_claude: false,
                 })
                 .collect();
+            let unread = !s.attached && s.activity > s.last_attached;
             Some(TmuxSession {
                 name,
                 attached: s.attached,
+                unread,
                 windows,
+                has_claude: false,
             })
         })
         .collect()
+}
+
+// =============================================================================
+// Claude-process detection
+// =============================================================================
+//
+// For each pane we already know the shell pid. A claude process running in
+// that pane shows up as a descendant — `claude` (or `.claude-wrapped`) under
+// the shell. We snapshot the full process table once per refresh and mark
+// any pane whose descendant tree contains such a process. The chrome native
+// host instance is excluded so it does not light up unrelated panes.
+
+async fn annotate_claude_panes(sessions: &mut [TmuxSession]) {
+    use std::collections::{HashMap, HashSet};
+
+    let output = match Command::new("ps")
+        .args(["-eo", "pid=,ppid=,args="])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut claude_pids: HashSet<u32> = HashSet::new();
+
+    for line in stdout.lines() {
+        let mut it = line.split_whitespace();
+        let pid: u32 = match it.next().and_then(|s| s.parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        let ppid: u32 = match it.next().and_then(|s| s.parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        let args: String = it.collect::<Vec<_>>().join(" ");
+
+        children.entry(ppid).or_default().push(pid);
+        if is_claude_args(&args) {
+            claude_pids.insert(pid);
+        }
+    }
+
+    if claude_pids.is_empty() {
+        return;
+    }
+
+    for session in sessions.iter_mut() {
+        let mut session_has = false;
+        for window in session.windows.iter_mut() {
+            let mut window_has = false;
+            for pane in window.panes.iter_mut() {
+                if pane.pid != 0 && pane_has_claude(pane.pid, &children, &claude_pids) {
+                    pane.has_claude = true;
+                    window_has = true;
+                }
+            }
+            window.has_claude = window_has;
+            if window_has {
+                session_has = true;
+            }
+        }
+        session.has_claude = session_has;
+    }
+}
+
+fn is_claude_args(args: &str) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+    // The chrome-native-host instance is a separate, persistent helper that
+    // is not associated with an interactive pane.
+    if args.contains("--chrome-native-host") {
+        return false;
+    }
+    args.contains(".claude-wrapped")
+        || args.contains("claude-code/cli")
+        || args.split_whitespace().next() == Some("claude")
+}
+
+fn pane_has_claude(
+    root: u32,
+    children: &std::collections::HashMap<u32, Vec<u32>>,
+    claude_pids: &std::collections::HashSet<u32>,
+) -> bool {
+    let mut stack = vec![root];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        if claude_pids.contains(&pid) {
+            return true;
+        }
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids.iter().copied());
+        }
+    }
+    false
 }
 
 fn append_switch_log(path: &str, target: &str, success: bool, error: Option<&str>) {
