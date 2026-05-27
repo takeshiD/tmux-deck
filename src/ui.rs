@@ -6,6 +6,13 @@ use ratatui::{
 
 use crate::app::{Focus, InputMode, PopupMode, TmuxPane, TmuxWindow, UIState, ViewMode};
 
+/// Orange color used to flag sessions / windows / panes that have a claude
+/// process running. Color::Indexed(208) is the standard 256-color "Orange1"
+/// slot, which renders consistently across terminals that do not honour
+/// truecolor.
+const CLAUDE_MARKER_COLOR: Color = Color::Indexed(208);
+const CLAUDE_MARKER: &str = "●";
+
 // =============================================================================
 // ANSI Content Processing
 // =============================================================================
@@ -201,13 +208,24 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, session)| {
-            let attached_marker = if session.attached { " ●" } else { "" };
             let style = if i == state.selected_session {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
                 Style::default()
             };
-            ListItem::new(format!("{}{}", session.name, attached_marker)).style(style)
+            let mut spans = vec![Span::raw(session.name.clone())];
+            if session.attached {
+                spans.push(Span::styled(" ●", Style::default().fg(Color::Green)));
+            } else if session.unread {
+                spans.push(Span::styled(" ◆", Style::default().fg(Color::Yellow)));
+            }
+            if session.has_claude {
+                spans.push(Span::styled(
+                    format!(" {}", CLAUDE_MARKER),
+                    Style::default().fg(CLAUDE_MARKER_COLOR),
+                ));
+            }
+            ListItem::new(Line::from(spans)).style(style)
         })
         .collect();
 
@@ -249,7 +267,17 @@ fn render_windows_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
             } else {
                 Style::default()
             };
-            ListItem::new(format!("{}:{}{}", window.index, window.name, active_marker)).style(style)
+            let mut spans = vec![Span::raw(format!(
+                "{}:{}{}",
+                window.index, window.name, active_marker
+            ))];
+            if window.has_claude {
+                spans.push(Span::styled(
+                    format!(" {}", CLAUDE_MARKER),
+                    Style::default().fg(CLAUDE_MARKER_COLOR),
+                ));
+            }
+            ListItem::new(Line::from(spans)).style(style)
         })
         .collect();
 
@@ -298,11 +326,17 @@ fn render_panes_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
             } else {
                 Style::default()
             };
-            ListItem::new(format!(
+            let mut spans = vec![Span::raw(format!(
                 "{}:{}{} [{}]",
                 pane.index, pane.id, active_marker, pane.current_command
-            ))
-            .style(style)
+            ))];
+            if pane.has_claude {
+                spans.push(Span::styled(
+                    format!(" {}", CLAUDE_MARKER),
+                    Style::default().fg(CLAUDE_MARKER_COLOR),
+                ));
+            }
+            ListItem::new(Line::from(spans)).style(style)
         })
         .collect();
 
@@ -437,25 +471,36 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
         {
             let is_selected_session = session_idx == state.multi_session;
 
-            // Session block style
+            // Session block style. Claude-running sessions are highlighted in
+            // orange unless they are the currently selected session (selection
+            // colour wins so the user does not lose track of focus).
             let session_border_style = if is_selected_session {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else if session.has_claude {
+                Style::default().fg(CLAUDE_MARKER_COLOR)
             } else if session.attached {
                 Style::default().fg(Color::Green)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
 
-            let session_title = if session.attached {
-                format!(" {} ● ", session.name)
-            } else {
-                format!(" {} ", session.name)
-            };
+            let mut title_spans = vec![Span::raw(format!(" {} ", session.name))];
+            if session.attached {
+                title_spans.push(Span::styled("● ", Style::default().fg(Color::Green)));
+            } else if session.unread {
+                title_spans.push(Span::styled("◆ ", Style::default().fg(Color::Yellow)));
+            }
+            if session.has_claude {
+                title_spans.push(Span::styled(
+                    format!("{} ", CLAUDE_MARKER),
+                    Style::default().fg(CLAUDE_MARKER_COLOR),
+                ));
+            }
 
             let session_block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(session_border_style)
-                .title(session_title);
+                .title(Line::from(title_spans));
 
             let inner_area = session_block.inner(*session_area);
             frame.render_widget(session_block, *session_area);
@@ -528,10 +573,14 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
 }
 
 fn render_window_preview(frame: &mut Frame, window: &TmuxWindow, area: Rect, is_selected: bool) {
+    // Claude-running windows are bordered in orange unless they are currently
+    // selected (selection colour wins).
     let border_style = if is_selected {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
+    } else if window.has_claude {
+        Style::default().fg(CLAUDE_MARKER_COLOR)
     } else if window.active {
         Style::default().fg(Color::Green)
     } else {
@@ -544,12 +593,21 @@ fn render_window_preview(frame: &mut Frame, window: &TmuxWindow, area: Rect, is_
         .map(|p| p.current_command.as_str())
         .unwrap_or("");
 
-    let title = format!(" {}:{}{} [{}] ", window.index, window.name, active_marker, cmd);
+    let mut title_spans = vec![Span::raw(format!(
+        " {}:{}{} [{}] ",
+        window.index, window.name, active_marker, cmd
+    ))];
+    if window.has_claude {
+        title_spans.push(Span::styled(
+            format!("{} ", CLAUDE_MARKER),
+            Style::default().fg(CLAUDE_MARKER_COLOR),
+        ));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(title);
+        .title(Line::from(title_spans));
 
     let inner = block.inner(area);
 

@@ -19,6 +19,9 @@ pub struct TmuxPane {
     pub height: u32,
     pub active: bool,
     pub current_command: String,
+    pub pid: u32,
+    /// True if a claude process is running in this pane (detected via descendant process scan).
+    pub has_claude: bool,
 }
 
 /// Represents a tmux window with captured content
@@ -34,6 +37,8 @@ pub struct TmuxWindow {
     pub pane_width: u32,
     /// Height of the active pane
     pub pane_height: u32,
+    /// True if any pane in this window has claude running.
+    pub has_claude: bool,
 }
 
 impl TmuxWindow {
@@ -47,7 +52,13 @@ impl TmuxWindow {
 pub struct TmuxSession {
     pub name: String,
     pub attached: bool,
+    /// True if the session has activity newer than its last_attached and
+    /// is not currently attached — i.e. something happened in there that
+    /// the user has not seen yet.
+    pub unread: bool,
     pub windows: Vec<TmuxWindow>,
+    /// True if any window in this session has claude running.
+    pub has_claude: bool,
 }
 
 // =============================================================================
