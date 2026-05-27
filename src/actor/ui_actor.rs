@@ -8,7 +8,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::messages::{RefreshControl, TmuxCommand, TmuxResponse, UIEvent};
-use crate::app::{InputMode, PopupMode, UIState, ViewMode};
+use crate::app::{Focus, InputMode, PopupMode, UIState, ViewMode};
 use crate::ui::render_ui;
 
 // =============================================================================
@@ -256,6 +256,12 @@ impl UIActor {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(true), // Exit
                 KeyCode::Char('r') => {
                     let _ = self.tmux_cmd_tx.send(TmuxCommand::RefreshAll).await;
+                }
+                KeyCode::Char('s')
+                    if self.state.view_mode == ViewMode::TreeView
+                        && self.state.focus == Focus::Sessions =>
+                {
+                    self.state.cycle_session_sort();
                 }
                 KeyCode::Char(' ') => {
                     self.state.handle_space_press();

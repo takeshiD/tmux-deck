@@ -234,7 +234,11 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title(format!(" Sessions ({}) ", state.sessions.len())),
+                .title(format!(
+                    " Sessions ({}) [{}] ",
+                    state.sessions.len(),
+                    state.session_sort.label()
+                )),
         )
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol(if is_focused { "▶ " } else { "  " });
@@ -406,6 +410,8 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
             Span::raw(":move "),
             Span::styled("Tab", Style::default().fg(Color::Yellow)),
             Span::raw(":focus "),
+            Span::styled("s", Style::default().fg(Color::Yellow)),
+            Span::raw(":sort "),
             Span::styled("Space×2", Style::default().fg(Color::Magenta)),
             Span::raw(":multi "),
             Span::styled("C-n", Style::default().fg(Color::Green)),
