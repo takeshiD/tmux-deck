@@ -1,4 +1,3 @@
-use ansi_to_tui::IntoText;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
@@ -12,131 +11,6 @@ use crate::app::{Focus, InputMode, PopupMode, TmuxPane, TmuxWindow, UIState, Vie
 /// truecolor.
 const CLAUDE_MARKER_COLOR: Color = Color::Indexed(208);
 const CLAUDE_MARKER: &str = "●";
-
-// =============================================================================
-// ANSI Content Processing
-// =============================================================================
-
-/// A character with its associated style (for ANSI rendering)
-#[derive(Clone, Default)]
-struct StyledChar {
-    ch: char,
-    style: Style,
-}
-
-fn ansi_to_styled_grid(content: &str) -> Vec<Vec<StyledChar>> {
-    let text = match content.as_bytes().into_text() {
-        Ok(t) => t,
-        Err(_) => {
-            return content
-                .lines()
-                .map(|line| {
-                    line.chars()
-                        .map(|ch| StyledChar {
-                            ch,
-                            style: Style::default(),
-                        })
-                        .collect()
-                })
-                .collect();
-        }
-    };
-
-    let mut grid: Vec<Vec<StyledChar>> = Vec::new();
-
-    for line in text.lines {
-        let mut row: Vec<StyledChar> = Vec::new();
-        for span in line.spans {
-            for ch in span.content.chars() {
-                row.push(StyledChar {
-                    ch,
-                    style: span.style,
-                });
-            }
-        }
-        grid.push(row);
-    }
-
-    grid
-}
-
-fn shrink_styled_content<'a>(
-    grid: &[Vec<StyledChar>],
-    target_width: usize,
-    target_height: usize,
-    source_width: u32,
-    _source_height: u32,
-) -> Text<'a> {
-    if grid.is_empty() || target_width == 0 || target_height == 0 {
-        return Text::default();
-    }
-
-    let actual_lines = grid.len();
-    let source_width = source_width as usize;
-
-    let col_ratio = if source_width > target_width {
-        source_width as f64 / target_width as f64
-    } else {
-        1.0
-    };
-
-    let (start_row, row_ratio) = if actual_lines <= target_height {
-        (0, 1.0)
-    } else {
-        let rows_to_show = actual_lines.min(target_height * 2);
-        let start = actual_lines.saturating_sub(rows_to_show);
-        let ratio = rows_to_show as f64 / target_height as f64;
-        (start, ratio)
-    };
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    for target_row in 0..target_height {
-        let source_row = start_row + (target_row as f64 * row_ratio) as usize;
-
-        if source_row >= grid.len() {
-            lines.push(Line::default());
-            continue;
-        }
-
-        let row = &grid[source_row];
-        let mut spans: Vec<Span> = Vec::new();
-        let mut current_style = Style::default();
-        let mut current_text = String::new();
-
-        for target_col in 0..target_width {
-            let source_col = (target_col as f64 * col_ratio) as usize;
-
-            let styled_char = if source_col < row.len() {
-                &row[source_col]
-            } else {
-                &StyledChar {
-                    ch: ' ',
-                    style: Style::default(),
-                }
-            };
-
-            if styled_char.style != current_style && !current_text.is_empty() {
-                spans.push(Span::styled(current_text.clone(), current_style));
-                current_text.clear();
-            }
-
-            current_style = styled_char.style;
-            current_text.push(styled_char.ch);
-        }
-
-        if !current_text.is_empty() {
-            let trimmed = current_text.trim_end();
-            if !trimmed.is_empty() {
-                spans.push(Span::styled(trimmed.to_string(), current_style));
-            }
-        }
-
-        lines.push(Line::from(spans));
-    }
-
-    Text::from(lines)
-}
 
 // =============================================================================
 // Main UI Rendering
@@ -579,8 +453,6 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
 }
 
 fn render_window_preview(frame: &mut Frame, window: &TmuxWindow, area: Rect, is_selected: bool) {
-    // Claude-running windows are bordered in orange unless they are currently
-    // selected (selection colour wins).
     let border_style = if is_selected {
         Style::default()
             .fg(Color::Cyan)
@@ -615,20 +487,7 @@ fn render_window_preview(frame: &mut Frame, window: &TmuxWindow, area: Rect, is_
         .border_style(border_style)
         .title(Line::from(title_spans));
 
-    let inner = block.inner(area);
-
-    // let styled_grid = ansi_to_styled_grid(&window.content);
-    // let shrunk_text = shrink_styled_content(
-    //     &styled_grid,
-    //     inner.width as usize,
-    //     inner.height as usize,
-    //     window.pane_width,
-    //     window.pane_height,
-    // );
-
-    // let paragraph = Paragraph::new(shrunk_text).block(block);
-
-    // frame.render_widget(paragraph, area);
+    frame.render_widget(block, area);
 }
 
 // =============================================================================
