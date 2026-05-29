@@ -686,8 +686,6 @@ struct WindowAccum {
     name: String,
     /// (active, last, index, pane) — sorted then unwrapped
     panes_raw: Vec<(bool, bool, u32, TmuxPane)>,
-    pane_width: u32,
-    pane_height: u32,
 }
 
 fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
@@ -738,8 +736,6 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                         index,
                         name,
                         panes_raw: Vec::new(),
-                        pane_width: 80,
-                        pane_height: 24,
                     });
                 }
             }
@@ -758,10 +754,6 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                 if let Some(s) = sessions.get_mut(session)
                     && let Some(w) = s.windows.iter_mut().find(|w| w.index == window_index)
                 {
-                    if active {
-                        w.pane_width = width;
-                        w.pane_height = height;
-                    }
                     w.panes_raw.push((
                         active,
                         last,
@@ -822,8 +814,6 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                     name: w.name,
                     active: w.active,
                     panes: w.panes_raw.into_iter().map(|(_, _, _, p)| p).collect(),
-                    pane_width: w.pane_width,
-                    pane_height: w.pane_height,
                     has_claude: false,
                 })
                 .collect();

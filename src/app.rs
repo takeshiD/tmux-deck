@@ -31,12 +31,6 @@ pub struct TmuxWindow {
     pub name: String,
     pub active: bool,
     pub panes: Vec<TmuxPane>,
-    /// Captured content of the active pane (for preview)
-    // pub content: String,
-    /// Width of the active pane
-    pub pane_width: u32,
-    /// Height of the active pane
-    pub pane_height: u32,
     /// True if any pane in this window has claude running.
     pub has_claude: bool,
 }
@@ -99,6 +93,7 @@ pub enum InputMode {
 ///   3. Add a short label in [`SessionSortKey::label`].
 ///   4. Add `SessionSort` entries (one per direction) to [`SessionSort::ALL`]
 ///      at the position you want users to land on when cycling with `s`.
+///
 /// Direction handling, UI display and key wiring are all generic over key —
 /// no further code needs to change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

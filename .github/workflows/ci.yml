@@ -1,0 +1,53 @@
+name: CI
+on:
+  pull_request:
+    types: 
+      - opened
+      - synchronize
+permissions:
+  contents: read
+jobs:
+  version-check:
+    name: Cargo.toml version is placeholder
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check Cargo.toml version is 0.0.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_ver="$(grep -m1 '^version' Cargo.toml \
+                        | sed -E 's/version *= *"([^"]+)".*/\1/')"
+          [[ "${cargo_ver}" == "0.0.0" ]] \
+            || { echo "❌  Cargo.toml version must be 0.0.0 on PRs, got '${cargo_ver}'"; exit 1; }
+          echo "✅  Cargo.toml version is 0.0.0"
+
+  test:
+    name: Test - ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.90
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --all --locked
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
