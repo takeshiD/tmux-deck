@@ -3,7 +3,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
-use crate::app::{Focus, InputMode, PopupMode, TmuxPane, TmuxWindow, UIState, ViewMode};
+use crate::app::{ClaudeState, Focus, InputMode, PopupMode, TmuxPane, TmuxWindow, UIState, ViewMode};
 
 /// Orange color used to flag sessions / windows / panes that have a claude
 /// process running. Color::Indexed(208) is the standard 256-color "Orange1"
@@ -11,6 +11,61 @@ use crate::app::{Focus, InputMode, PopupMode, TmuxPane, TmuxWindow, UIState, Vie
 /// truecolor.
 const CLAUDE_MARKER_COLOR: Color = Color::Indexed(208);
 const CLAUDE_MARKER: &str = "●";
+
+/// Braille "dots" spinner frames (cli-spinners `dots`). Rendered for the
+/// `Working` Claude state so the marker visibly animates.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Milliseconds each spinner frame is shown.
+const SPINNER_FRAME_MS: u128 = 80;
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// The current spinner glyph, chosen from wall-clock time so it animates at a
+/// constant rate regardless of how often we happen to redraw.
+fn spinner_frame() -> &'static str {
+    let idx = (now_millis() / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len();
+    SPINNER_FRAMES[idx]
+}
+
+/// Color for a given Claude state.
+fn claude_color(state: ClaudeState) -> Color {
+    match state {
+        ClaudeState::Working => CLAUDE_MARKER_COLOR,
+        ClaudeState::Waiting => Color::Yellow,
+        ClaudeState::Done => Color::Green,
+        ClaudeState::Error => Color::Red,
+    }
+}
+
+/// The marker glyph + color to show for a node, given its hook state and
+/// whether a claude process was detected. Hook state wins; otherwise we fall
+/// back to the plain "claude is running" marker so behaviour is unchanged when
+/// hooks are not installed. Returns `None` when there is nothing to show.
+fn claude_marker(state: Option<ClaudeState>, has_claude: bool) -> Option<(&'static str, Color)> {
+    match state {
+        Some(ClaudeState::Working) => Some((spinner_frame(), CLAUDE_MARKER_COLOR)),
+        Some(ClaudeState::Waiting) => Some(("◆", claude_color(ClaudeState::Waiting))),
+        Some(ClaudeState::Done) => Some(("●", claude_color(ClaudeState::Done))),
+        Some(ClaudeState::Error) => Some(("✗", claude_color(ClaudeState::Error))),
+        None if has_claude => Some((CLAUDE_MARKER, CLAUDE_MARKER_COLOR)),
+        None => None,
+    }
+}
+
+/// Border accent color for a node based on its Claude state, falling back to
+/// the plain claude color when only a process was detected.
+fn claude_border_color(state: Option<ClaudeState>, has_claude: bool) -> Option<Color> {
+    match state {
+        Some(s) => Some(claude_color(s)),
+        None if has_claude => Some(CLAUDE_MARKER_COLOR),
+        None => None,
+    }
+}
 
 // =============================================================================
 // Main UI Rendering
@@ -93,10 +148,10 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
             } else if session.unread {
                 spans.push(Span::styled(" ◆", Style::default().fg(Color::Yellow)));
             }
-            if session.has_claude {
+            if let Some((sym, color)) = claude_marker(session.claude_state, session.has_claude) {
                 spans.push(Span::styled(
-                    format!(" {}", CLAUDE_MARKER),
-                    Style::default().fg(CLAUDE_MARKER_COLOR),
+                    format!(" {}", sym),
+                    Style::default().fg(color),
                 ));
             }
             ListItem::new(Line::from(spans)).style(style)
@@ -149,10 +204,10 @@ fn render_windows_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
                 "{}:{}{}",
                 window.index, window.name, active_marker
             ))];
-            if window.has_claude {
+            if let Some((sym, color)) = claude_marker(window.claude_state, window.has_claude) {
                 spans.push(Span::styled(
-                    format!(" {}", CLAUDE_MARKER),
-                    Style::default().fg(CLAUDE_MARKER_COLOR),
+                    format!(" {}", sym),
+                    Style::default().fg(color),
                 ));
             }
             ListItem::new(Line::from(spans)).style(style)
@@ -208,10 +263,10 @@ fn render_panes_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
                 "{}:{}{} [{}]",
                 pane.index, pane.id, active_marker, pane.current_command
             ))];
-            if pane.has_claude {
+            if let Some((sym, color)) = claude_marker(pane.claude_state, pane.has_claude) {
                 spans.push(Span::styled(
-                    format!(" {}", CLAUDE_MARKER),
-                    Style::default().fg(CLAUDE_MARKER_COLOR),
+                    format!(" {}", sym),
+                    Style::default().fg(color),
                 ));
             }
             ListItem::new(Line::from(spans)).style(style)
@@ -356,8 +411,10 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
             // colour wins so the user does not lose track of focus).
             let session_border_style = if is_selected_session {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else if session.has_claude {
-                Style::default().fg(CLAUDE_MARKER_COLOR)
+            } else if let Some(color) =
+                claude_border_color(session.claude_state, session.has_claude)
+            {
+                Style::default().fg(color)
             } else if session.attached {
                 Style::default().fg(Color::Green)
             } else {
@@ -370,10 +427,10 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
             } else if session.unread {
                 title_spans.push(Span::styled("◆ ", Style::default().fg(Color::Yellow)));
             }
-            if session.has_claude {
+            if let Some((sym, color)) = claude_marker(session.claude_state, session.has_claude) {
                 title_spans.push(Span::styled(
-                    format!("{} ", CLAUDE_MARKER),
-                    Style::default().fg(CLAUDE_MARKER_COLOR),
+                    format!("{} ", sym),
+                    Style::default().fg(color),
                 ));
             }
 
@@ -457,8 +514,8 @@ fn render_window_preview(frame: &mut Frame, window: &TmuxWindow, area: Rect, is_
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
-    } else if window.has_claude {
-        Style::default().fg(CLAUDE_MARKER_COLOR)
+    } else if let Some(color) = claude_border_color(window.claude_state, window.has_claude) {
+        Style::default().fg(color)
     } else if window.active {
         Style::default().fg(Color::Green)
     } else {
@@ -475,10 +532,10 @@ fn render_window_preview(frame: &mut Frame, window: &TmuxWindow, area: Rect, is_
         " {}:{}{} [{}] ",
         window.index, window.name, active_marker, cmd
     ))];
-    if window.has_claude {
+    if let Some((sym, color)) = claude_marker(window.claude_state, window.has_claude) {
         title_spans.push(Span::styled(
-            format!("{} ", CLAUDE_MARKER),
-            Style::default().fg(CLAUDE_MARKER_COLOR),
+            format!("{} ", sym),
+            Style::default().fg(color),
         ));
     }
 

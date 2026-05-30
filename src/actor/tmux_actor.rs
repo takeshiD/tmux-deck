@@ -220,6 +220,7 @@ impl TmuxActor {
 
         let mut sessions = build_sessions(&stdout);
         annotate_claude_panes(&mut sessions).await;
+        crate::hook::apply_states(&mut sessions);
         TmuxResponse::SessionsRefreshed { sessions }
     }
 
@@ -767,6 +768,7 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                             current_command,
                             pid,
                             has_claude: false,
+                            claude_state: None,
                         },
                     ));
                 }
@@ -815,6 +817,7 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                     active: w.active,
                     panes: w.panes_raw.into_iter().map(|(_, _, _, p)| p).collect(),
                     has_claude: false,
+                    claude_state: None,
                 })
                 .collect();
             let unread = !s.attached && s.activity > s.last_attached;
@@ -824,6 +827,7 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                 unread,
                 windows,
                 has_claude: false,
+                claude_state: None,
                 last_attached: s.last_attached,
                 activity: s.activity,
             })
