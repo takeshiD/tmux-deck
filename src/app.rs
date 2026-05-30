@@ -5,6 +5,7 @@ use ansi_to_tui::IntoText;
 use ratatui::text::Text;
 use ratatui::widgets::ListState;
 
+use crate::config::{BehaviorConfig, Config, HooksConfig, KeyBindings, LayoutConfig, Theme};
 use crate::group::GroupStore;
 
 /// Label shown for the implicit group of sessions that have not been assigned
@@ -393,6 +394,19 @@ pub struct UIState {
     pub last_error: Option<String>,
     #[allow(dead_code)]
     pub interval: Duration,
+
+    // Resolved user configuration.
+    /// Semantic UI colour palette.
+    pub theme: Theme,
+    /// Per-state hook markers (claude / codex).
+    pub hooks: HooksConfig,
+    /// Remappable key bindings.
+    pub keybindings: KeyBindings,
+    /// Panel layout ratios.
+    pub layout: LayoutConfig,
+    /// Behavioural toggles (double-space window, exit-on-switch, …).
+    pub behavior: BehaviorConfig,
+
     pub input_mode: InputMode,
     pub input_buffer: String,
     pub input_cursor: usize,
@@ -409,9 +423,13 @@ pub struct UIState {
 }
 
 impl UIState {
-    pub fn new(interval_ms: u64) -> Self {
+    pub fn new(config: Config) -> Self {
+        let interval_ms = config.preview.interval.unwrap_or(300);
+        let theme = config.theme.resolve();
+        let view_mode = config.behavior.view_mode();
+        let session_sort = config.behavior.session_sort();
         let mut state = Self {
-            view_mode: ViewMode::TreeView,
+            view_mode,
             last_space_press: None,
 
             sessions: Vec::new(),
@@ -422,7 +440,7 @@ impl UIState {
             session_list_state: ListState::default(),
             window_list_state: ListState::default(),
             pane_list_state: ListState::default(),
-            session_sort: SessionSort::default(),
+            session_sort,
 
             groups: GroupStore::load(),
             collapsed_groups: HashSet::new(),
@@ -435,6 +453,13 @@ impl UIState {
             pane_content_parsed: None,
             last_error: None,
             interval: Duration::from_millis(interval_ms),
+
+            theme,
+            hooks: config.hooks,
+            keybindings: config.keybindings,
+            layout: config.layout,
+            behavior: config.behavior,
+
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             input_cursor: 0,
@@ -473,7 +498,7 @@ impl UIState {
     pub fn handle_space_press(&mut self) -> bool {
         let now = Instant::now();
         if let Some(last) = self.last_space_press
-            && now.duration_since(last) < Duration::from_millis(300)
+            && now.duration_since(last) < Duration::from_millis(self.behavior.double_space_ms)
         {
             // Double space detected
             self.toggle_view_mode();
@@ -1143,7 +1168,7 @@ mod tests {
     /// Build a UIState with an in-memory (no-disk) group store and the given
     /// assignments, then load `names` as the session list.
     fn state_with(names: &[&str], groups: &[(&str, &str)]) -> UIState {
-        let mut state = UIState::new(100);
+        let mut state = UIState::new(Config::default());
         state.groups = GroupStore::default();
         for (sess, grp) in groups {
             state.groups.set(sess, Some(grp));
@@ -1341,7 +1366,7 @@ mod tests {
 
     #[test]
     fn input_handles_multibyte_chars_without_panic() {
-        let mut state = UIState::new(100);
+        let mut state = UIState::new(Config::default());
         // 日本語を複数文字入力（旧実装ではバイト境界パニックしていた）
         state.input_char('あ');
         state.input_char('い');
@@ -1352,7 +1377,7 @@ mod tests {
 
     #[test]
     fn input_cursor_movement_and_editing_with_multibyte() {
-        let mut state = UIState::new(100);
+        let mut state = UIState::new(Config::default());
         for c in "あいう".chars() {
             state.input_char(c);
         }
@@ -1376,7 +1401,7 @@ mod tests {
 
     #[test]
     fn input_move_end_uses_char_count() {
-        let mut state = UIState::new(100);
+        let mut state = UIState::new(Config::default());
         for c in "あい".chars() {
             state.input_char(c);
         }
@@ -1388,7 +1413,7 @@ mod tests {
 
     #[test]
     fn input_char_limited_caps_char_count() {
-        let mut state = UIState::new(100);
+        let mut state = UIState::new(Config::default());
         for _ in 0..40 {
             state.input_char_limited('a', SESSION_NAME_MAX_LEN);
         }
@@ -1397,7 +1422,7 @@ mod tests {
 
     #[test]
     fn input_char_limited_counts_chars_not_bytes() {
-        let mut state = UIState::new(100);
+        let mut state = UIState::new(Config::default());
         // マルチバイト文字でもバイト長ではなく文字数で制限される
         for _ in 0..40 {
             state.input_char_limited('あ', SESSION_NAME_MAX_LEN);

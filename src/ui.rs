@@ -7,18 +7,11 @@ use crate::app::{
     ClaudeState, Focus, InputMode, PopupMode, SessionRow, TmuxPane, TmuxWindow, UIState,
     UNGROUPED_LABEL, ViewMode,
 };
+use crate::config::{Action, MarkerSet, Theme};
 
-/// Single colour used for every Claude marker. States are distinguished by
-/// glyph *shape*, not colour, so the markers stay legible regardless of the
-/// terminal palette or colour-blindness. Color::Indexed(208) is the standard
-/// 256-color "Orange1" slot, which renders consistently across terminals that
-/// do not honour truecolor.
-const CLAUDE_MARKER_COLOR: Color = Color::Indexed(208);
-/// Marker shown for a claude process when no hook state is known.
-const CLAUDE_MARKER: &str = "●";
-
-/// Braille "dots" spinner frames (cli-spinners `dots`). Rendered for the
-/// `Working` Claude state so the marker visibly animates.
+/// Braille "dots" spinner frames (cli-spinners `dots`). Rendered for a marker
+/// configured as `"spinner"` (the default `Working` Claude state) so it
+/// visibly animates.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Milliseconds each spinner frame is shown.
 const SPINNER_FRAME_MS: u128 = 80;
@@ -38,31 +31,40 @@ fn spinner_frame() -> &'static str {
 }
 
 /// The marker glyph + colour to show for a node, given its hook state and
-/// whether a claude process was detected. States are distinguished by shape
-/// (the colour is always the same); hook state wins, otherwise we fall back to
-/// the plain "claude is running" dot so behaviour is unchanged when hooks are
-/// not installed. Returns `None` when there is nothing to show.
-fn claude_marker(state: Option<ClaudeState>, has_claude: bool) -> Option<(&'static str, Color)> {
-    let sym = match state {
-        Some(ClaudeState::Working) => spinner_frame(),
-        Some(ClaudeState::Waiting) => "◆",
-        Some(ClaudeState::Done) => "✓",
-        Some(ClaudeState::Error) => "✗",
-        None if has_claude => CLAUDE_MARKER,
+/// whether a claude process was detected. The glyph and colour come from the
+/// user-configurable [`MarkerSet`]; a marker configured as `"spinner"` animates.
+/// Hook state wins, otherwise we fall back to the plain "claude is running"
+/// marker so behaviour is unchanged when hooks are not installed. Returns
+/// `None` when there is nothing to show.
+fn claude_marker(
+    markers: &MarkerSet,
+    state: Option<ClaudeState>,
+    has_claude: bool,
+) -> Option<(String, Color)> {
+    let marker = match state {
+        Some(ClaudeState::Working) => &markers.working,
+        Some(ClaudeState::Waiting) => &markers.waiting,
+        Some(ClaudeState::Done) => &markers.done,
+        Some(ClaudeState::Error) => &markers.error,
+        None if has_claude => &markers.running,
         None => return None,
     };
-    Some((sym, CLAUDE_MARKER_COLOR))
+    let glyph = if marker.animated {
+        spinner_frame().to_string()
+    } else {
+        marker.glyph.clone()
+    };
+    Some((glyph, marker.color))
 }
 
 /// Border accent colour for a node that is running claude (any state). The
-/// border only signals presence — state is conveyed by the marker shape — so a
-/// single colour is used throughout.
-fn claude_border_color(state: Option<ClaudeState>, has_claude: bool) -> Option<Color> {
-    if state.is_some() || has_claude {
-        Some(CLAUDE_MARKER_COLOR)
-    } else {
-        None
-    }
+/// border only signals presence; it reuses the marker's colour for that state.
+fn claude_border_color(
+    markers: &MarkerSet,
+    state: Option<ClaudeState>,
+    has_claude: bool,
+) -> Option<Color> {
+    claude_marker(markers, state, has_claude).map(|(_, color)| color)
 }
 
 // =============================================================================
@@ -102,17 +104,22 @@ fn render_tree_view(frame: &mut Frame, state: &mut UIState) {
     let area = frame.area();
 
     // Main layout: left panel (lists) | right panel (preview)
-    let main_chunks =
-        Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
+    let left_width = state.layout.session_panel_width.min(100);
+    let main_chunks = Layout::horizontal([
+        Constraint::Percentage(left_width),
+        Constraint::Percentage(100 - left_width),
+    ])
+    .split(area);
 
     let left_panel = main_chunks[0];
     let right_panel = main_chunks[1];
 
     // Left panel: Sessions | Windows | Panes (vertical stack)
+    let [s, w, p] = state.layout.tree_split;
     let left_chunks = Layout::vertical([
-        Constraint::Percentage(30),
-        Constraint::Percentage(35),
-        Constraint::Percentage(35),
+        Constraint::Percentage(s),
+        Constraint::Percentage(w),
+        Constraint::Percentage(p),
     ])
     .split(left_panel);
 
@@ -127,11 +134,12 @@ fn render_tree_view(frame: &mut Frame, state: &mut UIState) {
 }
 
 fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
+    let theme = state.theme;
     let is_focused = state.focus == Focus::Sessions;
     let border_style = if is_focused {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme.focus_border).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.unfocus_border)
     };
 
     // Grouping turns the flat session list into a list of rows that may also
@@ -168,10 +176,10 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
                     selected_row = Some(row_idx);
                 }
                 let mut style = Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD);
                 if is_selected {
-                    style = style.bg(Color::DarkGray).fg(Color::White);
+                    style = style.bg(theme.selection_bg).fg(theme.selection_fg);
                 }
                 items.push(ListItem::new(Line::from(vec![Span::styled(
                     format!("{} {} ({})", arrow, label, count),
@@ -184,7 +192,7 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
                     selected_row = Some(row_idx);
                 }
                 let style = if *index == state.selected_session {
-                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                    Style::default().bg(theme.selection_bg).fg(theme.selection_fg)
                 } else {
                     Style::default()
                 };
@@ -195,7 +203,7 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
                     session.name.clone()
                 })];
                 if let Some((sym, color)) =
-                    claude_marker(session.claude_state, session.has_claude)
+                    claude_marker(&state.hooks.claude, session.claude_state, session.has_claude)
                 {
                     spans.push(Span::styled(
                         format!(" {}", sym),
@@ -229,11 +237,12 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
 }
 
 fn render_windows_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
+    let theme = state.theme;
     let is_focused = state.focus == Focus::Windows;
     let border_style = if is_focused {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme.focus_border).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.unfocus_border)
     };
 
     let empty_windows: Vec<TmuxWindow> = Vec::new();
@@ -248,12 +257,14 @@ fn render_windows_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
         .enumerate()
         .map(|(i, window)| {
             let style = if i == state.selected_window {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
+                Style::default().bg(theme.selection_bg).fg(theme.selection_fg)
             } else {
                 Style::default()
             };
             let mut spans = vec![Span::raw(format!("{}:{}", window.index, window.name))];
-            if let Some((sym, color)) = claude_marker(window.claude_state, window.has_claude) {
+            if let Some((sym, color)) =
+                claude_marker(&state.hooks.claude, window.claude_state, window.has_claude)
+            {
                 spans.push(Span::styled(
                     format!(" {}", sym),
                     Style::default().fg(color),
@@ -283,11 +294,12 @@ fn render_windows_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
 }
 
 fn render_panes_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
+    let theme = state.theme;
     let is_focused = state.focus == Focus::Panes;
     let border_style = if is_focused {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme.focus_border).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.unfocus_border)
     };
 
     let empty_panes: Vec<TmuxPane> = Vec::new();
@@ -303,7 +315,7 @@ fn render_panes_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
         .enumerate()
         .map(|(i, pane)| {
             let style = if i == state.selected_pane {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
+                Style::default().bg(theme.selection_bg).fg(theme.selection_fg)
             } else {
                 Style::default()
             };
@@ -311,7 +323,9 @@ fn render_panes_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
                 "{}:{} [{}]",
                 pane.index, pane.id, pane.current_command
             ))];
-            if let Some((sym, color)) = claude_marker(pane.claude_state, pane.has_claude) {
+            if let Some((sym, color)) =
+                claude_marker(&state.hooks.claude, pane.claude_state, pane.has_claude)
+            {
                 spans.push(Span::styled(
                     format!(" {}", sym),
                     Style::default().fg(color),
@@ -349,7 +363,7 @@ fn render_pane_preview_tree(frame: &mut Frame, state: &UIState, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(state.theme.accent))
         .title(title);
 
     let inner = block.inner(area);
@@ -376,38 +390,42 @@ fn render_pane_preview_tree(frame: &mut Frame, state: &UIState, area: Rect) {
 }
 
 fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
+    let theme = state.theme;
     let status_text = if let Some(ref err) = state.last_error {
         Line::from(vec![Span::styled(
             format!(" Error: {} ", err),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error),
         )])
     } else {
+        let kb = &state.keybindings;
+        // `j/k`, `Tab`, `za` and `Space×2` are fixed (not remappable); the rest
+        // reflect the user's key bindings so the hint bar always stays accurate.
         Line::from(vec![
-            Span::styled("j/k", Style::default().fg(Color::Yellow)),
+            Span::styled("j/k", Style::default().fg(theme.focus_border)),
             Span::raw(":move "),
-            Span::styled("Tab", Style::default().fg(Color::Yellow)),
+            Span::styled("Tab", Style::default().fg(theme.focus_border)),
             Span::raw(":focus "),
-            Span::styled("s", Style::default().fg(Color::Yellow)),
+            Span::styled(kb.label(Action::Sort), Style::default().fg(theme.focus_border)),
             Span::raw(":sort "),
-            Span::styled("g", Style::default().fg(Color::Yellow)),
+            Span::styled(kb.label(Action::Group), Style::default().fg(theme.focus_border)),
             Span::raw(":group "),
-            Span::styled("za", Style::default().fg(Color::Yellow)),
+            Span::styled("za", Style::default().fg(theme.focus_border)),
             Span::raw(":fold "),
-            Span::styled("Space×2", Style::default().fg(Color::Magenta)),
+            Span::styled("Space×2", Style::default().fg(theme.highlight)),
             Span::raw(":multi "),
-            Span::styled("C-n", Style::default().fg(Color::Green)),
+            Span::styled(kb.label(Action::NewSession), Style::default().fg(theme.success)),
             Span::raw(":new "),
-            Span::styled("C-r", Style::default().fg(Color::Green)),
+            Span::styled(kb.label(Action::RenameSession), Style::default().fg(theme.success)),
             Span::raw(":rename "),
-            Span::styled("C-x", Style::default().fg(Color::Red)),
+            Span::styled(kb.label(Action::KillSession), Style::default().fg(theme.error)),
             Span::raw(":kill "),
-            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::styled(kb.label(Action::Quit), Style::default().fg(theme.focus_border)),
             Span::raw(":quit"),
         ])
     };
 
     frame.render_widget(
-        Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray)),
+        Paragraph::new(status_text).style(Style::default().bg(theme.status_bar_bg)),
         area,
     );
 }
@@ -418,6 +436,7 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
 
 fn render_multi_preview(frame: &mut Frame, state: &UIState) {
     let area = frame.area();
+    let theme = state.theme;
 
     let main_chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
 
@@ -430,20 +449,20 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
             .title(" No sessions found ");
         frame.render_widget(block, preview_area);
     } else {
-        // Create horizontal layout for sessions
-        // Selected session gets 80%, others share 20%
+        // Create horizontal layout for sessions: the selected session gets
+        // `multi_selected_ratio`%, the rest share what remains.
+        let selected_ratio = state.layout.multi_selected_ratio.min(100);
         let session_constraints: Vec<Constraint> = if state.sessions.len() == 1 {
             vec![Constraint::Percentage(100)]
         } else {
             let other_count = state.sessions.len() - 1;
-            // Each non-selected session gets an equal share of 20%
-            let other_percentage = 30 / other_count as u16;
+            let other_percentage = (100 - selected_ratio) / other_count as u16;
             state.sessions
                 .iter()
                 .enumerate()
                 .map(|(idx, _)| {
                     if idx == state.multi_session {
-                        Constraint::Percentage(70)
+                        Constraint::Percentage(selected_ratio)
                     } else {
                         Constraint::Percentage(other_percentage.max(1))
                     }
@@ -462,17 +481,19 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
             // their Claude state colour unless they are the currently selected
             // session (selection colour wins so focus is never lost).
             let session_border_style = if is_selected_session {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme.focus_border).add_modifier(Modifier::BOLD)
             } else if let Some(color) =
-                claude_border_color(session.claude_state, session.has_claude)
+                claude_border_color(&state.hooks.claude, session.claude_state, session.has_claude)
             {
                 Style::default().fg(color)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme.unfocus_border)
             };
 
             let mut title_spans = vec![Span::raw(format!(" {} ", session.name))];
-            if let Some((sym, color)) = claude_marker(session.claude_state, session.has_claude) {
+            if let Some((sym, color)) =
+                claude_marker(&state.hooks.claude, session.claude_state, session.has_claude)
+            {
                 title_spans.push(Span::styled(
                     format!("{} ", sym),
                     Style::default().fg(color),
@@ -489,7 +510,7 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
 
             if session.windows.is_empty() {
                 let no_windows = Paragraph::new("No windows")
-                    .style(Style::default().fg(Color::DarkGray));
+                    .style(Style::default().fg(theme.unfocus_border));
                 frame.render_widget(no_windows, inner_area);
                 continue;
             }
@@ -509,7 +530,14 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
                 let is_selected_window =
                     is_selected_session && window_idx == state.multi_window;
 
-                render_window_preview(frame, window, *window_area, is_selected_window);
+                render_window_preview(
+                    frame,
+                    &state.theme,
+                    &state.hooks.claude,
+                    window,
+                    *window_area,
+                    is_selected_window,
+                );
             }
         }
     }
@@ -518,51 +546,59 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
     let status_text = if let Some(ref err) = state.last_error {
         Line::from(vec![Span::styled(
             format!(" Error: {} ", err),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error),
         )])
     } else {
         let selected_info = state
             .get_multi_selected_target()
             .unwrap_or_else(|| "None".to_string());
 
+        let kb = &state.keybindings;
         Line::from(vec![
-            Span::styled("h/l", Style::default().fg(Color::Yellow)),
+            Span::styled("h/l", Style::default().fg(theme.focus_border)),
             Span::raw(":session "),
-            Span::styled("j/k", Style::default().fg(Color::Yellow)),
+            Span::styled("j/k", Style::default().fg(theme.focus_border)),
             Span::raw(":window "),
-            Span::styled("Space×2", Style::default().fg(Color::Magenta)),
+            Span::styled("Space×2", Style::default().fg(theme.highlight)),
             Span::raw(":tree "),
-            Span::styled("C-n", Style::default().fg(Color::Green)),
+            Span::styled(kb.label(Action::NewSession), Style::default().fg(theme.success)),
             Span::raw(":new "),
-            Span::styled("C-r", Style::default().fg(Color::Green)),
+            Span::styled(kb.label(Action::RenameSession), Style::default().fg(theme.success)),
             Span::raw(":rename "),
-            Span::styled("C-x", Style::default().fg(Color::Red)),
+            Span::styled(kb.label(Action::KillSession), Style::default().fg(theme.error)),
             Span::raw(":kill "),
-            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::styled(kb.label(Action::Quit), Style::default().fg(theme.focus_border)),
             Span::raw(":quit "),
             Span::raw("| "),
             Span::styled(
                 format!("Sel:{}", selected_info),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme.accent),
             ),
         ])
     };
 
     frame.render_widget(
-        Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray)),
+        Paragraph::new(status_text).style(Style::default().bg(theme.status_bar_bg)),
         status_area,
     );
 }
 
-fn render_window_preview(frame: &mut Frame, window: &TmuxWindow, area: Rect, is_selected: bool) {
+fn render_window_preview(
+    frame: &mut Frame,
+    theme: &Theme,
+    markers: &MarkerSet,
+    window: &TmuxWindow,
+    area: Rect,
+    is_selected: bool,
+) {
     let border_style = if is_selected {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme.accent)
             .add_modifier(Modifier::BOLD)
-    } else if let Some(color) = claude_border_color(window.claude_state, window.has_claude) {
+    } else if let Some(color) = claude_border_color(markers, window.claude_state, window.has_claude) {
         Style::default().fg(color)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.unfocus_border)
     };
 
     let cmd = window
@@ -574,7 +610,7 @@ fn render_window_preview(frame: &mut Frame, window: &TmuxWindow, area: Rect, is_
         " {}:{} [{}] ",
         window.index, window.name, cmd
     ))];
-    if let Some((sym, color)) = claude_marker(window.claude_state, window.has_claude) {
+    if let Some((sym, color)) = claude_marker(markers, window.claude_state, window.has_claude) {
         title_spans.push(Span::styled(
             format!("{} ", sym),
             Style::default().fg(color),
@@ -615,7 +651,7 @@ fn render_input_popup(frame: &mut Frame, state: &UIState, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(state.theme.accent))
         .title(format!(" Send to: {} ", target_info))
         .title_bottom(Line::from(" Enter:send | Esc:cancel ").centered());
 
@@ -688,7 +724,7 @@ fn render_session_name_popup(frame: &mut Frame, state: &UIState, title: &str, la
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(state.theme.accent))
         .title(format!(" {} ", title))
         .title_bottom(Line::from(" Enter:confirm | Esc:cancel ").centered());
 
@@ -753,11 +789,11 @@ fn render_group_select_popup(frame: &mut Frame, state: &UIState) {
     let ungrouped_label = "(Ungrouped)";
     items.push(ListItem::new(Line::from(Span::styled(
         ungrouped_label,
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(state.theme.unfocus_border),
     ))));
     items.push(ListItem::new(Line::from(Span::styled(
         "+ New group…",
-        Style::default().fg(Color::Green),
+        Style::default().fg(state.theme.success),
     ))));
 
     // Size the popup to the content, clamped so it always fits on screen.
@@ -780,7 +816,7 @@ fn render_group_select_popup(frame: &mut Frame, state: &UIState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(state.theme.accent))
         .title(format!(" Group: {} ", session_name))
         .title_bottom(Line::from(" ↑↓:select | Enter:confirm | Esc:cancel ").centered());
 
@@ -792,7 +828,7 @@ fn render_group_select_popup(frame: &mut Frame, state: &UIState) {
 
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(Color::Cyan)
+            .bg(state.theme.accent)
             .fg(Color::Black)
             .add_modifier(Modifier::BOLD),
     );
@@ -825,7 +861,7 @@ fn render_confirm_kill_popup(frame: &mut Frame, state: &UIState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
+        .border_style(Style::default().fg(state.theme.error))
         .title(" Kill Session ")
         .title_bottom(Line::from(" Enter:confirm | Esc:cancel ").centered());
 
@@ -854,15 +890,15 @@ fn render_confirm_kill_popup(frame: &mut Frame, state: &UIState) {
     .split(button_area);
 
     let yes_style = if state.confirm_yes_selected {
-        Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD)
+        Style::default().fg(Color::Black).bg(state.theme.error).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(state.theme.unfocus_border)
     };
 
     let no_style = if !state.confirm_yes_selected {
-        Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+        Style::default().fg(Color::Black).bg(state.theme.success).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(state.theme.unfocus_border)
     };
 
     let yes_button = Paragraph::new(" [Y]es ")
@@ -894,7 +930,7 @@ mod cursor_alignment_tests {
     }
 
     fn render_name_popup_cursor(text: &str) -> Option<(u16, u16)> {
-        let mut state = UIState::new(100);
+        let mut state = UIState::new(crate::config::Config::default());
         state.popup_mode = Some(PopupMode::NewSession);
         for c in text.chars() {
             state.input_char(c);
