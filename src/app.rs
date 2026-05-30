@@ -11,6 +11,10 @@ use crate::group::GroupStore;
 /// to any user group. Only rendered when at least one session *is* grouped.
 pub const UNGROUPED_LABEL: &str = "Ungrouped";
 
+/// Maximum number of characters (not bytes) accepted in the session/group name
+/// input popups. Keeps names short enough to render in the narrow list panes.
+pub const SESSION_NAME_MAX_LEN: usize = 30;
+
 // =============================================================================
 // Data Structures
 // =============================================================================
@@ -542,21 +546,47 @@ impl UIState {
         }
     }
 
+    /// `input_cursor`（char 単位）を `input_buffer` 内のバイトオフセットへ変換する。
+    fn input_cursor_byte_offset(&self) -> usize {
+        self.input_buffer
+            .char_indices()
+            .nth(self.input_cursor)
+            .map(|(byte_idx, _)| byte_idx)
+            .unwrap_or(self.input_buffer.len())
+    }
+
+    /// `input_buffer` の文字数（char 単位）。
+    fn input_char_count(&self) -> usize {
+        self.input_buffer.chars().count()
+    }
+
     pub fn input_char(&mut self, c: char) {
-        self.input_buffer.insert(self.input_cursor, c);
+        let byte_offset = self.input_cursor_byte_offset();
+        self.input_buffer.insert(byte_offset, c);
         self.input_cursor += 1;
+    }
+
+    /// Insert a character only while the buffer holds fewer than `max_chars`
+    /// characters; otherwise the keystroke is ignored. Used by the session/group
+    /// name popups to cap the name length.
+    pub fn input_char_limited(&mut self, c: char, max_chars: usize) {
+        if self.input_char_count() < max_chars {
+            self.input_char(c);
+        }
     }
 
     pub fn input_backspace(&mut self) {
         if self.input_cursor > 0 {
             self.input_cursor -= 1;
-            self.input_buffer.remove(self.input_cursor);
+            let byte_offset = self.input_cursor_byte_offset();
+            self.input_buffer.remove(byte_offset);
         }
     }
 
     pub fn input_delete(&mut self) {
-        if self.input_cursor < self.input_buffer.len() {
-            self.input_buffer.remove(self.input_cursor);
+        if self.input_cursor < self.input_char_count() {
+            let byte_offset = self.input_cursor_byte_offset();
+            self.input_buffer.remove(byte_offset);
         }
     }
 
@@ -567,7 +597,7 @@ impl UIState {
     }
 
     pub fn input_move_right(&mut self) {
-        if self.input_cursor < self.input_buffer.len() {
+        if self.input_cursor < self.input_char_count() {
             self.input_cursor += 1;
         }
     }
@@ -577,7 +607,7 @@ impl UIState {
     }
 
     pub fn input_move_end(&mut self) {
-        self.input_cursor = self.input_buffer.len();
+        self.input_cursor = self.input_char_count();
     }
 
     // =========================================================================
@@ -594,7 +624,7 @@ impl UIState {
         if let Some(session) = self.sessions.get(self.selected_session) {
             self.popup_mode = Some(PopupMode::RenameSession);
             self.input_buffer = session.name.clone();
-            self.input_cursor = self.input_buffer.len();
+            self.input_cursor = self.input_char_count();
         }
     }
 
@@ -1307,5 +1337,71 @@ mod tests {
         );
         state.group_choice_down();
         assert_eq!(state.selected_group_choice(), GroupChoice::Ungrouped);
+    }
+
+    #[test]
+    fn input_handles_multibyte_chars_without_panic() {
+        let mut state = UIState::new(100);
+        // 日本語を複数文字入力（旧実装ではバイト境界パニックしていた）
+        state.input_char('あ');
+        state.input_char('い');
+        state.input_char('う');
+        assert_eq!(state.input_buffer, "あいう");
+        assert_eq!(state.input_cursor, 3);
+    }
+
+    #[test]
+    fn input_cursor_movement_and_editing_with_multibyte() {
+        let mut state = UIState::new(100);
+        for c in "あいう".chars() {
+            state.input_char(c);
+        }
+        // 左へ2つ移動 → カーソルは「い」の前
+        state.input_move_left();
+        state.input_move_left();
+        assert_eq!(state.input_cursor, 1);
+        // カーソル位置に「ん」を挿入
+        state.input_char('ん');
+        assert_eq!(state.input_buffer, "あんいう");
+        assert_eq!(state.input_cursor, 2);
+        // backspace で「ん」を削除
+        state.input_backspace();
+        assert_eq!(state.input_buffer, "あいう");
+        assert_eq!(state.input_cursor, 1);
+        // delete でカーソル位置の「い」を削除
+        state.input_delete();
+        assert_eq!(state.input_buffer, "あう");
+        assert_eq!(state.input_cursor, 1);
+    }
+
+    #[test]
+    fn input_move_end_uses_char_count() {
+        let mut state = UIState::new(100);
+        for c in "あい".chars() {
+            state.input_char(c);
+        }
+        state.input_move_home();
+        assert_eq!(state.input_cursor, 0);
+        state.input_move_end();
+        assert_eq!(state.input_cursor, 2);
+    }
+
+    #[test]
+    fn input_char_limited_caps_char_count() {
+        let mut state = UIState::new(100);
+        for _ in 0..40 {
+            state.input_char_limited('a', SESSION_NAME_MAX_LEN);
+        }
+        assert_eq!(state.input_buffer.chars().count(), SESSION_NAME_MAX_LEN);
+    }
+
+    #[test]
+    fn input_char_limited_counts_chars_not_bytes() {
+        let mut state = UIState::new(100);
+        // マルチバイト文字でもバイト長ではなく文字数で制限される
+        for _ in 0..40 {
+            state.input_char_limited('あ', SESSION_NAME_MAX_LEN);
+        }
+        assert_eq!(state.input_buffer.chars().count(), SESSION_NAME_MAX_LEN);
     }
 }

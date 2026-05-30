@@ -8,7 +8,9 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::messages::{RefreshControl, TmuxCommand, TmuxResponse, UIEvent};
-use crate::app::{Focus, GroupChoice, InputMode, PopupMode, UIState, ViewMode};
+use crate::app::{
+    Focus, GroupChoice, InputMode, PopupMode, SESSION_NAME_MAX_LEN, UIState, ViewMode,
+};
 use crate::ui::render_ui;
 
 // =============================================================================
@@ -255,7 +257,9 @@ impl UIActor {
                     KeyCode::Right => self.state.input_move_right(),
                     KeyCode::Home => self.state.input_move_home(),
                     KeyCode::End => self.state.input_move_end(),
-                    KeyCode::Char(c) => self.state.input_char(c),
+                    KeyCode::Char(c) => {
+                        self.state.input_char_limited(c, SESSION_NAME_MAX_LEN)
+                    }
                     _ => {}
                 }
             }
