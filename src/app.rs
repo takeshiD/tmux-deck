@@ -4,6 +4,12 @@ use ansi_to_tui::IntoText;
 use ratatui::text::Text;
 use ratatui::widgets::ListState;
 
+use crate::group::GroupStore;
+
+/// Label shown for the implicit group of sessions that have not been assigned
+/// to any user group. Only rendered when at least one session *is* grouped.
+pub const UNGROUPED_LABEL: &str = "Ungrouped";
+
 // =============================================================================
 // Data Structures
 // =============================================================================
@@ -57,6 +63,10 @@ pub struct TmuxSession {
     /// the list without re-querying tmux.
     pub last_attached: i64,
     pub activity: i64,
+    /// tmux-deck-side group label this session belongs to, if any. This is a
+    /// purely organisational tag managed by the deck (see [`crate::group`]),
+    /// independent of tmux's native session groups. `None` means ungrouped.
+    pub group: Option<String>,
 }
 
 // =============================================================================
@@ -220,6 +230,21 @@ pub enum PopupMode {
     RenameSession,
     /// Confirming session kill
     ConfirmKill,
+    /// Assigning the selected session to a tmux-deck group
+    GroupSession,
+}
+
+/// A single rendered row in the Sessions list. Grouping inserts non-selectable
+/// [`SessionRow::Header`] rows between the [`SessionRow::Session`] rows; the
+/// session rows still map 1:1 onto indices into [`UIState::sessions`], so all
+/// navigation continues to operate on session indices and only rendering needs
+/// to be group-aware.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRow {
+    /// A group heading. `group` is `None` for the implicit ungrouped bucket.
+    Header { group: Option<String>, count: usize },
+    /// A session, identified by its index into [`UIState::sessions`].
+    Session { index: usize },
 }
 
 // =============================================================================
@@ -243,6 +268,9 @@ pub struct UIState {
     pub window_list_state: ListState,
     pub pane_list_state: ListState,
     pub session_sort: SessionSort,
+
+    /// Persisted tmux-deck-side session grouping (session name -> group).
+    pub groups: GroupStore,
 
     // MultiPreview state (session_idx, window_idx)
     pub multi_session: usize,
@@ -278,6 +306,8 @@ impl UIState {
             window_list_state: ListState::default(),
             pane_list_state: ListState::default(),
             session_sort: SessionSort::default(),
+
+            groups: GroupStore::load(),
 
             multi_session: 0,
             multi_window: 0,
@@ -435,6 +465,15 @@ impl UIState {
         }
     }
 
+    pub fn open_group_session_popup(&mut self) {
+        if let Some(session) = self.sessions.get(self.selected_session) {
+            self.popup_mode = Some(PopupMode::GroupSession);
+            // Prefill with the current group so editing/clearing is natural.
+            self.input_buffer = session.group.clone().unwrap_or_default();
+            self.input_cursor = self.input_buffer.len();
+        }
+    }
+
     pub fn open_kill_session_popup(&mut self) {
         if !self.sessions.is_empty() {
             self.popup_mode = Some(PopupMode::ConfirmKill);
@@ -469,6 +508,17 @@ impl UIState {
             .map(|s| (s.name.clone(), new_name))
     }
 
+    /// Get the group name typed in the GroupSession popup. An empty/whitespace
+    /// entry means "remove from any group" and is returned as `None`.
+    pub fn get_group_session_input(&self) -> Option<String> {
+        let trimmed = self.input_buffer.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
     /// Get the session name to kill (for ConfirmKill popup)
     pub fn get_kill_session_name(&self) -> Option<String> {
         if self.confirm_yes_selected {
@@ -494,7 +544,8 @@ impl UIState {
             .map(|s| s.name.clone());
 
         self.sessions = sessions;
-        self.session_sort.apply(&mut self.sessions);
+        self.apply_group_labels();
+        self.order_sessions();
 
         if let Some(name) = current_name
             && let Some(idx) = self.sessions.iter().position(|s| s.name == name)
@@ -504,6 +555,67 @@ impl UIState {
 
         self.validate_selections();
         self.last_error = None;
+    }
+
+    /// Stamp each session with its persisted group label. Called whenever fresh
+    /// session data arrives from tmux, since the tmux layer is group-agnostic.
+    fn apply_group_labels(&mut self) {
+        for session in &mut self.sessions {
+            session.group = self.groups.group_of(&session.name);
+        }
+    }
+
+    /// Order the session list: first by the active [`SessionSort`], then cluster
+    /// sessions of the same group together. Because the clustering pass is a
+    /// *stable* sort keyed only on the group, sessions keep their sort order
+    /// within each group, and ungrouped sessions fall to the bottom.
+    fn order_sessions(&mut self) {
+        self.session_sort.apply(&mut self.sessions);
+        self.sessions.sort_by(|a, b| match (&a.group, &b.group) {
+            (Some(x), Some(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+    }
+
+    /// Assign the currently-selected session to `group` (or remove it from any
+    /// group when `group` is `None`/empty), persist the change, and re-order the
+    /// list in place keeping that session highlighted. No tmux round-trip is
+    /// needed — grouping is entirely tmux-deck-side.
+    pub fn assign_selected_group(&mut self, group: Option<String>) {
+        let Some(session) = self.sessions.get(self.selected_session) else {
+            return;
+        };
+        let name = session.name.clone();
+        self.groups.set(&name, group.as_deref());
+        self.apply_group_labels();
+        self.resort_sessions_preserve_selection();
+    }
+
+    /// Build the rendered Sessions rows, inserting group headers. When no
+    /// session is grouped the result is a flat list of [`SessionRow::Session`]
+    /// rows (no headers), matching the pre-grouping behaviour exactly.
+    pub fn session_rows(&self) -> Vec<SessionRow> {
+        let any_grouped = self.sessions.iter().any(|s| s.group.is_some());
+        let mut rows = Vec::with_capacity(self.sessions.len());
+        let mut current: Option<&Option<String>> = None;
+        for (index, session) in self.sessions.iter().enumerate() {
+            if any_grouped && current != Some(&session.group) {
+                let count = self
+                    .sessions
+                    .iter()
+                    .filter(|s| s.group == session.group)
+                    .count();
+                rows.push(SessionRow::Header {
+                    group: session.group.clone(),
+                    count,
+                });
+                current = Some(&session.group);
+            }
+            rows.push(SessionRow::Session { index });
+        }
+        rows
     }
 
     /// Advance to the next [`SessionSort`] and re-sort the list in place,
@@ -519,7 +631,7 @@ impl UIState {
             .get(self.selected_session)
             .map(|s| s.name.clone());
 
-        self.session_sort.apply(&mut self.sessions);
+        self.order_sessions();
 
         if let Some(name) = current_name
             && let Some(idx) = self.sessions.iter().position(|s| s.name == name)
@@ -711,5 +823,94 @@ impl UIState {
         {
             self.multi_window += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(name: &str) -> TmuxSession {
+        TmuxSession {
+            name: name.to_string(),
+            attached: false,
+            unread: false,
+            windows: Vec::new(),
+            has_claude: false,
+            last_attached: 0,
+            activity: 0,
+            group: None,
+        }
+    }
+
+    /// Build a UIState with an in-memory (no-disk) group store and the given
+    /// assignments, then load `names` as the session list.
+    fn state_with(names: &[&str], groups: &[(&str, &str)]) -> UIState {
+        let mut state = UIState::new(100);
+        state.groups = GroupStore::default();
+        for (sess, grp) in groups {
+            state.groups.set(sess, Some(grp));
+        }
+        state.update_sessions(names.iter().map(|n| session(n)).collect());
+        state
+    }
+
+    #[test]
+    fn ungrouped_sessions_have_no_headers() {
+        let state = state_with(&["a", "b", "c"], &[]);
+        let rows = state.session_rows();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| matches!(r, SessionRow::Session { .. })));
+    }
+
+    #[test]
+    fn grouped_sessions_cluster_with_ungrouped_last() {
+        // a, c -> "work"; b ungrouped. Names tie-break ascending within a group.
+        let state = state_with(&["a", "b", "c"], &[("a", "work"), ("c", "work")]);
+        let ordered: Vec<&str> = state.sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(ordered, vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn rows_insert_one_header_per_group() {
+        let state = state_with(
+            &["a", "b", "c"],
+            &[("a", "work"), ("c", "work"), ("b", "play")],
+        );
+        let rows = state.session_rows();
+        // play(b) sorts before work(a,c) alphabetically; ungrouped bucket absent.
+        let labels: Vec<String> = rows
+            .iter()
+            .filter_map(|r| match r {
+                SessionRow::Header { group, count } => {
+                    Some(format!("{}:{}", group.as_deref().unwrap_or("none"), count))
+                }
+                SessionRow::Session { .. } => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["play:1".to_string(), "work:2".to_string()]);
+    }
+
+    #[test]
+    fn ungrouped_bucket_gets_a_header_when_mixed() {
+        let state = state_with(&["a", "b"], &[("a", "work")]);
+        let rows = state.session_rows();
+        let has_ungrouped_header = rows.iter().any(|r| {
+            matches!(r, SessionRow::Header { group: None, count } if *count == 1)
+        });
+        assert!(has_ungrouped_header);
+    }
+
+    #[test]
+    fn assigning_group_updates_store_and_order() {
+        let mut state = state_with(&["a", "b"], &[]);
+        state.selected_session = 1; // "b"
+        state.assign_selected_group(Some("work".to_string()));
+        assert_eq!(state.groups.group_of("b"), Some("work".to_string()));
+        // "b" is now grouped and clusters above the ungrouped "a".
+        let ordered: Vec<&str> = state.sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(ordered, vec!["b", "a"]);
+        // Selection still tracks "b" after the reorder.
+        assert_eq!(state.sessions[state.selected_session].name, "b");
     }
 }

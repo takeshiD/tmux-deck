@@ -3,7 +3,10 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
-use crate::app::{Focus, InputMode, PopupMode, TmuxPane, TmuxWindow, UIState, ViewMode};
+use crate::app::{
+    Focus, InputMode, PopupMode, SessionRow, TmuxPane, TmuxWindow, UIState, UNGROUPED_LABEL,
+    ViewMode,
+};
 
 /// Orange color used to flag sessions / windows / panes that have a claude
 /// process running. Color::Indexed(208) is the standard 256-color "Orange1"
@@ -32,6 +35,12 @@ pub fn render_ui(frame: &mut Frame, state: &mut UIState) {
         match popup_mode {
             PopupMode::NewSession => render_session_name_popup(frame, state, "New Session", "Enter session name:"),
             PopupMode::RenameSession => render_session_name_popup(frame, state, "Rename Session", "Enter new name:"),
+            PopupMode::GroupSession => render_session_name_popup(
+                frame,
+                state,
+                "Group Session",
+                "Group name (empty to ungroup):",
+            ),
             PopupMode::ConfirmKill => render_confirm_kill_popup(frame, state),
         }
     }
@@ -77,31 +86,62 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let items: Vec<ListItem> = state
-        .sessions
+    // Grouping turns the flat session list into a list of rows that may also
+    // contain non-selectable group headers. When nothing is grouped, the rows
+    // are all sessions and this renders identically to the ungrouped list.
+    let rows = state.session_rows();
+    let indented = rows
         .iter()
-        .enumerate()
-        .map(|(i, session)| {
-            let style = if i == state.selected_session {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
-            } else {
-                Style::default()
-            };
-            let mut spans = vec![Span::raw(session.name.clone())];
-            if session.attached {
-                spans.push(Span::styled(" ●", Style::default().fg(Color::Green)));
-            } else if session.unread {
-                spans.push(Span::styled(" ◆", Style::default().fg(Color::Yellow)));
+        .any(|r| matches!(r, SessionRow::Header { .. }));
+
+    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
+    let mut selected_row: Option<usize> = None;
+    for (row_idx, row) in rows.iter().enumerate() {
+        match row {
+            SessionRow::Header { group, count } => {
+                let label = group.as_deref().unwrap_or(UNGROUPED_LABEL);
+                items.push(ListItem::new(Line::from(vec![Span::styled(
+                    format!("▾ {} ({})", label, count),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )])));
             }
-            if session.has_claude {
-                spans.push(Span::styled(
-                    format!(" {}", CLAUDE_MARKER),
-                    Style::default().fg(CLAUDE_MARKER_COLOR),
-                ));
+            SessionRow::Session { index } => {
+                let session = &state.sessions[*index];
+                if *index == state.selected_session {
+                    selected_row = Some(row_idx);
+                }
+                let style = if *index == state.selected_session {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+                // Indent sessions under their header so the hierarchy reads.
+                let mut spans = vec![Span::raw(if indented {
+                    format!("  {}", session.name)
+                } else {
+                    session.name.clone()
+                })];
+                if session.attached {
+                    spans.push(Span::styled(" ●", Style::default().fg(Color::Green)));
+                } else if session.unread {
+                    spans.push(Span::styled(" ◆", Style::default().fg(Color::Yellow)));
+                }
+                if session.has_claude {
+                    spans.push(Span::styled(
+                        format!(" {}", CLAUDE_MARKER),
+                        Style::default().fg(CLAUDE_MARKER_COLOR),
+                    ));
+                }
+                items.push(ListItem::new(Line::from(spans)).style(style));
             }
-            ListItem::new(Line::from(spans)).style(style)
-        })
-        .collect();
+        }
+    }
+
+    // The highlight tracks rendered rows, not session indices, so map the
+    // selected session onto its row before handing the state to ratatui.
+    state.session_list_state.select(selected_row);
 
     let list = List::new(items)
         .block(
@@ -286,6 +326,8 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
             Span::raw(":focus "),
             Span::styled("s", Style::default().fg(Color::Yellow)),
             Span::raw(":sort "),
+            Span::styled("g", Style::default().fg(Color::Yellow)),
+            Span::raw(":group "),
             Span::styled("Space×2", Style::default().fg(Color::Magenta)),
             Span::raw(":multi "),
             Span::styled("C-n", Style::default().fg(Color::Green)),

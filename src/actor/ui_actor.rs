@@ -162,13 +162,23 @@ impl UIActor {
         popup_mode: PopupMode,
     ) -> Result<bool> {
         match popup_mode {
-            PopupMode::NewSession | PopupMode::RenameSession => {
+            PopupMode::NewSession | PopupMode::RenameSession | PopupMode::GroupSession => {
                 match key.code {
                     KeyCode::Esc => {
                         self.state.close_popup();
                         self.refresh_control.resume();
                     }
                     KeyCode::Enter => {
+                        // GroupSession is handled entirely tmux-deck-side: no
+                        // tmux command and no RefreshAll, since grouping does
+                        // not change anything tmux knows about.
+                        if popup_mode == PopupMode::GroupSession {
+                            let group = self.state.get_group_session_input();
+                            self.state.assign_selected_group(group);
+                            self.state.close_popup();
+                            self.refresh_control.resume();
+                            return Ok(false);
+                        }
                         if popup_mode == PopupMode::NewSession {
                             let name = self.state.get_new_session_name();
                             if !name.is_empty() {
@@ -177,6 +187,9 @@ impl UIActor {
                         } else if let Some((old_name, new_name)) =
                             self.state.get_rename_session_info()
                         {
+                            // Carry the group label across the rename so the
+                            // session does not silently fall out of its group.
+                            self.state.groups.rename_session(&old_name, &new_name);
                             let _ = self
                                 .tmux_cmd_tx
                                 .send(TmuxCommand::RenameSession { old_name, new_name })
@@ -205,6 +218,9 @@ impl UIActor {
                     }
                     KeyCode::Enter => {
                         if let Some(name) = self.state.get_kill_session_name() {
+                            // Drop the killed session's group assignment so the
+                            // store does not keep stale entries around.
+                            self.state.groups.forget(&name);
                             let _ = self.tmux_cmd_tx.send(TmuxCommand::KillSession { name }).await;
                             // Refresh after operation
                             let _ = self.tmux_cmd_tx.send(TmuxCommand::RefreshAll).await;
@@ -262,6 +278,13 @@ impl UIActor {
                         && self.state.focus == Focus::Sessions =>
                 {
                     self.state.cycle_session_sort();
+                }
+                KeyCode::Char('g')
+                    if self.state.view_mode == ViewMode::TreeView
+                        && self.state.focus == Focus::Sessions =>
+                {
+                    self.state.open_group_session_popup();
+                    self.refresh_control.pause();
                 }
                 KeyCode::Char(' ') => {
                     self.state.handle_space_press();
