@@ -251,6 +251,17 @@ impl UIActor {
     async fn handle_normal_mode_key(&mut self, key: event::KeyEvent) -> Result<bool> {
         let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+        // `za` fold chord: a pending `z` followed by `a` toggles the current
+        // group's fold. Any other key cancels the chord and is then processed
+        // normally below.
+        if self.state.pending_z {
+            self.state.pending_z = false;
+            if !is_ctrl && key.code == KeyCode::Char('a') {
+                self.state.toggle_fold_current_group();
+                return Ok(false);
+            }
+        }
+
         if is_ctrl {
             match key.code {
                 KeyCode::Char('n') => {
@@ -285,6 +296,13 @@ impl UIActor {
                 {
                     self.state.open_group_session_popup();
                     self.refresh_control.pause();
+                }
+                KeyCode::Char('z')
+                    if self.state.view_mode == ViewMode::TreeView
+                        && self.state.focus == Focus::Sessions =>
+                {
+                    // Begin the `za` fold chord; the next key resolves it.
+                    self.state.pending_z = true;
                 }
                 KeyCode::Char(' ') => {
                     self.state.handle_space_press();

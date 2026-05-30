@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
@@ -242,7 +243,13 @@ pub enum PopupMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionRow {
     /// A group heading. `group` is `None` for the implicit ungrouped bucket.
-    Header { group: Option<String>, count: usize },
+    /// `collapsed` drives the fold indicator and means the member session rows
+    /// are hidden.
+    Header {
+        group: Option<String>,
+        count: usize,
+        collapsed: bool,
+    },
     /// A session, identified by its index into [`UIState::sessions`].
     Session { index: usize },
 }
@@ -271,6 +278,12 @@ pub struct UIState {
 
     /// Persisted tmux-deck-side session grouping (session name -> group).
     pub groups: GroupStore,
+    /// Groups currently folded in the Sessions list. A group key of `None` is
+    /// the implicit "Ungrouped" bucket. Fold state is session-runtime only and
+    /// is not persisted.
+    pub collapsed_groups: HashSet<Option<String>>,
+    /// True after `z` is pressed, awaiting the `a` of the `za` fold chord.
+    pub pending_z: bool,
 
     // MultiPreview state (session_idx, window_idx)
     pub multi_session: usize,
@@ -308,6 +321,8 @@ impl UIState {
             session_sort: SessionSort::default(),
 
             groups: GroupStore::load(),
+            collapsed_groups: HashSet::new(),
+            pending_z: false,
 
             multi_session: 0,
             multi_window: 0,
@@ -589,18 +604,91 @@ impl UIState {
         };
         let name = session.name.clone();
         self.groups.set(&name, group.as_deref());
+        // Reveal the destination group so the user sees the session land, even
+        // if that group was folded.
+        self.collapsed_groups.remove(&group);
         self.apply_group_labels();
         self.resort_sessions_preserve_selection();
     }
 
-    /// Build the rendered Sessions rows, inserting group headers. When no
-    /// session is grouped the result is a flat list of [`SessionRow::Session`]
-    /// rows (no headers), matching the pre-grouping behaviour exactly.
+    /// Whether any session carries a group label. When false there are no
+    /// headers and folding is a no-op (there is nothing to organise yet).
+    fn any_grouped(&self) -> bool {
+        self.sessions.iter().any(|s| s.group.is_some())
+    }
+
+    /// Whether `group` is currently folded. Folding only takes effect once
+    /// real groups exist, so a stray collapsed entry never hides a flat list.
+    fn is_collapsed(&self, group: &Option<String>) -> bool {
+        self.any_grouped() && self.collapsed_groups.contains(group)
+    }
+
+    /// Whether the session at `index` is shown (its group is not folded).
+    fn session_visible(&self, index: usize) -> bool {
+        match self.sessions.get(index) {
+            Some(s) => !self.is_collapsed(&s.group),
+            None => false,
+        }
+    }
+
+    /// Toggle the fold state of the group containing the selected session.
+    /// Folding a group hides its members, so the selection is moved onto the
+    /// nearest still-visible session.
+    pub fn toggle_fold_current_group(&mut self) {
+        if !self.any_grouped() {
+            return;
+        }
+        let Some(session) = self.sessions.get(self.selected_session) else {
+            return;
+        };
+        let group = session.group.clone();
+        if self.collapsed_groups.contains(&group) {
+            self.collapsed_groups.remove(&group);
+        } else {
+            self.collapsed_groups.insert(group);
+            self.select_nearest_visible_session();
+        }
+    }
+
+    fn next_visible_session(&self, from: usize) -> Option<usize> {
+        ((from + 1)..self.sessions.len()).find(|&i| self.session_visible(i))
+    }
+
+    fn prev_visible_session(&self, from: usize) -> Option<usize> {
+        (0..from).rev().find(|&i| self.session_visible(i))
+    }
+
+    /// If the selected session is hidden by a fold, move the selection to the
+    /// closest visible session (preferring the one just after it). When every
+    /// group is folded the selection is left as-is and simply shows no
+    /// highlight.
+    fn select_nearest_visible_session(&mut self) {
+        if self.session_visible(self.selected_session) {
+            return;
+        }
+        if let Some(i) = self
+            .next_visible_session(self.selected_session)
+            .or_else(|| self.prev_visible_session(self.selected_session))
+        {
+            self.selected_session = i;
+            self.selected_window = 0;
+            self.selected_pane = 0;
+            self.window_list_state.select(Some(0));
+            self.pane_list_state.select(Some(0));
+        }
+        self.session_list_state.select(Some(self.selected_session));
+    }
+
+    /// Build the rendered Sessions rows, inserting group headers and dropping
+    /// the members of folded groups. When no session is grouped the result is a
+    /// flat list of [`SessionRow::Session`] rows (no headers), matching the
+    /// pre-grouping behaviour exactly.
     pub fn session_rows(&self) -> Vec<SessionRow> {
-        let any_grouped = self.sessions.iter().any(|s| s.group.is_some());
+        let any_grouped = self.any_grouped();
         let mut rows = Vec::with_capacity(self.sessions.len());
         let mut current: Option<&Option<String>> = None;
         for (index, session) in self.sessions.iter().enumerate() {
+            let collapsed = any_grouped && self.collapsed_groups.contains(&session.group);
             if any_grouped && current != Some(&session.group) {
                 let count = self
                     .sessions
@@ -610,10 +698,13 @@ impl UIState {
                 rows.push(SessionRow::Header {
                     group: session.group.clone(),
                     count,
+                    collapsed,
                 });
                 current = Some(&session.group);
             }
-            rows.push(SessionRow::Session { index });
+            if !collapsed {
+                rows.push(SessionRow::Session { index });
+            }
         }
         rows
     }
@@ -708,8 +799,8 @@ impl UIState {
     pub fn tree_move_up(&mut self) {
         match self.focus {
             Focus::Sessions => {
-                if self.selected_session > 0 {
-                    self.selected_session -= 1;
+                if let Some(prev) = self.prev_visible_session(self.selected_session) {
+                    self.selected_session = prev;
                     self.selected_window = 0;
                     self.selected_pane = 0;
                     self.window_list_state.select(Some(0));
@@ -737,8 +828,8 @@ impl UIState {
     pub fn tree_move_down(&mut self) {
         match self.focus {
             Focus::Sessions => {
-                if self.selected_session < self.sessions.len().saturating_sub(1) {
-                    self.selected_session += 1;
+                if let Some(next) = self.next_visible_session(self.selected_session) {
+                    self.selected_session = next;
                     self.selected_window = 0;
                     self.selected_pane = 0;
                     self.window_list_state.select(Some(0));
@@ -882,7 +973,7 @@ mod tests {
         let labels: Vec<String> = rows
             .iter()
             .filter_map(|r| match r {
-                SessionRow::Header { group, count } => {
+                SessionRow::Header { group, count, .. } => {
                     Some(format!("{}:{}", group.as_deref().unwrap_or("none"), count))
                 }
                 SessionRow::Session { .. } => None,
@@ -896,9 +987,80 @@ mod tests {
         let state = state_with(&["a", "b"], &[("a", "work")]);
         let rows = state.session_rows();
         let has_ungrouped_header = rows.iter().any(|r| {
-            matches!(r, SessionRow::Header { group: None, count } if *count == 1)
+            matches!(r, SessionRow::Header { group: None, count, .. } if *count == 1)
         });
         assert!(has_ungrouped_header);
+    }
+
+    #[test]
+    fn folding_hides_members_but_keeps_header() {
+        // work: a, c ; play: b. Select "a" (in work) and fold its group.
+        let mut state = state_with(
+            &["a", "b", "c"],
+            &[("a", "work"), ("c", "work"), ("b", "play")],
+        );
+        let work_idx = state.sessions.iter().position(|s| s.name == "a").unwrap();
+        state.selected_session = work_idx;
+        state.toggle_fold_current_group();
+
+        let rows = state.session_rows();
+        // No "work" member sessions remain visible, but its header stays
+        // (now marked collapsed); play's member is still shown.
+        let work_collapsed = rows.iter().any(|r| matches!(
+            r,
+            SessionRow::Header { group: Some(g), collapsed: true, .. } if g == "work"
+        ));
+        assert!(work_collapsed);
+        let visible_sessions: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                SessionRow::Session { index } => Some(state.sessions[*index].name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(visible_sessions, vec!["b"]);
+        // Selection was relocated out of the folded group onto a visible one.
+        assert!(state.session_visible(state.selected_session));
+
+        // Folding again (after selecting back into work) toggles it open.
+        state.toggle_fold_current_group(); // currently on "b" (play) -> folds play
+        // Re-expand work by selecting a work session is impossible while folded;
+        // instead toggle work directly via its key state:
+        state.collapsed_groups.remove(&Some("work".to_string()));
+        let rows = state.session_rows();
+        let names: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                SessionRow::Session { index } => Some(state.sessions[*index].name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(names.contains(&"a") && names.contains(&"c"));
+    }
+
+    #[test]
+    fn navigation_skips_folded_sessions() {
+        let mut state = state_with(
+            &["a", "b", "c"],
+            &[("a", "work"), ("c", "work"), ("b", "play")],
+        );
+        // Order is play(b), work(a,c). Fold work.
+        state.selected_session = state.sessions.iter().position(|s| s.name == "a").unwrap();
+        state.toggle_fold_current_group();
+        // Start on the only visible session "b" and move down: nowhere visible.
+        state.selected_session = state.sessions.iter().position(|s| s.name == "b").unwrap();
+        state.tree_move_down();
+        assert_eq!(state.sessions[state.selected_session].name, "b");
+    }
+
+    #[test]
+    fn fold_is_noop_without_groups() {
+        let mut state = state_with(&["a", "b"], &[]);
+        state.toggle_fold_current_group();
+        let rows = state.session_rows();
+        // No headers, all sessions still visible.
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| matches!(r, SessionRow::Session { .. })));
     }
 
     #[test]

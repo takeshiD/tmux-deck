@@ -98,10 +98,15 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
     let mut selected_row: Option<usize> = None;
     for (row_idx, row) in rows.iter().enumerate() {
         match row {
-            SessionRow::Header { group, count } => {
+            SessionRow::Header {
+                group,
+                count,
+                collapsed,
+            } => {
                 let label = group.as_deref().unwrap_or(UNGROUPED_LABEL);
+                let arrow = if *collapsed { '▸' } else { '▾' };
                 items.push(ListItem::new(Line::from(vec![Span::styled(
-                    format!("▾ {} ({})", label, count),
+                    format!("{} {} ({})", arrow, label, count),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -328,6 +333,8 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
             Span::raw(":sort "),
             Span::styled("g", Style::default().fg(Color::Yellow)),
             Span::raw(":group "),
+            Span::styled("za", Style::default().fg(Color::Yellow)),
+            Span::raw(":fold "),
             Span::styled("Space×2", Style::default().fg(Color::Magenta)),
             Span::raw(":multi "),
             Span::styled("C-n", Style::default().fg(Color::Green)),
