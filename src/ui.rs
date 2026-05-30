@@ -1,6 +1,6 @@
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
 use crate::app::{
@@ -658,8 +658,7 @@ fn render_input_popup(frame: &mut Frame, state: &UIState, area: Rect) {
     ]);
 
     let input_paragraph = Paragraph::new(input_text)
-        .style(Style::default().fg(Color::White).bg(Color::DarkGray))
-        .wrap(Wrap { trim: false });
+        .style(Style::default().fg(Color::White).bg(Color::DarkGray));
 
     frame.render_widget(input_paragraph, input_area);
 }
@@ -731,8 +730,7 @@ fn render_session_name_popup(frame: &mut Frame, state: &UIState, title: &str, la
     ]);
 
     let input_paragraph = Paragraph::new(input_text)
-        .style(Style::default().fg(Color::White).bg(Color::DarkGray))
-        .wrap(Wrap { trim: false });
+        .style(Style::default().fg(Color::White).bg(Color::DarkGray));
 
     frame.render_widget(input_paragraph, input_area);
 }
@@ -878,4 +876,51 @@ fn render_confirm_kill_popup(frame: &mut Frame, state: &UIState) {
 
     frame.render_widget(yes_button, button_chunks[0]);
     frame.render_widget(no_button, button_chunks[1]);
+}
+
+#[cfg(test)]
+mod cursor_alignment_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// 白背景（カーソルブロック）のセルの (x, y) を返す。
+    fn cursor_cell(buf: &ratatui::buffer::Buffer) -> Option<(u16, u16)> {
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf.cell((x, y)).unwrap().style().bg == Some(Color::White) {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
+    }
+
+    fn render_name_popup_cursor(text: &str) -> Option<(u16, u16)> {
+        let mut state = UIState::new(100);
+        state.popup_mode = Some(PopupMode::NewSession);
+        for c in text.chars() {
+            state.input_char(c);
+        }
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| render_session_name_popup(f, &state, "New Session", "Label:"))
+            .unwrap();
+        cursor_cell(term.backend().buffer())
+    }
+
+    #[test]
+    fn cursor_row_is_stable_between_empty_and_filled() {
+        let empty = render_name_popup_cursor("").expect("cursor visible when empty");
+        let filled = render_name_popup_cursor("abc").expect("cursor visible with text");
+        // 行が一致していること（以前は空文字時に1行下へずれていた）
+        assert_eq!(empty.1, filled.1, "cursor row must not shift");
+        // 空文字時はカーソルが先頭列、文字入力後は文字数ぶん右
+        assert_eq!(filled.0, empty.0 + 3, "cursor should advance by char count");
+    }
+
+    #[test]
+    fn cursor_row_is_stable_with_multibyte() {
+        let empty = render_name_popup_cursor("").expect("cursor visible when empty");
+        let jp = render_name_popup_cursor("あい").expect("cursor visible with text");
+        assert_eq!(empty.1, jp.1, "cursor row must not shift with multibyte input");
+    }
 }
