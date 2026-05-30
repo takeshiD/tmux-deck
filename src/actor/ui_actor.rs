@@ -82,7 +82,15 @@ impl UIActor {
             render_ui(frame, &mut self.state);
         })?;
 
+        // Drives the Claude "Working" dots spinner. Ticks frequently, but only
+        // forces a redraw while something is actually animating, so an idle TUI
+        // stays event-driven.
+        let mut anim = tokio::time::interval(Duration::from_millis(80));
+
         loop {
+            // Default to redrawing; the animation tick decides for itself.
+            let mut redraw = true;
+
             // Use select to handle multiple event sources
             // biased; ensures key events are checked first (top-to-bottom priority)
             tokio::select! {
@@ -104,6 +112,11 @@ impl UIActor {
                 Some(event) = self.ui_event_rx.recv() => {
                     match event {
                         UIEvent::Tick => {
+                            // Cheap, local: fold the latest Claude hook states
+                            // into the tree so markers stay live between full
+                            // tmux refreshes.
+                            self.state.refresh_claude_states();
+
                             // Request pane capture if in TreeView mode (low-priority channel)
                             if self.state.view_mode == ViewMode::TreeView
                                 && let Some((target, start, end)) =
@@ -121,12 +134,19 @@ impl UIActor {
                         _ => (),
                     }
                 }
+
+                // Spinner animation tick: only redraw if a spinner is active.
+                _ = anim.tick() => {
+                    redraw = self.state.has_working_claude();
+                }
             }
 
             // Render UI after processing event (event-driven rendering)
-            self.terminal.draw(|frame| {
-                render_ui(frame, &mut self.state);
-            })?;
+            if redraw {
+                self.terminal.draw(|frame| {
+                    render_ui(frame, &mut self.state);
+                })?;
+            }
         }
 
         Ok(())

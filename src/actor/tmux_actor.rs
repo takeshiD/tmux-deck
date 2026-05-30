@@ -171,7 +171,7 @@ impl TmuxActor {
         let s_args: &[&str] = &[
             "list-sessions",
             "-F",
-            "SESS\t#{session_name}\t#{session_attached}\t#{session_activity}\t#{session_last_attached}",
+            "SESS\t#{session_name}\t#{session_activity}\t#{session_last_attached}",
         ];
         let w_args: &[&str] = &[
             "list-windows",
@@ -220,6 +220,7 @@ impl TmuxActor {
 
         let mut sessions = build_sessions(&stdout);
         annotate_claude_panes(&mut sessions).await;
+        crate::hook::apply_states(&mut sessions);
         TmuxResponse::SessionsRefreshed { sessions }
     }
 
@@ -675,7 +676,6 @@ fn quote_for_control(arg: &str) -> String {
 struct SessionAccum {
     activity: i64,
     last_attached: i64,
-    attached: bool,
     windows: Vec<WindowAccum>,
 }
 
@@ -704,7 +704,6 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
         match tag {
             "SESS" => {
                 let name = it.next().unwrap_or("").to_string();
-                let attached = it.next() == Some("1");
                 let activity = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                 let last_attached = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                 if name.is_empty() {
@@ -718,7 +717,6 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                     SessionAccum {
                         activity,
                         last_attached,
-                        attached,
                         windows: Vec::new(),
                     },
                 );
@@ -767,6 +765,7 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                             current_command,
                             pid,
                             has_claude: false,
+                            claude_state: None,
                         },
                     ));
                 }
@@ -812,18 +811,16 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                 .map(|w| TmuxWindow {
                     index: w.index,
                     name: w.name,
-                    active: w.active,
                     panes: w.panes_raw.into_iter().map(|(_, _, _, p)| p).collect(),
                     has_claude: false,
+                    claude_state: None,
                 })
                 .collect();
-            let unread = !s.attached && s.activity > s.last_attached;
             Some(TmuxSession {
                 name,
-                attached: s.attached,
-                unread,
                 windows,
                 has_claude: false,
+                claude_state: None,
                 last_attached: s.last_attached,
                 activity: s.activity,
             })

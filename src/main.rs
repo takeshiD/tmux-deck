@@ -1,6 +1,7 @@
 mod actor;
 mod app;
 mod cli;
+mod hook;
 mod ui;
 
 use std::io;
@@ -18,7 +19,7 @@ use tracing_subscriber::{EnvFilter, fmt::time};
 
 use actor::{RefreshActor, RefreshControl, TmuxActor, TmuxCommand, TmuxResponse, UIActor, UIEvent};
 use app::UIState;
-use cli::Cli;
+use cli::{Cli, Command, HookAction};
 
 // =============================================================================
 // Main
@@ -28,6 +29,20 @@ use cli::Cli;
 async fn main() -> Result<()> {
     color_eyre::install()?;
     let cmd = Cli::parse_with_color()?;
+
+    // Subcommands run without the TUI / terminal setup.
+    if let Some(command) = &cmd.command {
+        return match command {
+            Command::Hook { action } => match action {
+                HookAction::Report => {
+                    hook::run_report();
+                    Ok(())
+                }
+                HookAction::Install { project } => hook::run_install(*project),
+            },
+        };
+    }
+
     let project_dir =
         ProjectDirs::from("dev", "tkcd", "tmux-deck").expect("cannot determine project directory");
     let log_dir = project_dir.state_dir().expect("failed to get log dir");
