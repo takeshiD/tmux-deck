@@ -90,9 +90,9 @@ preset = "default"        # see the table below
 quit           = ["q", "Esc"]
 new_session    = "C-n"
 
-[hooks.claude]            # per-state markers: glyph + colour ("spinner" animates)
-working = { glyph = "spinner", color = "208" }
-waiting = { glyph = "◆", color = "208" }
+[hooks.claude]            # per-state markers: glyph + hex colour ("spinner" animates)
+working = { glyph = "spinner", color = "#ff8700" }
+waiting = { glyph = "◆", color = "#ff8700" }
 
 [layout]
 session_panel_width = 30  # left panel width (%); tree_split / multi_selected_ratio too
@@ -106,33 +106,37 @@ exit_on_switch = true     # exit after switching to a session
 
 Set `theme.preset` to one of:
 
-| Preset | Notes |
-| ------ | ----- |
-| `default` | The original palette (orange markers, cyan/yellow accents). |
+| Preset       | Notes                                                         |
+| ------       | -----                                                         |
+| `default`    | The original palette (orange markers, cyan/yellow accents).   |
 | `monochrome` | Distinguished by brightness, not hue — colour-blind friendly. |
-| `dracula` | |
-| `nord` | |
-| `gruvbox` | |
-| `tokyonight` | |
-| `catppuccin` | Mocha flavour. |
-| `solarized` | Dark variant. |
-| `cyberdream` | |
-| `carbonfox` | |
+| `dracula`    |                                                               |
+| `nord`       |                                                               |
+| `gruvbox`    |                                                               |
+| `tokyonight` |                                                               |
+| `catppuccin` | Mocha flavour.                                                |
+| `solarized`  | Dark variant.                                                 |
+| `cyberdream` |                                                               |
+| `carbonfox`  |                                                               |
 
-Colour values are a name (`red`, `darkgray`, `lightblue`…), a 256-colour index
-(`"208"`), or truecolor hex (`"#rrggbb"`).
+Theme colour values are a name (`red`, `darkgray`, `lightblue`…), a 256-colour
+index (`"208"`), or truecolor hex (`"#rrggbb"`). **Marker colours under
+`[hooks.*]` are hex codes only** (e.g. `color = "#ff8700"`).
 
 ## Key bindings
 
+The status bar at the bottom of the deck always reflects your current bindings,
+so remapping (e.g. `kill_session = "C-d"`) updates the on-screen hint too.
+
 The remappable actions and their defaults:
 
-| Action | Default | Action | Default |
-| ------ | ------- | ------ | ------- |
-| `quit` | `q`, `Esc` | `new_session` | `C-n` |
-| `refresh` | `r` | `rename_session` | `C-r` |
-| `sort` | `s` | `kill_session` | `C-x` |
-| `group` | `g` | `enter` | `Enter` |
-| `input` | `i` | | |
+| Action    | Default    | Action           | Default |
+| ------    | -------    | ------           | ------- |
+| `quit`    | `q`, `Esc` | `new_session`    | `C-n`   |
+| `refresh` | `r`        | `rename_session` | `C-r`   |
+| `sort`    | `s`        | `kill_session`   | `C-x`   |
+| `group`   | `g`        | `enter`          | `Enter` |
+| `input`   | `i`        |                  |         |
 
 A binding is one key string or a list. Modifiers are joined with `-` (`C`/`Ctrl`,
 `S`/`Shift`, `A`/`M`/`Alt`); keys are a single character or a name (`Esc`, `Tab`,
@@ -147,13 +151,13 @@ the Claude **hooks**, the marker reflects what Claude is *doing* in each pane.
 States are distinguished by the marker **shape** (the colour is always the
 same), so they stay legible on any terminal palette:
 
-| Marker | State | Meaning |
-| ------ | ----- | ------- |
-| `⠋⠙⠹…` (animated) | Working | A prompt was submitted / a tool is running |
-| `◆` | Waiting | Claude is waiting on you (permission / idle prompt) |
-| `✓` | Done | Claude finished its turn |
-| `✗` | Error | The turn ended with an error |
-| `●` | Running | Claude process detected, no hook state yet |
+| Marker            | State   | Meaning                                             |
+| ------            | -----   | -------                                             |
+| `⠋⠙⠹…` (animated) | Working | A prompt was submitted / a tool is running          |
+| `◆`               | Waiting | Claude is waiting on you (permission / idle prompt) |
+| `✓`               | Done    | Claude finished its turn                            |
+| `✗`               | Error   | The turn ended with an error                        |
+| `●`               | Running | Claude process detected, no hook state yet          |
 
 Windows and sessions roll up to the most attention-worthy state of their
 children (waiting > error > working > done).
@@ -226,7 +230,7 @@ Written in Rust for maximum performance and minimal resource usage.
     - [ ] Saving and Restoring sessions
     - [ ] Sort
         - [x] Most Recently Used
-        - [ ] Alphabet
+        - [x] Alphabet
         - [ ] Pinning
 - [x] Multi Preview
     - [x] Injection command to pane
@@ -239,7 +243,7 @@ Written in Rust for maximum performance and minimal resource usage.
 - Misc
     - [x] LLM Integration
         - [x] Claude Code status markers via hooks
-    - [ ] Installation for nix
+    - [x] Installation for nix
 
 # License
 MIT License.

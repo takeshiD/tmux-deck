@@ -7,7 +7,7 @@ use crate::app::{
     ClaudeState, Focus, InputMode, PopupMode, SessionRow, TmuxPane, TmuxWindow, UIState,
     UNGROUPED_LABEL, ViewMode,
 };
-use crate::config::{MarkerSet, Theme};
+use crate::config::{Action, MarkerSet, Theme};
 
 /// Braille "dots" spinner frames (cli-spinners `dots`). Rendered for a marker
 /// configured as `"spinner"` (the default `Working` Claude state) so it
@@ -397,26 +397,29 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
             Style::default().fg(theme.error),
         )])
     } else {
+        let kb = &state.keybindings;
+        // `j/k`, `Tab`, `za` and `Space×2` are fixed (not remappable); the rest
+        // reflect the user's key bindings so the hint bar always stays accurate.
         Line::from(vec![
             Span::styled("j/k", Style::default().fg(theme.focus_border)),
             Span::raw(":move "),
             Span::styled("Tab", Style::default().fg(theme.focus_border)),
             Span::raw(":focus "),
-            Span::styled("s", Style::default().fg(theme.focus_border)),
+            Span::styled(kb.label(Action::Sort), Style::default().fg(theme.focus_border)),
             Span::raw(":sort "),
-            Span::styled("g", Style::default().fg(theme.focus_border)),
+            Span::styled(kb.label(Action::Group), Style::default().fg(theme.focus_border)),
             Span::raw(":group "),
             Span::styled("za", Style::default().fg(theme.focus_border)),
             Span::raw(":fold "),
             Span::styled("Space×2", Style::default().fg(theme.highlight)),
             Span::raw(":multi "),
-            Span::styled("C-n", Style::default().fg(theme.success)),
+            Span::styled(kb.label(Action::NewSession), Style::default().fg(theme.success)),
             Span::raw(":new "),
-            Span::styled("C-r", Style::default().fg(theme.success)),
+            Span::styled(kb.label(Action::RenameSession), Style::default().fg(theme.success)),
             Span::raw(":rename "),
-            Span::styled("C-x", Style::default().fg(theme.error)),
+            Span::styled(kb.label(Action::KillSession), Style::default().fg(theme.error)),
             Span::raw(":kill "),
-            Span::styled("q", Style::default().fg(theme.focus_border)),
+            Span::styled(kb.label(Action::Quit), Style::default().fg(theme.focus_border)),
             Span::raw(":quit"),
         ])
     };
@@ -550,6 +553,7 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
             .get_multi_selected_target()
             .unwrap_or_else(|| "None".to_string());
 
+        let kb = &state.keybindings;
         Line::from(vec![
             Span::styled("h/l", Style::default().fg(theme.focus_border)),
             Span::raw(":session "),
@@ -557,13 +561,13 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
             Span::raw(":window "),
             Span::styled("Space×2", Style::default().fg(theme.highlight)),
             Span::raw(":tree "),
-            Span::styled("C-n", Style::default().fg(theme.success)),
+            Span::styled(kb.label(Action::NewSession), Style::default().fg(theme.success)),
             Span::raw(":new "),
-            Span::styled("C-r", Style::default().fg(theme.success)),
+            Span::styled(kb.label(Action::RenameSession), Style::default().fg(theme.success)),
             Span::raw(":rename "),
-            Span::styled("C-x", Style::default().fg(theme.error)),
+            Span::styled(kb.label(Action::KillSession), Style::default().fg(theme.error)),
             Span::raw(":kill "),
-            Span::styled("q", Style::default().fg(theme.focus_border)),
+            Span::styled(kb.label(Action::Quit), Style::default().fg(theme.focus_border)),
             Span::raw(":quit "),
             Span::raw("| "),
             Span::styled(

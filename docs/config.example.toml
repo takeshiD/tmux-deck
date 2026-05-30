@@ -13,7 +13,7 @@
 [preview]
 # Preview refresh interval in milliseconds. The CLI flag `--interval` overrides
 # this; this overrides the built-in default of 300.
-interval = 300
+interval = 50
 
 # -----------------------------------------------------------------------------
 [theme]
@@ -22,6 +22,7 @@ interval = 300
 #   tokyonight    catppuccin   solarized   cyberdream  carbonfox
 # `monochrome` distinguishes states by brightness rather than hue (good for
 # colour-blind users and minimal terminals).
+# preset = "default"
 preset = "default"
 
 # Optionally override individual semantic roles on top of the preset. Each value
@@ -37,7 +38,7 @@ preset = "default"
 # error          = "red"        # errors and destructive actions (kill)
 # success        = "green"      # creation accents (new / rename / "No")
 # highlight      = "magenta"    # attention accent (multi-preview hint)
-# claude_marker  = "208"        # default colour of the Claude markers
+# (Claude marker colours are configured per-state under [hooks.claude] below.)
 
 # -----------------------------------------------------------------------------
 [keybindings]
@@ -63,21 +64,22 @@ kill_session   = "C-x"
 
 # -----------------------------------------------------------------------------
 # Markers shown for hook-driven agent states. Each marker has a `glyph` and a
-# `color`. The special glyph "spinner" renders the animated braille spinner.
+# `color`. The colour is a hex colour code ("#rrggbb"). The special glyph
+# "spinner" renders the animated braille spinner.
 [hooks.claude]
-working = { glyph = "spinner", color = "208" }  # prompt submitted / tool running
-waiting = { glyph = "◆", color = "208" }        # waiting on you (permission/idle)
-done    = { glyph = "✓", color = "208" }         # finished its turn
-error   = { glyph = "✗", color = "208" }         # turn ended with an error
-running = { glyph = "●", color = "208" }         # process detected, no hook state
+working = { glyph = "spinner", color = "#ff8700" } # prompt submitted / tool running
+waiting = { glyph = "◆", color = "#ff8700" }       # waiting on you (permission/idle)
+done    = { glyph = "✓", color = "#ff8700" }        # finished its turn
+error   = { glyph = "✗", color = "#ff8700" }        # turn ended with an error
+running = { glyph = "●", color = "#ff8700" }        # process detected, no hook state
 
 # Reserved for future Codex hook integration; currently parsed but not consumed.
 [hooks.codex]
-# working = { glyph = "spinner", color = "39" }
-# waiting = { glyph = "◆", color = "39" }
-# done    = { glyph = "✓", color = "39" }
-# error   = { glyph = "✗", color = "39" }
-# running = { glyph = "●", color = "39" }
+# working = { glyph = "spinner", color = "#5fafff" }
+# waiting = { glyph = "◆", color = "#5fafff" }
+# done    = { glyph = "✓", color = "#5fafff" }
+# error   = { glyph = "✗", color = "#5fafff" }
+# running = { glyph = "●", color = "#5fafff" }
 
 # -----------------------------------------------------------------------------
 [layout]

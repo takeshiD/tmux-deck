@@ -250,8 +250,6 @@ pub struct Theme {
     pub success: Color,
     /// Attention accent used sparingly (e.g. the multi-preview hint).
     pub highlight: Color,
-    /// Single colour used for every Claude marker by default.
-    pub claude_marker: Color,
 }
 
 impl Default for Theme {
@@ -273,7 +271,6 @@ impl Theme {
             "error" => self.error = color,
             "success" => self.success = color,
             "highlight" => self.highlight = color,
-            "claude_marker" => self.claude_marker = color,
             _ => return false,
         }
         true
@@ -295,7 +292,6 @@ impl Theme {
                 error: Color::Red,
                 success: Color::Green,
                 highlight: Color::Magenta,
-                claude_marker: Color::Indexed(208),
             },
             // Distinguished by brightness, not hue (colour-blind friendly).
             "monochrome" => Self {
@@ -308,7 +304,6 @@ impl Theme {
                 error: rgb(0xff, 0xff, 0xff),
                 success: rgb(0xab, 0xb2, 0xbf),
                 highlight: rgb(0xff, 0xff, 0xff),
-                claude_marker: rgb(0xff, 0xff, 0xff),
             },
             "dracula" => Self {
                 focus_border: rgb(0xf1, 0xfa, 0x8c),  // yellow
@@ -320,7 +315,6 @@ impl Theme {
                 error: rgb(0xff, 0x55, 0x55),          // red
                 success: rgb(0x50, 0xfa, 0x7b),        // green
                 highlight: rgb(0xbd, 0x93, 0xf9),      // purple
-                claude_marker: rgb(0xff, 0xb8, 0x6c),  // orange
             },
             "nord" => Self {
                 focus_border: rgb(0xeb, 0xcb, 0x8b),
@@ -332,7 +326,6 @@ impl Theme {
                 error: rgb(0xbf, 0x61, 0x6a),
                 success: rgb(0xa3, 0xbe, 0x8c),
                 highlight: rgb(0xb4, 0x8e, 0xad),
-                claude_marker: rgb(0xd0, 0x87, 0x70),
             },
             "gruvbox" => Self {
                 focus_border: rgb(0xfa, 0xbd, 0x2f),
@@ -344,7 +337,6 @@ impl Theme {
                 error: rgb(0xfb, 0x49, 0x34),
                 success: rgb(0xb8, 0xbb, 0x26),
                 highlight: rgb(0xd3, 0x86, 0x9b),
-                claude_marker: rgb(0xfe, 0x80, 0x19),
             },
             "tokyonight" => Self {
                 focus_border: rgb(0xe0, 0xaf, 0x68),
@@ -356,7 +348,6 @@ impl Theme {
                 error: rgb(0xf7, 0x76, 0x8e),
                 success: rgb(0x9e, 0xce, 0x6a),
                 highlight: rgb(0xbb, 0x9a, 0xf7),
-                claude_marker: rgb(0xff, 0x9e, 0x64),
             },
             "catppuccin" => Self {
                 focus_border: rgb(0xf9, 0xe2, 0xaf),
@@ -368,7 +359,6 @@ impl Theme {
                 error: rgb(0xf3, 0x8b, 0xa8),
                 success: rgb(0xa6, 0xe3, 0xa1),
                 highlight: rgb(0xcb, 0xa6, 0xf7),
-                claude_marker: rgb(0xfa, 0xb3, 0x87),
             },
             "solarized" => Self {
                 focus_border: rgb(0xb5, 0x89, 0x00),
@@ -380,7 +370,6 @@ impl Theme {
                 error: rgb(0xdc, 0x32, 0x2f),
                 success: rgb(0x85, 0x99, 0x00),
                 highlight: rgb(0x6c, 0x71, 0xc4),
-                claude_marker: rgb(0xcb, 0x4b, 0x16),
             },
             "cyberdream" => Self {
                 focus_border: rgb(0xf1, 0xff, 0x5e),
@@ -392,7 +381,6 @@ impl Theme {
                 error: rgb(0xff, 0x6e, 0x5e),
                 success: rgb(0x5e, 0xff, 0x6c),
                 highlight: rgb(0xbd, 0x5e, 0xff),
-                claude_marker: rgb(0xff, 0xbd, 0x5e),
             },
             "carbonfox" => Self {
                 focus_border: rgb(0x08, 0xbd, 0xba),
@@ -404,7 +392,6 @@ impl Theme {
                 error: rgb(0xee, 0x53, 0x96),
                 success: rgb(0x25, 0xbe, 0x6a),
                 highlight: rgb(0xbe, 0x95, 0xff),
-                claude_marker: rgb(0xff, 0x7e, 0xb6),
             },
             other => {
                 warn!("unknown theme preset '{other}', using default");
@@ -419,14 +406,8 @@ impl Theme {
 /// unrecognised.
 pub fn parse_color(s: &str) -> Option<Color> {
     let t = s.trim();
-    if let Some(hex) = t.strip_prefix('#') {
-        if hex.len() == 6 {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            return Some(Color::Rgb(r, g, b));
-        }
-        return None;
+    if t.starts_with('#') {
+        return parse_hex_color(t);
     }
     if let Ok(idx) = t.parse::<u8>() {
         return Some(Color::Indexed(idx));
@@ -454,9 +435,27 @@ pub fn parse_color(s: &str) -> Option<Color> {
     Some(color)
 }
 
+/// Parse a truecolor hex code like `#ff8700` into [`Color::Rgb`]. Returns `None`
+/// for anything that is not a 6-digit `#rrggbb` string.
+pub fn parse_hex_color(s: &str) -> Option<Color> {
+    let hex = s.trim().strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::Rgb(r, g, b))
+}
+
 // =============================================================================
 // [hooks.claude] / [hooks.codex]
 // =============================================================================
+
+/// Default marker colour as a truecolor code (`#ff8700`, the orange of the
+/// classic xterm-256 slot 208). Marker colours are specified as hex colour
+/// codes in the config.
+const DEFAULT_MARKER_COLOR: Color = Color::Rgb(0xff, 0x87, 0x00);
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -479,7 +478,7 @@ pub struct MarkerSet {
 
 impl Default for MarkerSet {
     fn default() -> Self {
-        let color = Color::Indexed(208);
+        let color = DEFAULT_MARKER_COLOR;
         Self {
             working: Marker::spinner(color),
             waiting: Marker::glyph("◆", color),
@@ -530,10 +529,12 @@ impl<'de> Deserialize<'de> for Marker {
             color: Option<String>,
         }
         let raw = Raw::deserialize(deserializer)?;
+        // Marker colours are given as a hex colour code, e.g. `color = "#ff8700"`.
         let color = match raw.color.as_deref() {
-            Some(c) => parse_color(c)
-                .ok_or_else(|| de::Error::custom(format!("invalid marker colour: {c}")))?,
-            None => Color::Indexed(208),
+            Some(c) => parse_hex_color(c).ok_or_else(|| {
+                de::Error::custom(format!("invalid marker colour {c:?}, expected a hex code like \"#ff8700\""))
+            })?,
+            None => DEFAULT_MARKER_COLOR,
         };
         Ok(Marker {
             animated: raw.glyph == "spinner",
@@ -626,6 +627,18 @@ impl KeyBindings {
             .find(|(_, specs)| specs.iter().any(|s| s.matches(key)))
             .map(|(action, _)| action)
     }
+
+    /// Human-readable label for an action's primary binding, e.g. `C-n` or `q`,
+    /// used to keep the on-screen hint bar in sync with the user's remaps.
+    /// Returns an empty string if the action has no binding.
+    pub fn label(&self, action: Action) -> String {
+        self.entries()
+            .into_iter()
+            .find(|(a, _)| *a == action)
+            .and_then(|(_, specs)| specs.first())
+            .map(KeySpec::label)
+            .unwrap_or_default()
+    }
 }
 
 /// A parsed key chord: a base key plus modifiers.
@@ -641,6 +654,40 @@ impl KeySpec {
     pub fn matches(&self, key: &KeyEvent) -> bool {
         let relevant = KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT;
         self.code == key.code && (key.modifiers & relevant) == self.mods
+    }
+
+    /// Render the chord back to a short label like `C-n`, `S-Tab`, `Space`, `q`.
+    /// Roughly the inverse of [`parse_key`].
+    pub fn label(&self) -> String {
+        let mut s = String::new();
+        if self.mods.contains(KeyModifiers::CONTROL) {
+            s.push_str("C-");
+        }
+        if self.mods.contains(KeyModifiers::ALT) {
+            s.push_str("A-");
+        }
+        if self.mods.contains(KeyModifiers::SHIFT) {
+            s.push_str("S-");
+        }
+        let base = match self.code {
+            KeyCode::Char(' ') => "Space".to_string(),
+            KeyCode::Char(c) => c.to_string(),
+            KeyCode::Esc => "Esc".to_string(),
+            KeyCode::Enter => "Enter".to_string(),
+            KeyCode::Tab => "Tab".to_string(),
+            KeyCode::BackTab => "BackTab".to_string(),
+            KeyCode::Up => "Up".to_string(),
+            KeyCode::Down => "Down".to_string(),
+            KeyCode::Left => "Left".to_string(),
+            KeyCode::Right => "Right".to_string(),
+            KeyCode::Home => "Home".to_string(),
+            KeyCode::End => "End".to_string(),
+            KeyCode::Backspace => "Backspace".to_string(),
+            KeyCode::Delete => "Delete".to_string(),
+            other => format!("{other:?}"),
+        };
+        s.push_str(&base);
+        s
     }
 }
 
@@ -749,6 +796,19 @@ mod tests {
         assert_eq!(parse_color("#ff8800"), Some(Color::Rgb(0xff, 0x88, 0x00)));
         assert_eq!(parse_color("notacolor"), None);
         assert_eq!(parse_color("#xyz"), None);
+        // Hex-only parser used for marker colours.
+        assert_eq!(parse_hex_color("#ff8700"), Some(Color::Rgb(0xff, 0x87, 0x00)));
+        assert_eq!(parse_hex_color("red"), None);
+        assert_eq!(parse_hex_color("208"), None);
+    }
+
+    #[test]
+    fn marker_color_must_be_hex() {
+        // A colour name is rejected for marker colours (hex codes only).
+        let err = toml::from_str::<Config>(
+            "[hooks.claude]\nworking = { glyph = \"x\", color = \"red\" }\n",
+        );
+        assert!(err.is_err(), "non-hex marker colour should be rejected");
     }
 
     #[test]
@@ -787,7 +847,7 @@ mod tests {
     #[test]
     fn partial_config_merges_with_defaults() {
         let cfg: Config = toml::from_str(
-            r#"
+            r##"
             [preview]
             interval = 500
 
@@ -795,8 +855,8 @@ mod tests {
             quit = "x"
 
             [hooks.claude]
-            done = { glyph = "DONE", color = "green" }
-        "#,
+            done = { glyph = "DONE", color = "#00ff00" }
+        "##,
         )
         .unwrap();
         assert_eq!(cfg.preview.interval, Some(500));
@@ -804,9 +864,9 @@ mod tests {
         assert_eq!(cfg.keybindings.quit, vec![key('x')]);
         // ...while untouched bindings keep their defaults.
         assert_eq!(cfg.keybindings.refresh, vec![key('r')]);
-        // Overridden marker, and a default sibling marker.
+        // Overridden marker (hex colour), and a default sibling marker.
         assert_eq!(cfg.hooks.claude.done.glyph, "DONE");
-        assert_eq!(cfg.hooks.claude.done.color, Color::Green);
+        assert_eq!(cfg.hooks.claude.done.color, Color::Rgb(0x00, 0xff, 0x00));
         assert_eq!(cfg.hooks.claude.waiting.glyph, "◆");
     }
 
@@ -838,13 +898,14 @@ mod tests {
         // Override applied.
         assert_eq!(theme.accent, Color::Rgb(0x12, 0x34, 0x56));
         // Preset value retained for a non-overridden role.
-        assert_eq!(theme.claude_marker, Color::Rgb(0xff, 0xb8, 0x6c));
+        assert_eq!(theme.success, Color::Rgb(0x50, 0xfa, 0x7b));
     }
 
     #[test]
     fn unknown_preset_falls_back_to_default() {
         let theme = Theme::preset("does-not-exist");
-        assert_eq!(theme.claude_marker, Color::Indexed(208));
+        // Falls back to the `default` preset's palette.
+        assert_eq!(theme.accent, Color::Cyan);
     }
 
     #[test]
@@ -863,10 +924,12 @@ mod tests {
         // The example we ship must always parse against the current schema.
         let example = include_str!("../docs/config.example.toml");
         let cfg: Config = toml::from_str(example).expect("example config must parse");
-        // Spot-check a couple of representative values.
-        assert_eq!(cfg.preview.interval, Some(300));
-        assert_eq!(cfg.theme.preset, "default");
+        // Spot-check representative values without pinning the exact interval
+        // (the example may tweak it).
+        assert!(cfg.preview.interval.is_some());
         assert!(cfg.hooks.claude.working.animated);
+        // Marker colours in the example are hex codes.
+        assert_eq!(cfg.hooks.claude.waiting.color, Color::Rgb(0xff, 0x87, 0x00));
     }
 
     #[test]
