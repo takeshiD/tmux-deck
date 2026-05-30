@@ -8,7 +8,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::messages::{RefreshControl, TmuxCommand, TmuxResponse, UIEvent};
-use crate::app::{Focus, InputMode, PopupMode, UIState, ViewMode};
+use crate::app::{Focus, GroupChoice, InputMode, PopupMode, UIState, ViewMode};
 use crate::ui::render_ui;
 
 // =============================================================================
@@ -182,17 +182,46 @@ impl UIActor {
         popup_mode: PopupMode,
     ) -> Result<bool> {
         match popup_mode {
-            PopupMode::NewSession | PopupMode::RenameSession | PopupMode::GroupSession => {
+            PopupMode::GroupSession => {
+                // Selecting an existing group (or "ungroup") is handled entirely
+                // tmux-deck-side: no tmux command and no RefreshAll, since
+                // grouping does not change anything tmux knows about.
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state.close_popup();
+                        self.refresh_control.resume();
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => self.state.group_choice_up(),
+                    KeyCode::Down | KeyCode::Char('j') => self.state.group_choice_down(),
+                    KeyCode::Enter => match self.state.selected_group_choice() {
+                        GroupChoice::Existing(group) => {
+                            self.state.assign_selected_group(Some(group));
+                            self.state.close_popup();
+                            self.refresh_control.resume();
+                        }
+                        GroupChoice::Ungrouped => {
+                            self.state.assign_selected_group(None);
+                            self.state.close_popup();
+                            self.refresh_control.resume();
+                        }
+                        // Switch to text entry; stay in popup so the refresh
+                        // control remains paused until the name is confirmed.
+                        GroupChoice::New => self.state.begin_new_group_entry(),
+                    },
+                    _ => {}
+                }
+            }
+            PopupMode::NewSession | PopupMode::RenameSession | PopupMode::NewGroup => {
                 match key.code {
                     KeyCode::Esc => {
                         self.state.close_popup();
                         self.refresh_control.resume();
                     }
                     KeyCode::Enter => {
-                        // GroupSession is handled entirely tmux-deck-side: no
+                        // A new group is handled entirely tmux-deck-side: no
                         // tmux command and no RefreshAll, since grouping does
                         // not change anything tmux knows about.
-                        if popup_mode == PopupMode::GroupSession {
+                        if popup_mode == PopupMode::NewGroup {
                             let group = self.state.get_group_session_input();
                             self.state.assign_selected_group(group);
                             self.state.close_popup();

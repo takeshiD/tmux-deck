@@ -61,6 +61,21 @@ impl GroupStore {
         self.assignments.get(session).cloned()
     }
 
+    /// All distinct group names currently in use, sorted alphabetically. Used
+    /// to populate the group selection popup so the user can pick an existing
+    /// group rather than retyping its name.
+    pub fn group_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .assignments
+            .values()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Assign `session` to `group`, or remove it from any group when `group`
     /// is `None` or empty. Persists immediately (best effort).
     pub fn set(&mut self, session: &str, group: Option<&str>) {

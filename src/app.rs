@@ -308,8 +308,25 @@ pub enum PopupMode {
     RenameSession,
     /// Confirming session kill
     ConfirmKill,
-    /// Assigning the selected session to a tmux-deck group
+    /// Choosing a group for the selected session from a list of existing
+    /// groups (plus "ungroup" and "create new" entries).
     GroupSession,
+    /// Typing the name of a brand-new group, reached from the GroupSession
+    /// list via the "New group" entry.
+    NewGroup,
+}
+
+/// The entry highlighted in the [`PopupMode::GroupSession`] selection list.
+/// The list shows every existing group, then an "Ungrouped" entry that clears
+/// the assignment, then a "New group" entry that switches to text entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupChoice {
+    /// Assign the session to an existing group of this name.
+    Existing(String),
+    /// Remove the session from any group.
+    Ungrouped,
+    /// Create a new group (switches the popup to text entry).
+    New,
 }
 
 /// A single rendered row in the Sessions list. Grouping inserts non-selectable
@@ -379,6 +396,12 @@ pub struct UIState {
     // Popup state
     pub popup_mode: Option<PopupMode>,
     pub confirm_yes_selected: bool,
+    /// Existing group names offered in the GroupSession selection list,
+    /// snapshotted when the popup opens so navigation stays stable.
+    pub group_choices: Vec<String>,
+    /// Index of the highlighted entry in the GroupSession list. Entries are
+    /// `group_choices` followed by the "Ungrouped" and "New group" entries.
+    pub group_choice_index: usize,
 }
 
 impl UIState {
@@ -413,6 +436,8 @@ impl UIState {
             input_cursor: 0,
 
             popup_mode: None,
+            group_choices: Vec::new(),
+            group_choice_index: 0,
             confirm_yes_selected: false,
         };
         state.session_list_state.select(Some(0));
@@ -574,12 +599,60 @@ impl UIState {
     }
 
     pub fn open_group_session_popup(&mut self) {
-        if let Some(session) = self.sessions.get(self.selected_session) {
-            self.popup_mode = Some(PopupMode::GroupSession);
-            // Prefill with the current group so editing/clearing is natural.
-            self.input_buffer = session.group.clone().unwrap_or_default();
-            self.input_cursor = self.input_buffer.len();
+        let Some(session) = self.sessions.get(self.selected_session) else {
+            return;
+        };
+        let current = session.group.clone();
+        self.popup_mode = Some(PopupMode::GroupSession);
+        self.group_choices = self.groups.group_names();
+        // Highlight the session's current group by default, falling back to the
+        // "Ungrouped" entry (which sits just past the existing groups) when the
+        // session is not grouped yet.
+        self.group_choice_index = match current {
+            Some(g) => self
+                .group_choices
+                .iter()
+                .position(|name| *name == g)
+                .unwrap_or(self.group_choices.len()),
+            None => self.group_choices.len(),
+        };
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+    }
+
+    /// Total number of entries in the GroupSession list: every existing group,
+    /// then the "Ungrouped" and "New group" entries.
+    pub fn group_choice_count(&self) -> usize {
+        self.group_choices.len() + 2
+    }
+
+    /// The entry currently highlighted in the GroupSession list.
+    pub fn selected_group_choice(&self) -> GroupChoice {
+        let n = self.group_choices.len();
+        if self.group_choice_index < n {
+            GroupChoice::Existing(self.group_choices[self.group_choice_index].clone())
+        } else if self.group_choice_index == n {
+            GroupChoice::Ungrouped
+        } else {
+            GroupChoice::New
         }
+    }
+
+    pub fn group_choice_up(&mut self) {
+        let n = self.group_choice_count();
+        self.group_choice_index = (self.group_choice_index + n - 1) % n;
+    }
+
+    pub fn group_choice_down(&mut self) {
+        let n = self.group_choice_count();
+        self.group_choice_index = (self.group_choice_index + 1) % n;
+    }
+
+    /// Switch the open GroupSession popup into text entry for a new group name.
+    pub fn begin_new_group_entry(&mut self) {
+        self.popup_mode = Some(PopupMode::NewGroup);
+        self.input_buffer.clear();
+        self.input_cursor = 0;
     }
 
     pub fn open_kill_session_popup(&mut self) {
@@ -594,6 +667,8 @@ impl UIState {
         self.input_buffer.clear();
         self.input_cursor = 0;
         self.confirm_yes_selected = false;
+        self.group_choices.clear();
+        self.group_choice_index = 0;
     }
 
     pub fn toggle_confirm_selection(&mut self) {
@@ -1181,5 +1256,56 @@ mod tests {
         assert_eq!(ordered, vec!["b", "a"]);
         // Selection still tracks "b" after the reorder.
         assert_eq!(state.sessions[state.selected_session].name, "b");
+    }
+
+    #[test]
+    fn group_popup_lists_existing_groups_and_highlights_current() {
+        let state = state_with(
+            &["a", "b", "c"],
+            &[("a", "work"), ("b", "personal"), ("c", "work")],
+        );
+        // Sorted, deduplicated existing groups.
+        assert_eq!(state.groups.group_names(), vec!["personal", "work"]);
+
+        let mut state = state;
+        state.selected_session = state.sessions.iter().position(|s| s.name == "b").unwrap();
+        state.open_group_session_popup();
+        assert_eq!(state.popup_mode, Some(PopupMode::GroupSession));
+        // "b" is in "personal", so that entry starts highlighted.
+        assert_eq!(
+            state.selected_group_choice(),
+            GroupChoice::Existing("personal".to_string())
+        );
+        // Entries: 2 groups + Ungrouped + New.
+        assert_eq!(state.group_choice_count(), 4);
+    }
+
+    #[test]
+    fn group_popup_defaults_to_ungrouped_for_ungrouped_session() {
+        let mut state = state_with(&["a", "b"], &[("b", "work")]);
+        state.selected_session = state.sessions.iter().position(|s| s.name == "a").unwrap();
+        state.open_group_session_popup();
+        // Index sits on the "Ungrouped" entry, just past the single group.
+        assert_eq!(state.selected_group_choice(), GroupChoice::Ungrouped);
+    }
+
+    #[test]
+    fn group_choice_navigation_wraps_and_reaches_new() {
+        let mut state = state_with(&["a"], &[("a", "work")]);
+        state.open_group_session_popup();
+        // Entries: ["work", Ungrouped, New]. Starts on "work".
+        assert_eq!(
+            state.selected_group_choice(),
+            GroupChoice::Existing("work".to_string())
+        );
+        state.group_choice_up(); // wraps to last entry
+        assert_eq!(state.selected_group_choice(), GroupChoice::New);
+        state.group_choice_down(); // wraps back to first
+        assert_eq!(
+            state.selected_group_choice(),
+            GroupChoice::Existing("work".to_string())
+        );
+        state.group_choice_down();
+        assert_eq!(state.selected_group_choice(), GroupChoice::Ungrouped);
     }
 }

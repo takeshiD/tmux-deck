@@ -1,6 +1,6 @@
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::app::{
@@ -85,12 +85,10 @@ pub fn render_ui(frame: &mut Frame, state: &mut UIState) {
         match popup_mode {
             PopupMode::NewSession => render_session_name_popup(frame, state, "New Session", "Enter session name:"),
             PopupMode::RenameSession => render_session_name_popup(frame, state, "Rename Session", "Enter new name:"),
-            PopupMode::GroupSession => render_session_name_popup(
-                frame,
-                state,
-                "Group Session",
-                "Group name (empty to ungroup):",
-            ),
+            PopupMode::GroupSession => render_group_select_popup(frame, state),
+            PopupMode::NewGroup => {
+                render_session_name_popup(frame, state, "New Group", "New group name:")
+            }
             PopupMode::ConfirmKill => render_confirm_kill_popup(frame, state),
         }
     }
@@ -735,6 +733,73 @@ fn render_session_name_popup(frame: &mut Frame, state: &UIState, title: &str, la
         .wrap(Wrap { trim: false });
 
     frame.render_widget(input_paragraph, input_area);
+}
+
+/// Render the group selection list: every existing group, then an "Ungrouped"
+/// entry that clears the assignment and a "New group" entry that switches to
+/// text entry. The highlighted row tracks [`UIState::group_choice_index`].
+fn render_group_select_popup(frame: &mut Frame, state: &UIState) {
+    let area = frame.area();
+
+    let session_name = state
+        .sessions
+        .get(state.selected_session)
+        .map(|s| s.name.as_str())
+        .unwrap_or("");
+
+    // Build the rows in the same order the selection index walks them.
+    let mut items: Vec<ListItem> = Vec::new();
+    for group in &state.group_choices {
+        items.push(ListItem::new(Line::from(group.clone())));
+    }
+    let ungrouped_label = "(Ungrouped)";
+    items.push(ListItem::new(Line::from(Span::styled(
+        ungrouped_label,
+        Style::default().fg(Color::DarkGray),
+    ))));
+    items.push(ListItem::new(Line::from(Span::styled(
+        "+ New group…",
+        Style::default().fg(Color::Green),
+    ))));
+
+    // Size the popup to the content, clamped so it always fits on screen.
+    let list_len = items.len() as u16;
+    let popup_width = (area.width * 60 / 100).clamp(40, 70);
+    let max_height = area.height.saturating_sub(2).max(5);
+    let popup_height = (list_len + 4).min(max_height);
+
+    let popup_x = (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" Group: {} ", session_name))
+        .title_bottom(Line::from(" ↑↓:select | Enter:confirm | Esc:cancel ").centered());
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.group_choice_index.min(items.len().saturating_sub(1))));
+
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    frame.render_stateful_widget(list, inner, &mut list_state);
 }
 
 fn render_confirm_kill_popup(frame: &mut Frame, state: &UIState) {
