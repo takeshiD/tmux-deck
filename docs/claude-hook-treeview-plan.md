@@ -125,7 +125,7 @@ tmux-deck 本体
 
 | 状態 | 由来 | マーク | 色（案） |
 |---|---|---|---|
-| `Working` | `UserPromptSubmit` / `PreToolUse` | `●` | オレンジ (208) |
+| `Working` | `UserPromptSubmit` / `PreToolUse` | **dots スピナー（アニメーション）** | オレンジ (208) |
 | `Waiting` | `Notification`(permission/idle) | `◆` | 黄 |
 | `Idle` / `Done` | `Stop` (end_turn) | `●` | 緑 |
 | `Error` | （要確認）`StopFailure` 等 | `✗` | 赤 |
@@ -135,6 +135,45 @@ tmux-deck 本体
   フォールバックする。これにより hook 未設定環境でも従来どおり動作。
 - window / session への集約は注目度順
   （Waiting > Error > Working > Done > Unknown など）で最大値を採用。
+
+### Working マークのアニメーション（dots スピナー）
+
+`Working` 状態のマークは静的な記号ではなく、フレームが遷移して
+「回転して動いて見える」 braille の dots スピナーにする。
+
+- フレーム列（cli-spinners の `dots` 相当・10 フレーム）:
+
+  ```
+  ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏
+  ```
+
+- フレームの進め方は **時間ベース**にして、リフレッシュ間隔に依存せず
+  常に一定速度で回るようにする。描画時に現在時刻から算出:
+
+  ```text
+  frame_index = (now_millis / FRAME_INTERVAL_MS) % FRAMES.len()
+  // 例: FRAME_INTERVAL_MS = 80（≒12.5 fps）
+  ```
+
+  描画関数（`ui.rs`）にだけアニメーション状態を持たせ、状態ストアや
+  データ構造（`ClaudeState`）には**フレーム番号を持たせない**。
+  `ClaudeState::Working` であることだけを保持し、表示するフレームは
+  描画時刻から決定する（描画は純粋関数に近い形を保つ）。
+
+- 表示色は `Working` のオレンジ (208) を維持。色は固定、記号だけが遷移。
+
+#### アニメーションを成立させるための再描画
+
+スピナーが動いて見えるには、Working な Claude が存在する間、UI が
+継続的に再描画される必要がある。tmux-deck は `RefreshActor` の tick
+（`src/actor/refresh_actor.rs`）で再描画している。
+
+- どこかの pane が `Working` の間は、スピナーがなめらかに回る程度の
+  間隔（例: 100〜120ms）で再描画ティックを出すよう、リフレッシュ
+  cadence を見直す。
+- Working な対象が無いときは従来どおりの低頻度に戻し、無駄な再描画と
+  CPU 使用を避ける（アニメーション中だけ高頻度化する）。
+- 具体的なフレーム間隔・ティック間隔は実装時に体感で調整する。
 
 ## 実装ステップ（次フェーズ）
 
@@ -174,4 +213,5 @@ tmux-deck 本体
 
 - 採用する hook イベントの最終セット（`StopFailure` 等の存在確認）。
 - 各状態の最終的な記号・配色（点滅相当の表現可否含む）。
+- Working スピナーのフレーム間隔と、アニメーション中の再描画ティック間隔の具体値。
 - 状態ファイルのクリーンアップ間隔・保持時間の具体値。
