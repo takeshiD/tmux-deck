@@ -66,9 +66,10 @@ if youde use flake, you can add `tmux-deck` in your flake.nix
 
 # Claude Code Integration
 
-tmux-deck shows what [Claude Code](https://code.claude.com) is *doing* in each
-tmux pane, driven by Claude's **hooks**. Once the hooks are installed, the
-treeview marker reflects Claude's current state:
+tmux-deck highlights tmux entities that are running [Claude Code](https://code.claude.com).
+By default it detects the `claude` process and shows an orange `●`. If you also
+install the Claude **hooks**, the marker reflects what Claude is *doing* in each
+pane:
 
 | Marker | State | Meaning |
 | ------ | ----- | ------- |
@@ -76,10 +77,10 @@ treeview marker reflects Claude's current state:
 | `◆` (yellow) | Waiting | Claude is waiting on you (permission / idle prompt) |
 | `●` (green) | Done | Claude finished its turn |
 | `✗` (red) | Error | The turn ended with an error |
+| `●` (orange) | Running | Claude process detected, no hook state yet |
 
 Windows and sessions roll up to the most attention-worthy state of their
-children (waiting > error > working > done). No marker is shown until the
-hooks are installed.
+children (waiting > error > working > done).
 
 ## Setup
 
