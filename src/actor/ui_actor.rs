@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::messages::{RefreshControl, TmuxCommand, TmuxResponse, UIEvent};
 use crate::app::{Focus, GroupChoice, InputMode, PopupMode, UIState, ViewMode};
+use crate::config::Action;
 use crate::ui::render_ui;
 
 // =============================================================================
@@ -299,6 +300,8 @@ impl UIActor {
 
     async fn handle_normal_mode_key(&mut self, key: event::KeyEvent) -> Result<bool> {
         let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let in_sessions = self.state.view_mode == ViewMode::TreeView
+            && self.state.focus == Focus::Sessions;
 
         // `za` fold chord: a pending `z` followed by `a` toggles the current
         // group's fold. Any other key cancels the chord and is then processed
@@ -311,56 +314,51 @@ impl UIActor {
             }
         }
 
-        if is_ctrl {
+        // Fixed (non-remappable) chords handled before config bindings:
+        // `z` begins the `za` fold chord, double-`Space` toggles the view.
+        if !is_ctrl {
             match key.code {
-                KeyCode::Char('n') => {
-                    self.state.open_new_session_popup();
-                    self.refresh_control.pause();
-                }
-                KeyCode::Char('r') => {
-                    self.state.open_rename_session_popup();
-                    self.refresh_control.pause();
-                }
-                KeyCode::Char('x') => {
-                    self.state.open_kill_session_popup();
-                    self.refresh_control.pause();
-                }
-                _ => {}
-            }
-        } else {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(true), // Exit
-                KeyCode::Char('r') => {
-                    let _ = self.tmux_cmd_tx.send(TmuxCommand::RefreshAll).await;
-                }
-                KeyCode::Char('s')
-                    if self.state.view_mode == ViewMode::TreeView
-                        && self.state.focus == Focus::Sessions =>
-                {
-                    self.state.cycle_session_sort();
-                }
-                KeyCode::Char('g')
-                    if self.state.view_mode == ViewMode::TreeView
-                        && self.state.focus == Focus::Sessions =>
-                {
-                    self.state.open_group_session_popup();
-                    self.refresh_control.pause();
-                }
-                KeyCode::Char('z')
-                    if self.state.view_mode == ViewMode::TreeView
-                        && self.state.focus == Focus::Sessions =>
-                {
-                    // Begin the `za` fold chord; the next key resolves it.
+                KeyCode::Char('z') if in_sessions => {
                     self.state.pending_z = true;
+                    return Ok(false);
                 }
                 KeyCode::Char(' ') => {
                     self.state.handle_space_press();
+                    return Ok(false);
                 }
-                KeyCode::Char('i') => {
+                _ => {}
+            }
+        }
+
+        // Remappable actions, resolved through the user's key bindings.
+        if let Some(action) = self.state.keybindings.action_for(&key) {
+            match action {
+                Action::Quit => return Ok(true),
+                Action::Refresh => {
+                    let _ = self.tmux_cmd_tx.send(TmuxCommand::RefreshAll).await;
+                }
+                Action::Sort if in_sessions => self.state.cycle_session_sort(),
+                Action::Group if in_sessions => {
+                    self.state.open_group_session_popup();
+                    self.refresh_control.pause();
+                }
+                Action::Input => {
                     self.state.enter_input_mode();
                     self.refresh_control.pause();
                 }
-                KeyCode::Enter => {
+                Action::NewSession => {
+                    self.state.open_new_session_popup();
+                    self.refresh_control.pause();
+                }
+                Action::RenameSession => {
+                    self.state.open_rename_session_popup();
+                    self.refresh_control.pause();
+                }
+                Action::KillSession => {
+                    self.state.open_kill_session_popup();
+                    self.refresh_control.pause();
+                }
+                Action::Enter => {
                     if let Some(target) = self.state.get_enter_target() {
                         let (reply_tx, reply_rx) = oneshot::channel();
                         let _ = self
@@ -371,14 +369,26 @@ impl UIActor {
                             })
                             .await;
                         let _ = reply_rx.await;
-                        return Ok(true); // Exit after switch
+                        // Optionally keep the deck open after switching.
+                        if self.state.behavior.exit_on_switch {
+                            return Ok(true);
+                        }
                     }
                 }
-                _ => {
-                    // View-specific key handling
-                    self.handle_navigation_key(key.code);
+                // Context-gated actions whose gate is not satisfied fall through
+                // to navigation so the key is not swallowed.
+                Action::Sort | Action::Group => {
+                    if !is_ctrl {
+                        self.handle_navigation_key(key.code);
+                    }
                 }
             }
+            return Ok(false);
+        }
+
+        // Unbound keys: view-specific navigation (only without Ctrl).
+        if !is_ctrl {
+            self.handle_navigation_key(key.code);
         }
         Ok(false)
     }

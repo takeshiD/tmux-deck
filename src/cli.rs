@@ -8,15 +8,15 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(author, name="tmux-deck", about="a tmux session manager and monitoring multi sessions.", version, long_about=None)]
 pub struct Cli {
-    /// Config file
-    #[arg(short, long, default_value = "~/.config/tmux_deck/config.toml")]
+    /// Config file (defaults to $XDG_CONFIG_HOME/tmux-deck/config.toml)
+    #[arg(short, long)]
     pub config: Option<PathBuf>,
     /// Target pane (e.g., "session:window.pane" or "%123")
     #[arg(short, long)]
     pub target: Option<String>,
-    /// Preview refresh interval in milliseconds
-    #[arg(short, long, default_value = "300")]
-    pub interval: u64,
+    /// Preview refresh interval in milliseconds (overrides the config file)
+    #[arg(short, long)]
+    pub interval: Option<u64>,
     /// Subcommand (omit to launch the interactive TUI)
     #[command(subcommand)]
     pub command: Option<Command>,

@@ -1,6 +1,7 @@
 mod actor;
 mod app;
 mod cli;
+mod config;
 mod group;
 mod hook;
 mod ui;
@@ -21,6 +22,10 @@ use tracing_subscriber::{EnvFilter, fmt::time};
 use actor::{RefreshActor, RefreshControl, TmuxActor, TmuxCommand, TmuxResponse, UIActor, UIEvent};
 use app::UIState;
 use cli::{Cli, Command, HookAction};
+use config::Config;
+
+/// Fallback preview interval (ms) when neither the CLI flag nor the config sets one.
+const DEFAULT_INTERVAL_MS: u64 = 300;
 
 // =============================================================================
 // Main
@@ -43,6 +48,14 @@ async fn main() -> Result<()> {
             },
         };
     }
+
+    // Load user config (best-effort): CLI --config > XDG config.toml > defaults.
+    let config = Config::load(cmd.config.as_deref());
+    // CLI --interval wins over the config, which wins over the built-in default.
+    let interval_ms = cmd
+        .interval
+        .or(config.preview.interval)
+        .unwrap_or(DEFAULT_INTERVAL_MS);
 
     let project_dir =
         ProjectDirs::from("dev", "tkcd", "tmux-deck").expect("cannot determine project directory");
@@ -67,7 +80,7 @@ async fn main() -> Result<()> {
     io::stdout().execute(EnterAlternateScreen)?;
     let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    let result = run_app(terminal, cmd.interval).await;
+    let result = run_app(terminal, config, interval_ms).await;
 
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
@@ -75,7 +88,11 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run_app(terminal: Terminal<CrosstermBackend<io::Stdout>>, interval_ms: u64) -> Result<()> {
+async fn run_app(
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    config: Config,
+    interval_ms: u64,
+) -> Result<()> {
     // Create channels.
     // tmux_cmd_*: high-priority user-initiated commands.
     // tmux_capture_*: low-priority periodic capture-pane requests.
@@ -88,7 +105,7 @@ async fn run_app(terminal: Terminal<CrosstermBackend<io::Stdout>>, interval_ms: 
     let refresh_control = RefreshControl::new();
 
     // Initialize UIState
-    let state = UIState::new(interval_ms);
+    let state = UIState::new(config);
     let interval = Duration::from_millis(interval_ms);
 
     // Create actors
