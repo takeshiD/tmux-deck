@@ -5,11 +5,13 @@ use ratatui::{
 
 use crate::app::{ClaudeState, Focus, InputMode, PopupMode, TmuxPane, TmuxWindow, UIState, ViewMode};
 
-/// Orange color used to flag sessions / windows / panes that have a claude
-/// process running. Color::Indexed(208) is the standard 256-color "Orange1"
-/// slot, which renders consistently across terminals that do not honour
-/// truecolor.
+/// Single colour used for every Claude marker. States are distinguished by
+/// glyph *shape*, not colour, so the markers stay legible regardless of the
+/// terminal palette or colour-blindness. Color::Indexed(208) is the standard
+/// 256-color "Orange1" slot, which renders consistently across terminals that
+/// do not honour truecolor.
 const CLAUDE_MARKER_COLOR: Color = Color::Indexed(208);
+/// Marker shown for a claude process when no hook state is known.
 const CLAUDE_MARKER: &str = "●";
 
 /// Braille "dots" spinner frames (cli-spinners `dots`). Rendered for the
@@ -32,38 +34,31 @@ fn spinner_frame() -> &'static str {
     SPINNER_FRAMES[idx]
 }
 
-/// Color for a given Claude state.
-fn claude_color(state: ClaudeState) -> Color {
-    match state {
-        ClaudeState::Working => CLAUDE_MARKER_COLOR,
-        ClaudeState::Waiting => Color::Yellow,
-        ClaudeState::Done => Color::Green,
-        ClaudeState::Error => Color::Red,
-    }
-}
-
-/// The marker glyph + color to show for a node, given its hook state and
-/// whether a claude process was detected. Hook state wins; otherwise we fall
-/// back to the plain "claude is running" marker so behaviour is unchanged when
-/// hooks are not installed. Returns `None` when there is nothing to show.
+/// The marker glyph + colour to show for a node, given its hook state and
+/// whether a claude process was detected. States are distinguished by shape
+/// (the colour is always the same); hook state wins, otherwise we fall back to
+/// the plain "claude is running" dot so behaviour is unchanged when hooks are
+/// not installed. Returns `None` when there is nothing to show.
 fn claude_marker(state: Option<ClaudeState>, has_claude: bool) -> Option<(&'static str, Color)> {
-    match state {
-        Some(ClaudeState::Working) => Some((spinner_frame(), CLAUDE_MARKER_COLOR)),
-        Some(ClaudeState::Waiting) => Some(("◆", claude_color(ClaudeState::Waiting))),
-        Some(ClaudeState::Done) => Some(("●", claude_color(ClaudeState::Done))),
-        Some(ClaudeState::Error) => Some(("✗", claude_color(ClaudeState::Error))),
-        None if has_claude => Some((CLAUDE_MARKER, CLAUDE_MARKER_COLOR)),
-        None => None,
-    }
+    let sym = match state {
+        Some(ClaudeState::Working) => spinner_frame(),
+        Some(ClaudeState::Waiting) => "◆",
+        Some(ClaudeState::Done) => "✓",
+        Some(ClaudeState::Error) => "✗",
+        None if has_claude => CLAUDE_MARKER,
+        None => return None,
+    };
+    Some((sym, CLAUDE_MARKER_COLOR))
 }
 
-/// Border accent color for a node based on its Claude state, falling back to
-/// the plain claude color when only a process was detected.
+/// Border accent colour for a node that is running claude (any state). The
+/// border only signals presence — state is conveyed by the marker shape — so a
+/// single colour is used throughout.
 fn claude_border_color(state: Option<ClaudeState>, has_claude: bool) -> Option<Color> {
-    match state {
-        Some(s) => Some(claude_color(s)),
-        None if has_claude => Some(CLAUDE_MARKER_COLOR),
-        None => None,
+    if state.is_some() || has_claude {
+        Some(CLAUDE_MARKER_COLOR)
+    } else {
+        None
     }
 }
 

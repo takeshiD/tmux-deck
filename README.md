@@ -67,17 +67,18 @@ if youde use flake, you can add `tmux-deck` in your flake.nix
 # Claude Code Integration
 
 tmux-deck highlights tmux entities that are running [Claude Code](https://code.claude.com).
-By default it detects the `claude` process and shows an orange `●`. If you also
-install the Claude **hooks**, the marker reflects what Claude is *doing* in each
-pane:
+By default it detects the `claude` process and shows a `●`. If you also install
+the Claude **hooks**, the marker reflects what Claude is *doing* in each pane.
+States are distinguished by the marker **shape** (the colour is always the
+same), so they stay legible on any terminal palette:
 
 | Marker | State | Meaning |
 | ------ | ----- | ------- |
-| `⠋⠙⠹…` (orange, animated) | Working | A prompt was submitted / a tool is running |
-| `◆` (yellow) | Waiting | Claude is waiting on you (permission / idle prompt) |
-| `●` (green) | Done | Claude finished its turn |
-| `✗` (red) | Error | The turn ended with an error |
-| `●` (orange) | Running | Claude process detected, no hook state yet |
+| `⠋⠙⠹…` (animated) | Working | A prompt was submitted / a tool is running |
+| `◆` | Waiting | Claude is waiting on you (permission / idle prompt) |
+| `✓` | Done | Claude finished its turn |
+| `✗` | Error | The turn ended with an error |
+| `●` | Running | Claude process detected, no hook state yet |
 
 Windows and sessions roll up to the most attention-worthy state of their
 children (waiting > error > working > done).
