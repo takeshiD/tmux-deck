@@ -96,6 +96,16 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
 
     let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
     let mut selected_row: Option<usize> = None;
+    // When the selection sits on a folded group, the cursor lands on that
+    // group's header instead of a (hidden) member session.
+    let selected_group = if state.selection_on_folded_header() {
+        state
+            .sessions
+            .get(state.selected_session)
+            .map(|s| s.group.clone())
+    } else {
+        None
+    };
     for (row_idx, row) in rows.iter().enumerate() {
         match row {
             SessionRow::Header {
@@ -105,11 +115,19 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
             } => {
                 let label = group.as_deref().unwrap_or(UNGROUPED_LABEL);
                 let arrow = if *collapsed { '▸' } else { '▾' };
+                let is_selected = selected_group.as_ref() == Some(group);
+                if is_selected {
+                    selected_row = Some(row_idx);
+                }
+                let mut style = Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
+                if is_selected {
+                    style = style.bg(Color::DarkGray).fg(Color::White);
+                }
                 items.push(ListItem::new(Line::from(vec![Span::styled(
                     format!("{} {} ({})", arrow, label, count),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    style,
                 )])));
             }
             SessionRow::Session { index } => {

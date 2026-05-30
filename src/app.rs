@@ -623,17 +623,39 @@ impl UIState {
         self.any_grouped() && self.collapsed_groups.contains(group)
     }
 
-    /// Whether the session at `index` is shown (its group is not folded).
-    fn session_visible(&self, index: usize) -> bool {
+    /// Whether the session at `index` is the first of its group in the current
+    /// ordering — the row a folded group collapses onto.
+    fn is_group_head(&self, index: usize) -> bool {
         match self.sessions.get(index) {
-            Some(s) => !self.is_collapsed(&s.group),
             None => false,
+            Some(s) => index == 0 || self.sessions[index - 1].group != s.group,
         }
     }
 
+    /// Whether the cursor may rest on the session at `index`. A session is a
+    /// stop when it is visible, or when it is the head of a folded group — in
+    /// which case the cursor visually sits on that group's (collapsed) header,
+    /// so the group can be re-expanded with `za`.
+    fn is_cursor_stop(&self, index: usize) -> bool {
+        match self.sessions.get(index) {
+            None => false,
+            Some(s) => !self.is_collapsed(&s.group) || self.is_group_head(index),
+        }
+    }
+
+    /// Whether the selection currently sits on a folded group's header rather
+    /// than a visible session. Used by the renderer to highlight the header.
+    pub fn selection_on_folded_header(&self) -> bool {
+        self.sessions
+            .get(self.selected_session)
+            .map(|s| self.is_collapsed(&s.group))
+            .unwrap_or(false)
+    }
+
     /// Toggle the fold state of the group containing the selected session.
-    /// Folding a group hides its members, so the selection is moved onto the
-    /// nearest still-visible session.
+    /// When folding, the selection collapses onto the group's head so the
+    /// cursor stays on the (now folded) header and the group can be reopened
+    /// with another `za`.
     pub fn toggle_fold_current_group(&mut self) {
         if !self.any_grouped() {
             return;
@@ -645,38 +667,25 @@ impl UIState {
         if self.collapsed_groups.contains(&group) {
             self.collapsed_groups.remove(&group);
         } else {
-            self.collapsed_groups.insert(group);
-            self.select_nearest_visible_session();
+            self.collapsed_groups.insert(group.clone());
+            // Park the selection on the group's head so it remains a valid
+            // cursor stop (the folded header) instead of a hidden member.
+            if let Some(head) = self.sessions.iter().position(|s| s.group == group) {
+                self.selected_session = head;
+                self.selected_window = 0;
+                self.selected_pane = 0;
+                self.window_list_state.select(Some(0));
+                self.pane_list_state.select(Some(0));
+            }
         }
     }
 
-    fn next_visible_session(&self, from: usize) -> Option<usize> {
-        ((from + 1)..self.sessions.len()).find(|&i| self.session_visible(i))
+    fn next_cursor_stop(&self, from: usize) -> Option<usize> {
+        ((from + 1)..self.sessions.len()).find(|&i| self.is_cursor_stop(i))
     }
 
-    fn prev_visible_session(&self, from: usize) -> Option<usize> {
-        (0..from).rev().find(|&i| self.session_visible(i))
-    }
-
-    /// If the selected session is hidden by a fold, move the selection to the
-    /// closest visible session (preferring the one just after it). When every
-    /// group is folded the selection is left as-is and simply shows no
-    /// highlight.
-    fn select_nearest_visible_session(&mut self) {
-        if self.session_visible(self.selected_session) {
-            return;
-        }
-        if let Some(i) = self
-            .next_visible_session(self.selected_session)
-            .or_else(|| self.prev_visible_session(self.selected_session))
-        {
-            self.selected_session = i;
-            self.selected_window = 0;
-            self.selected_pane = 0;
-            self.window_list_state.select(Some(0));
-            self.pane_list_state.select(Some(0));
-        }
-        self.session_list_state.select(Some(self.selected_session));
+    fn prev_cursor_stop(&self, from: usize) -> Option<usize> {
+        (0..from).rev().find(|&i| self.is_cursor_stop(i))
     }
 
     /// Build the rendered Sessions rows, inserting group headers and dropping
@@ -799,7 +808,7 @@ impl UIState {
     pub fn tree_move_up(&mut self) {
         match self.focus {
             Focus::Sessions => {
-                if let Some(prev) = self.prev_visible_session(self.selected_session) {
+                if let Some(prev) = self.prev_cursor_stop(self.selected_session) {
                     self.selected_session = prev;
                     self.selected_window = 0;
                     self.selected_pane = 0;
@@ -828,7 +837,7 @@ impl UIState {
     pub fn tree_move_down(&mut self) {
         match self.focus {
             Focus::Sessions => {
-                if let Some(next) = self.next_visible_session(self.selected_session) {
+                if let Some(next) = self.next_cursor_stop(self.selected_session) {
                     self.selected_session = next;
                     self.selected_window = 0;
                     self.selected_pane = 0;
@@ -1019,14 +1028,14 @@ mod tests {
             })
             .collect();
         assert_eq!(visible_sessions, vec!["b"]);
-        // Selection was relocated out of the folded group onto a visible one.
-        assert!(state.session_visible(state.selected_session));
+        // Selection parks on the folded group's head, so the cursor sits on the
+        // (collapsed) "work" header and can re-open it.
+        assert!(state.selection_on_folded_header());
+        assert_eq!(state.sessions[state.selected_session].group.as_deref(), Some("work"));
 
-        // Folding again (after selecting back into work) toggles it open.
-        state.toggle_fold_current_group(); // currently on "b" (play) -> folds play
-        // Re-expand work by selecting a work session is impossible while folded;
-        // instead toggle work directly via its key state:
-        state.collapsed_groups.remove(&Some("work".to_string()));
+        // Toggling again from the folded header re-expands the group — this is
+        // the regression that previously had no way to recover.
+        state.toggle_fold_current_group();
         let rows = state.session_rows();
         let names: Vec<&str> = rows
             .iter()
@@ -1036,21 +1045,27 @@ mod tests {
             })
             .collect();
         assert!(names.contains(&"a") && names.contains(&"c"));
+        assert!(!state.selection_on_folded_header());
     }
 
     #[test]
-    fn navigation_skips_folded_sessions() {
+    fn navigation_lands_on_folded_group_then_reopens() {
         let mut state = state_with(
             &["a", "b", "c"],
             &[("a", "work"), ("c", "work"), ("b", "play")],
         );
-        // Order is play(b), work(a,c). Fold work.
+        // Order is play(b), work(a,c). Fold work (selection parks on work head).
         state.selected_session = state.sessions.iter().position(|s| s.name == "a").unwrap();
         state.toggle_fold_current_group();
-        // Start on the only visible session "b" and move down: nowhere visible.
+        // From the visible "b", moving down stops on the folded work header
+        // rather than skipping it entirely.
         state.selected_session = state.sessions.iter().position(|s| s.name == "b").unwrap();
         state.tree_move_down();
-        assert_eq!(state.sessions[state.selected_session].name, "b");
+        assert!(state.selection_on_folded_header());
+        assert_eq!(state.sessions[state.selected_session].group.as_deref(), Some("work"));
+        // And `za` there expands it back.
+        state.toggle_fold_current_group();
+        assert!(!state.selection_on_folded_header());
     }
 
     #[test]
