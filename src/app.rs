@@ -11,6 +11,10 @@ use crate::group::GroupStore;
 /// to any user group. Only rendered when at least one session *is* grouped.
 pub const UNGROUPED_LABEL: &str = "Ungrouped";
 
+/// Maximum number of characters (not bytes) accepted in the session/group name
+/// input popups. Keeps names short enough to render in the narrow list panes.
+pub const SESSION_NAME_MAX_LEN: usize = 30;
+
 // =============================================================================
 // Data Structures
 // =============================================================================
@@ -560,6 +564,15 @@ impl UIState {
         let byte_offset = self.input_cursor_byte_offset();
         self.input_buffer.insert(byte_offset, c);
         self.input_cursor += 1;
+    }
+
+    /// Insert a character only while the buffer holds fewer than `max_chars`
+    /// characters; otherwise the keystroke is ignored. Used by the session/group
+    /// name popups to cap the name length.
+    pub fn input_char_limited(&mut self, c: char, max_chars: usize) {
+        if self.input_char_count() < max_chars {
+            self.input_char(c);
+        }
     }
 
     pub fn input_backspace(&mut self) {
@@ -1371,5 +1384,24 @@ mod tests {
         assert_eq!(state.input_cursor, 0);
         state.input_move_end();
         assert_eq!(state.input_cursor, 2);
+    }
+
+    #[test]
+    fn input_char_limited_caps_char_count() {
+        let mut state = UIState::new(100);
+        for _ in 0..40 {
+            state.input_char_limited('a', SESSION_NAME_MAX_LEN);
+        }
+        assert_eq!(state.input_buffer.chars().count(), SESSION_NAME_MAX_LEN);
+    }
+
+    #[test]
+    fn input_char_limited_counts_chars_not_bytes() {
+        let mut state = UIState::new(100);
+        // マルチバイト文字でもバイト長ではなく文字数で制限される
+        for _ in 0..40 {
+            state.input_char_limited('あ', SESSION_NAME_MAX_LEN);
+        }
+        assert_eq!(state.input_buffer.chars().count(), SESSION_NAME_MAX_LEN);
     }
 }

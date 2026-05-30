@@ -670,7 +670,9 @@ fn render_input_popup(frame: &mut Frame, state: &UIState, area: Rect) {
 fn render_session_name_popup(frame: &mut Frame, state: &UIState, title: &str, label: &str) {
     let area = frame.area();
     let popup_width = (area.width * 60 / 100).clamp(40, 70);
-    let popup_height = 7;
+    // border(1) + label(1) + input(1) + border(1) = 4 rows: the input field is
+    // a single line tall.
+    let popup_height = 4;
 
     let popup_x = (area.width.saturating_sub(popup_width)) / 2;
     let popup_y = (area.height.saturating_sub(popup_height)) / 2;
@@ -693,17 +695,13 @@ fn render_session_name_popup(frame: &mut Frame, state: &UIState, title: &str, la
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
-    let input_chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(1),
-    ])
-    .split(inner);
+    let input_chunks =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
 
     let label_widget = Paragraph::new(label).style(Style::default().fg(Color::White));
     frame.render_widget(label_widget, input_chunks[0]);
 
-    let input_area = input_chunks[2];
+    let input_area = input_chunks[1];
 
     // Render input with cursor
     // input_cursor は char 単位なので、char 単位で前後を分割する
