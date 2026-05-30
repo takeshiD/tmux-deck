@@ -183,7 +183,7 @@ impl TmuxActor {
             "list-panes",
             "-a",
             "-F",
-            "PANE\t#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_index}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_last}\t#{pane_current_command}\t#{pane_pid}",
+            "PANE\t#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_index}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_last}\t#{pane_current_command}",
         ];
 
         // If control mode is up, send 3 commands as 3 blocks; otherwise one
@@ -219,7 +219,6 @@ impl TmuxActor {
         };
 
         let mut sessions = build_sessions(&stdout);
-        annotate_claude_panes(&mut sessions).await;
         crate::hook::apply_states(&mut sessions);
         TmuxResponse::SessionsRefreshed { sessions }
     }
@@ -750,7 +749,6 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                 let active = it.next() == Some("1");
                 let last = it.next() == Some("1");
                 let current_command = it.next().unwrap_or("").to_string();
-                let pid: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
                 if let Some(s) = sessions.get_mut(session)
                     && let Some(w) = s.windows.iter_mut().find(|w| w.index == window_index)
@@ -766,8 +764,6 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                             height,
                             active,
                             current_command,
-                            pid,
-                            has_claude: false,
                             claude_state: None,
                         },
                     ));
@@ -816,7 +812,6 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                     name: w.name,
                     active: w.active,
                     panes: w.panes_raw.into_iter().map(|(_, _, _, p)| p).collect(),
-                    has_claude: false,
                     claude_state: None,
                 })
                 .collect();
@@ -826,115 +821,12 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                 attached: s.attached,
                 unread,
                 windows,
-                has_claude: false,
                 claude_state: None,
                 last_attached: s.last_attached,
                 activity: s.activity,
             })
         })
         .collect()
-}
-
-// =============================================================================
-// Claude-process detection
-// =============================================================================
-//
-// For each pane we already know the shell pid. A claude process running in
-// that pane shows up as a descendant — `claude` (or `.claude-wrapped`) under
-// the shell. We snapshot the full process table once per refresh and mark
-// any pane whose descendant tree contains such a process. The chrome native
-// host instance is excluded so it does not light up unrelated panes.
-
-async fn annotate_claude_panes(sessions: &mut [TmuxSession]) {
-    use std::collections::{HashMap, HashSet};
-
-    let output = match Command::new("ps")
-        .args(["-eo", "pid=,ppid=,args="])
-        .output()
-        .await
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return,
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut claude_pids: HashSet<u32> = HashSet::new();
-
-    for line in stdout.lines() {
-        let mut it = line.split_whitespace();
-        let pid: u32 = match it.next().and_then(|s| s.parse().ok()) {
-            Some(p) => p,
-            None => continue,
-        };
-        let ppid: u32 = match it.next().and_then(|s| s.parse().ok()) {
-            Some(p) => p,
-            None => continue,
-        };
-        let args: String = it.collect::<Vec<_>>().join(" ");
-
-        children.entry(ppid).or_default().push(pid);
-        if is_claude_args(&args) {
-            claude_pids.insert(pid);
-        }
-    }
-
-    if claude_pids.is_empty() {
-        return;
-    }
-
-    for session in sessions.iter_mut() {
-        let mut session_has = false;
-        for window in session.windows.iter_mut() {
-            let mut window_has = false;
-            for pane in window.panes.iter_mut() {
-                if pane.pid != 0 && pane_has_claude(pane.pid, &children, &claude_pids) {
-                    pane.has_claude = true;
-                    window_has = true;
-                }
-            }
-            window.has_claude = window_has;
-            if window_has {
-                session_has = true;
-            }
-        }
-        session.has_claude = session_has;
-    }
-}
-
-fn is_claude_args(args: &str) -> bool {
-    if args.is_empty() {
-        return false;
-    }
-    // The chrome-native-host instance is a separate, persistent helper that
-    // is not associated with an interactive pane.
-    if args.contains("--chrome-native-host") {
-        return false;
-    }
-    args.contains(".claude-wrapped")
-        || args.contains("claude-code/cli")
-        || args.split_whitespace().next() == Some("claude")
-}
-
-fn pane_has_claude(
-    root: u32,
-    children: &std::collections::HashMap<u32, Vec<u32>>,
-    claude_pids: &std::collections::HashSet<u32>,
-) -> bool {
-    let mut stack = vec![root];
-    let mut visited = std::collections::HashSet::new();
-    while let Some(pid) = stack.pop() {
-        if !visited.insert(pid) {
-            continue;
-        }
-        if claude_pids.contains(&pid) {
-            return true;
-        }
-        if let Some(kids) = children.get(&pid) {
-            stack.extend(kids.iter().copied());
-        }
-    }
-    false
 }
 
 fn append_switch_log(path: &str, target: &str, success: bool, error: Option<&str>) {

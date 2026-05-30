@@ -10,9 +10,8 @@ use ratatui::widgets::ListState;
 
 /// State reported by Claude Code hooks for a given pane.
 ///
-/// Process detection (`has_claude`) only tells us whether claude is running;
-/// these states tell us *what claude is doing*, sourced from Claude Code's
-/// hook events (see [`crate::hook`]). Variants are ordered loosely by how much
+/// Sourced from Claude Code's hook events (see [`crate::hook`]), these tell us
+/// *what claude is doing* in a pane. Variants are ordered loosely by how much
 /// they want the user's attention — see [`ClaudeState::priority`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaudeState {
@@ -96,9 +95,6 @@ pub struct TmuxPane {
     pub height: u32,
     pub active: bool,
     pub current_command: String,
-    pub pid: u32,
-    /// True if a claude process is running in this pane (detected via descendant process scan).
-    pub has_claude: bool,
     /// Latest state reported by Claude Code hooks for this pane, if any.
     pub claude_state: Option<ClaudeState>,
 }
@@ -110,8 +106,6 @@ pub struct TmuxWindow {
     pub name: String,
     pub active: bool,
     pub panes: Vec<TmuxPane>,
-    /// True if any pane in this window has claude running.
-    pub has_claude: bool,
     /// Highest-priority Claude hook state across this window's panes.
     pub claude_state: Option<ClaudeState>,
 }
@@ -132,8 +126,6 @@ pub struct TmuxSession {
     /// the user has not seen yet.
     pub unread: bool,
     pub windows: Vec<TmuxWindow>,
-    /// True if any window in this session has claude running.
-    pub has_claude: bool,
     /// Highest-priority Claude hook state across this session's windows.
     pub claude_state: Option<ClaudeState>,
     /// Epoch seconds — kept on the struct so [`SessionSort`] can reorder
