@@ -634,18 +634,19 @@ fn render_input_popup(frame: &mut Frame, state: &UIState, area: Rect) {
 
     let input_area = input_chunks[2];
 
-    let before_cursor = &state.input_buffer[..state.input_cursor];
+    // input_cursor は char 単位なので、char 単位で前後を分割する
+    let before_cursor: String = state.input_buffer.chars().take(state.input_cursor).collect();
     let cursor_char = state
         .input_buffer
         .chars()
         .nth(state.input_cursor)
         .map(|c| c.to_string())
         .unwrap_or_else(|| " ".to_string());
-    let after_cursor = if state.input_cursor < state.input_buffer.len() {
-        &state.input_buffer[state.input_cursor + cursor_char.len()..]
-    } else {
-        ""
-    };
+    let after_cursor: String = state
+        .input_buffer
+        .chars()
+        .skip(state.input_cursor + 1)
+        .collect();
 
     let input_text = Line::from(vec![
         Span::raw(before_cursor),
@@ -706,18 +707,19 @@ fn render_session_name_popup(frame: &mut Frame, state: &UIState, title: &str, la
     let input_area = input_chunks[2];
 
     // Render input with cursor
-    let before_cursor = &state.input_buffer[..state.input_cursor];
+    // input_cursor は char 単位なので、char 単位で前後を分割する
+    let before_cursor: String = state.input_buffer.chars().take(state.input_cursor).collect();
     let cursor_char = state
         .input_buffer
         .chars()
         .nth(state.input_cursor)
         .map(|c| c.to_string())
         .unwrap_or_else(|| " ".to_string());
-    let after_cursor = if state.input_cursor < state.input_buffer.len() {
-        &state.input_buffer[state.input_cursor + cursor_char.len()..]
-    } else {
-        ""
-    };
+    let after_cursor: String = state
+        .input_buffer
+        .chars()
+        .skip(state.input_cursor + 1)
+        .collect();
 
     let input_text = Line::from(vec![
         Span::raw(before_cursor),
