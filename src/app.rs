@@ -15,6 +15,83 @@ pub const UNGROUPED_LABEL: &str = "Ungrouped";
 // Data Structures
 // =============================================================================
 
+/// State reported by Claude Code hooks for a given pane.
+///
+/// Process detection (`has_claude`) only tells us whether claude is running;
+/// these states tell us *what claude is doing*, sourced from Claude Code's
+/// hook events (see [`crate::hook`]). Variants are ordered loosely by how much
+/// they want the user's attention — see [`ClaudeState::priority`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeState {
+    /// Claude is actively working (prompt submitted / tool running).
+    Working,
+    /// Claude is waiting on the user (permission prompt / idle prompt).
+    Waiting,
+    /// Claude finished its turn.
+    Done,
+    /// Claude's turn ended with an error.
+    Error,
+}
+
+impl ClaudeState {
+    /// Map a Claude Code `hook_event_name` to the state it implies.
+    /// Returns `None` for events that carry no marker meaning (the caller may
+    /// treat `SessionEnd` specially, clearing any existing marker).
+    pub fn from_hook_event(event: &str) -> Option<Self> {
+        match event {
+            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PreCompact" => Some(Self::Working),
+            "Notification" => Some(Self::Waiting),
+            "Stop" | "SubagentStop" => Some(Self::Done),
+            // StopFailure is not yet confirmed in the public docs; map it
+            // defensively so it lights up red if it ever fires.
+            "StopFailure" => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    /// Stable lowercase token used in the on-disk state files.
+    pub fn as_token(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Waiting => "waiting",
+            Self::Done => "done",
+            Self::Error => "error",
+        }
+    }
+
+    /// Inverse of [`Self::as_token`].
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "working" => Some(Self::Working),
+            "waiting" => Some(Self::Waiting),
+            "done" => Some(Self::Done),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    /// How strongly this state wants the user's attention. Used when rolling
+    /// pane states up into a single window / session marker — the highest
+    /// priority among children wins.
+    pub fn priority(self) -> u8 {
+        match self {
+            Self::Waiting => 3,
+            Self::Error => 2,
+            Self::Working => 1,
+            Self::Done => 0,
+        }
+    }
+
+    /// Combine two optional states, keeping the higher-priority one.
+    pub fn merge(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(x), Some(y)) => Some(if x.priority() >= y.priority() { x } else { y }),
+            (Some(x), None) => Some(x),
+            (None, b) => b,
+        }
+    }
+}
+
 /// Represents a tmux pane
 #[derive(Debug, Clone)]
 pub struct TmuxPane {
@@ -29,6 +106,8 @@ pub struct TmuxPane {
     pub pid: u32,
     /// True if a claude process is running in this pane (detected via descendant process scan).
     pub has_claude: bool,
+    /// Latest state reported by Claude Code hooks for this pane, if any.
+    pub claude_state: Option<ClaudeState>,
 }
 
 /// Represents a tmux window with captured content
@@ -36,10 +115,11 @@ pub struct TmuxPane {
 pub struct TmuxWindow {
     pub index: u32,
     pub name: String,
-    pub active: bool,
     pub panes: Vec<TmuxPane>,
     /// True if any pane in this window has claude running.
     pub has_claude: bool,
+    /// Highest-priority Claude hook state across this window's panes.
+    pub claude_state: Option<ClaudeState>,
 }
 
 impl TmuxWindow {
@@ -52,14 +132,11 @@ impl TmuxWindow {
 #[derive(Debug, Clone)]
 pub struct TmuxSession {
     pub name: String,
-    pub attached: bool,
-    /// True if the session has activity newer than its last_attached and
-    /// is not currently attached — i.e. something happened in there that
-    /// the user has not seen yet.
-    pub unread: bool,
     pub windows: Vec<TmuxWindow>,
     /// True if any window in this session has claude running.
     pub has_claude: bool,
+    /// Highest-priority Claude hook state across this session's windows.
+    pub claude_state: Option<ClaudeState>,
     /// Epoch seconds — kept on the struct so [`SessionSort`] can reorder
     /// the list without re-querying tmux.
     pub last_attached: i64,
@@ -347,6 +424,22 @@ impl UIState {
     // =========================================================================
     // View Mode Switching
     // =========================================================================
+
+    /// Re-read Claude hook state files and patch the in-memory session tree.
+    ///
+    /// Cheap enough to call on every refresh tick: it only reads a small local
+    /// state directory. This keeps markers live without a full tmux refresh.
+    pub fn refresh_claude_states(&mut self) {
+        crate::hook::apply_states(&mut self.sessions);
+    }
+
+    /// True if any session currently has a `Working` Claude marker, used to
+    /// decide whether the spinner animation needs frequent redraws.
+    pub fn has_working_claude(&self) -> bool {
+        self.sessions
+            .iter()
+            .any(|s| s.claude_state == Some(ClaudeState::Working))
+    }
 
     pub fn handle_space_press(&mut self) -> bool {
         let now = Instant::now();
@@ -933,10 +1026,9 @@ mod tests {
     fn session(name: &str) -> TmuxSession {
         TmuxSession {
             name: name.to_string(),
-            attached: false,
-            unread: false,
             windows: Vec::new(),
             has_claude: false,
+            claude_state: None,
             last_attached: 0,
             activity: 0,
             group: None,
