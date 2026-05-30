@@ -1,6 +1,7 @@
 mod actor;
 mod app;
 mod cli;
+mod group;
 mod hook;
 mod ui;
 

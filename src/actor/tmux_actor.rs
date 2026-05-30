@@ -823,6 +823,9 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                 claude_state: None,
                 last_attached: s.last_attached,
                 activity: s.activity,
+                // Group labels are applied tmux-deck-side in UIState once the
+                // refreshed sessions reach the UI; the tmux layer is unaware.
+                group: None,
             })
         })
         .collect()

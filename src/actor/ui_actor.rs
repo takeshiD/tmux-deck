@@ -8,7 +8,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::messages::{RefreshControl, TmuxCommand, TmuxResponse, UIEvent};
-use crate::app::{Focus, InputMode, PopupMode, UIState, ViewMode};
+use crate::app::{Focus, GroupChoice, InputMode, PopupMode, UIState, ViewMode};
 use crate::ui::render_ui;
 
 // =============================================================================
@@ -182,13 +182,52 @@ impl UIActor {
         popup_mode: PopupMode,
     ) -> Result<bool> {
         match popup_mode {
-            PopupMode::NewSession | PopupMode::RenameSession => {
+            PopupMode::GroupSession => {
+                // Selecting an existing group (or "ungroup") is handled entirely
+                // tmux-deck-side: no tmux command and no RefreshAll, since
+                // grouping does not change anything tmux knows about.
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state.close_popup();
+                        self.refresh_control.resume();
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => self.state.group_choice_up(),
+                    KeyCode::Down | KeyCode::Char('j') => self.state.group_choice_down(),
+                    KeyCode::Enter => match self.state.selected_group_choice() {
+                        GroupChoice::Existing(group) => {
+                            self.state.assign_selected_group(Some(group));
+                            self.state.close_popup();
+                            self.refresh_control.resume();
+                        }
+                        GroupChoice::Ungrouped => {
+                            self.state.assign_selected_group(None);
+                            self.state.close_popup();
+                            self.refresh_control.resume();
+                        }
+                        // Switch to text entry; stay in popup so the refresh
+                        // control remains paused until the name is confirmed.
+                        GroupChoice::New => self.state.begin_new_group_entry(),
+                    },
+                    _ => {}
+                }
+            }
+            PopupMode::NewSession | PopupMode::RenameSession | PopupMode::NewGroup => {
                 match key.code {
                     KeyCode::Esc => {
                         self.state.close_popup();
                         self.refresh_control.resume();
                     }
                     KeyCode::Enter => {
+                        // A new group is handled entirely tmux-deck-side: no
+                        // tmux command and no RefreshAll, since grouping does
+                        // not change anything tmux knows about.
+                        if popup_mode == PopupMode::NewGroup {
+                            let group = self.state.get_group_session_input();
+                            self.state.assign_selected_group(group);
+                            self.state.close_popup();
+                            self.refresh_control.resume();
+                            return Ok(false);
+                        }
                         if popup_mode == PopupMode::NewSession {
                             let name = self.state.get_new_session_name();
                             if !name.is_empty() {
@@ -197,6 +236,9 @@ impl UIActor {
                         } else if let Some((old_name, new_name)) =
                             self.state.get_rename_session_info()
                         {
+                            // Carry the group label across the rename so the
+                            // session does not silently fall out of its group.
+                            self.state.groups.rename_session(&old_name, &new_name);
                             let _ = self
                                 .tmux_cmd_tx
                                 .send(TmuxCommand::RenameSession { old_name, new_name })
@@ -225,6 +267,9 @@ impl UIActor {
                     }
                     KeyCode::Enter => {
                         if let Some(name) = self.state.get_kill_session_name() {
+                            // Drop the killed session's group assignment so the
+                            // store does not keep stale entries around.
+                            self.state.groups.forget(&name);
                             let _ = self.tmux_cmd_tx.send(TmuxCommand::KillSession { name }).await;
                             // Refresh after operation
                             let _ = self.tmux_cmd_tx.send(TmuxCommand::RefreshAll).await;
@@ -255,6 +300,17 @@ impl UIActor {
     async fn handle_normal_mode_key(&mut self, key: event::KeyEvent) -> Result<bool> {
         let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+        // `za` fold chord: a pending `z` followed by `a` toggles the current
+        // group's fold. Any other key cancels the chord and is then processed
+        // normally below.
+        if self.state.pending_z {
+            self.state.pending_z = false;
+            if !is_ctrl && key.code == KeyCode::Char('a') {
+                self.state.toggle_fold_current_group();
+                return Ok(false);
+            }
+        }
+
         if is_ctrl {
             match key.code {
                 KeyCode::Char('n') => {
@@ -282,6 +338,20 @@ impl UIActor {
                         && self.state.focus == Focus::Sessions =>
                 {
                     self.state.cycle_session_sort();
+                }
+                KeyCode::Char('g')
+                    if self.state.view_mode == ViewMode::TreeView
+                        && self.state.focus == Focus::Sessions =>
+                {
+                    self.state.open_group_session_popup();
+                    self.refresh_control.pause();
+                }
+                KeyCode::Char('z')
+                    if self.state.view_mode == ViewMode::TreeView
+                        && self.state.focus == Focus::Sessions =>
+                {
+                    // Begin the `za` fold chord; the next key resolves it.
+                    self.state.pending_z = true;
                 }
                 KeyCode::Char(' ') => {
                     self.state.handle_space_press();

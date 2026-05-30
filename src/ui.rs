@@ -1,9 +1,12 @@
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{ClaudeState, Focus, InputMode, PopupMode, TmuxPane, TmuxWindow, UIState, ViewMode};
+use crate::app::{
+    ClaudeState, Focus, InputMode, PopupMode, SessionRow, TmuxPane, TmuxWindow, UIState,
+    UNGROUPED_LABEL, ViewMode,
+};
 
 /// Single colour used for every Claude marker. States are distinguished by
 /// glyph *shape*, not colour, so the markers stay legible regardless of the
@@ -82,6 +85,10 @@ pub fn render_ui(frame: &mut Frame, state: &mut UIState) {
         match popup_mode {
             PopupMode::NewSession => render_session_name_popup(frame, state, "New Session", "Enter session name:"),
             PopupMode::RenameSession => render_session_name_popup(frame, state, "Rename Session", "Enter new name:"),
+            PopupMode::GroupSession => render_group_select_popup(frame, state),
+            PopupMode::NewGroup => {
+                render_session_name_popup(frame, state, "New Group", "New group name:")
+            }
             PopupMode::ConfirmKill => render_confirm_kill_popup(frame, state),
         }
     }
@@ -127,26 +134,82 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let items: Vec<ListItem> = state
-        .sessions
+    // Grouping turns the flat session list into a list of rows that may also
+    // contain non-selectable group headers. When nothing is grouped, the rows
+    // are all sessions and this renders identically to the ungrouped list.
+    let rows = state.session_rows();
+    let indented = rows
         .iter()
-        .enumerate()
-        .map(|(i, session)| {
-            let style = if i == state.selected_session {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
-            } else {
-                Style::default()
-            };
-            let mut spans = vec![Span::raw(session.name.clone())];
-            if let Some((sym, color)) = claude_marker(session.claude_state, session.has_claude) {
-                spans.push(Span::styled(
-                    format!(" {}", sym),
-                    Style::default().fg(color),
-                ));
+        .any(|r| matches!(r, SessionRow::Header { .. }));
+
+    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
+    let mut selected_row: Option<usize> = None;
+    // When the selection sits on a folded group, the cursor lands on that
+    // group's header instead of a (hidden) member session.
+    let selected_group = if state.selection_on_folded_header() {
+        state
+            .sessions
+            .get(state.selected_session)
+            .map(|s| s.group.clone())
+    } else {
+        None
+    };
+    for (row_idx, row) in rows.iter().enumerate() {
+        match row {
+            SessionRow::Header {
+                group,
+                count,
+                collapsed,
+            } => {
+                let label = group.as_deref().unwrap_or(UNGROUPED_LABEL);
+                let arrow = if *collapsed { '▸' } else { '▾' };
+                let is_selected = selected_group.as_ref() == Some(group);
+                if is_selected {
+                    selected_row = Some(row_idx);
+                }
+                let mut style = Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
+                if is_selected {
+                    style = style.bg(Color::DarkGray).fg(Color::White);
+                }
+                items.push(ListItem::new(Line::from(vec![Span::styled(
+                    format!("{} {} ({})", arrow, label, count),
+                    style,
+                )])));
             }
-            ListItem::new(Line::from(spans)).style(style)
-        })
-        .collect();
+            SessionRow::Session { index } => {
+                let session = &state.sessions[*index];
+                if *index == state.selected_session {
+                    selected_row = Some(row_idx);
+                }
+                let style = if *index == state.selected_session {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+                // Indent sessions under their header so the hierarchy reads.
+                let mut spans = vec![Span::raw(if indented {
+                    format!("  {}", session.name)
+                } else {
+                    session.name.clone()
+                })];
+                if let Some((sym, color)) =
+                    claude_marker(session.claude_state, session.has_claude)
+                {
+                    spans.push(Span::styled(
+                        format!(" {}", sym),
+                        Style::default().fg(color),
+                    ));
+                }
+                items.push(ListItem::new(Line::from(spans)).style(style));
+            }
+        }
+    }
+
+    // The highlight tracks rendered rows, not session indices, so map the
+    // selected session onto its row before handing the state to ratatui.
+    state.session_list_state.select(selected_row);
 
     let list = List::new(items)
         .block(
@@ -326,6 +389,10 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
             Span::raw(":focus "),
             Span::styled("s", Style::default().fg(Color::Yellow)),
             Span::raw(":sort "),
+            Span::styled("g", Style::default().fg(Color::Yellow)),
+            Span::raw(":group "),
+            Span::styled("za", Style::default().fg(Color::Yellow)),
+            Span::raw(":fold "),
             Span::styled("Space×2", Style::default().fg(Color::Magenta)),
             Span::raw(":multi "),
             Span::styled("C-n", Style::default().fg(Color::Green)),
@@ -666,6 +733,73 @@ fn render_session_name_popup(frame: &mut Frame, state: &UIState, title: &str, la
         .wrap(Wrap { trim: false });
 
     frame.render_widget(input_paragraph, input_area);
+}
+
+/// Render the group selection list: every existing group, then an "Ungrouped"
+/// entry that clears the assignment and a "New group" entry that switches to
+/// text entry. The highlighted row tracks [`UIState::group_choice_index`].
+fn render_group_select_popup(frame: &mut Frame, state: &UIState) {
+    let area = frame.area();
+
+    let session_name = state
+        .sessions
+        .get(state.selected_session)
+        .map(|s| s.name.as_str())
+        .unwrap_or("");
+
+    // Build the rows in the same order the selection index walks them.
+    let mut items: Vec<ListItem> = Vec::new();
+    for group in &state.group_choices {
+        items.push(ListItem::new(Line::from(group.clone())));
+    }
+    let ungrouped_label = "(Ungrouped)";
+    items.push(ListItem::new(Line::from(Span::styled(
+        ungrouped_label,
+        Style::default().fg(Color::DarkGray),
+    ))));
+    items.push(ListItem::new(Line::from(Span::styled(
+        "+ New group…",
+        Style::default().fg(Color::Green),
+    ))));
+
+    // Size the popup to the content, clamped so it always fits on screen.
+    let list_len = items.len() as u16;
+    let popup_width = (area.width * 60 / 100).clamp(40, 70);
+    let max_height = area.height.saturating_sub(2).max(5);
+    let popup_height = (list_len + 4).min(max_height);
+
+    let popup_x = (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" Group: {} ", session_name))
+        .title_bottom(Line::from(" ↑↓:select | Enter:confirm | Esc:cancel ").centered());
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.group_choice_index.min(items.len().saturating_sub(1))));
+
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    frame.render_stateful_widget(list, inner, &mut list_state);
 }
 
 fn render_confirm_kill_popup(frame: &mut Frame, state: &UIState) {

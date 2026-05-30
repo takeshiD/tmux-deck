@@ -1,8 +1,15 @@
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use ratatui::text::Text;
 use ratatui::widgets::ListState;
+
+use crate::group::GroupStore;
+
+/// Label shown for the implicit group of sessions that have not been assigned
+/// to any user group. Only rendered when at least one session *is* grouped.
+pub const UNGROUPED_LABEL: &str = "Ungrouped";
 
 // =============================================================================
 // Data Structures
@@ -134,6 +141,10 @@ pub struct TmuxSession {
     /// the list without re-querying tmux.
     pub last_attached: i64,
     pub activity: i64,
+    /// tmux-deck-side group label this session belongs to, if any. This is a
+    /// purely organisational tag managed by the deck (see [`crate::group`]),
+    /// independent of tmux's native session groups. `None` means ungrouped.
+    pub group: Option<String>,
 }
 
 // =============================================================================
@@ -297,6 +308,44 @@ pub enum PopupMode {
     RenameSession,
     /// Confirming session kill
     ConfirmKill,
+    /// Choosing a group for the selected session from a list of existing
+    /// groups (plus "ungroup" and "create new" entries).
+    GroupSession,
+    /// Typing the name of a brand-new group, reached from the GroupSession
+    /// list via the "New group" entry.
+    NewGroup,
+}
+
+/// The entry highlighted in the [`PopupMode::GroupSession`] selection list.
+/// The list shows every existing group, then an "Ungrouped" entry that clears
+/// the assignment, then a "New group" entry that switches to text entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupChoice {
+    /// Assign the session to an existing group of this name.
+    Existing(String),
+    /// Remove the session from any group.
+    Ungrouped,
+    /// Create a new group (switches the popup to text entry).
+    New,
+}
+
+/// A single rendered row in the Sessions list. Grouping inserts non-selectable
+/// [`SessionRow::Header`] rows between the [`SessionRow::Session`] rows; the
+/// session rows still map 1:1 onto indices into [`UIState::sessions`], so all
+/// navigation continues to operate on session indices and only rendering needs
+/// to be group-aware.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRow {
+    /// A group heading. `group` is `None` for the implicit ungrouped bucket.
+    /// `collapsed` drives the fold indicator and means the member session rows
+    /// are hidden.
+    Header {
+        group: Option<String>,
+        count: usize,
+        collapsed: bool,
+    },
+    /// A session, identified by its index into [`UIState::sessions`].
+    Session { index: usize },
 }
 
 // =============================================================================
@@ -321,6 +370,15 @@ pub struct UIState {
     pub pane_list_state: ListState,
     pub session_sort: SessionSort,
 
+    /// Persisted tmux-deck-side session grouping (session name -> group).
+    pub groups: GroupStore,
+    /// Groups currently folded in the Sessions list. A group key of `None` is
+    /// the implicit "Ungrouped" bucket. Fold state is session-runtime only and
+    /// is not persisted.
+    pub collapsed_groups: HashSet<Option<String>>,
+    /// True after `z` is pressed, awaiting the `a` of the `za` fold chord.
+    pub pending_z: bool,
+
     // MultiPreview state (session_idx, window_idx)
     pub multi_session: usize,
     pub multi_window: usize,
@@ -338,6 +396,12 @@ pub struct UIState {
     // Popup state
     pub popup_mode: Option<PopupMode>,
     pub confirm_yes_selected: bool,
+    /// Existing group names offered in the GroupSession selection list,
+    /// snapshotted when the popup opens so navigation stays stable.
+    pub group_choices: Vec<String>,
+    /// Index of the highlighted entry in the GroupSession list. Entries are
+    /// `group_choices` followed by the "Ungrouped" and "New group" entries.
+    pub group_choice_index: usize,
 }
 
 impl UIState {
@@ -356,6 +420,10 @@ impl UIState {
             pane_list_state: ListState::default(),
             session_sort: SessionSort::default(),
 
+            groups: GroupStore::load(),
+            collapsed_groups: HashSet::new(),
+            pending_z: false,
+
             multi_session: 0,
             multi_window: 0,
 
@@ -368,6 +436,8 @@ impl UIState {
             input_cursor: 0,
 
             popup_mode: None,
+            group_choices: Vec::new(),
+            group_choice_index: 0,
             confirm_yes_selected: false,
         };
         state.session_list_state.select(Some(0));
@@ -528,6 +598,63 @@ impl UIState {
         }
     }
 
+    pub fn open_group_session_popup(&mut self) {
+        let Some(session) = self.sessions.get(self.selected_session) else {
+            return;
+        };
+        let current = session.group.clone();
+        self.popup_mode = Some(PopupMode::GroupSession);
+        self.group_choices = self.groups.group_names();
+        // Highlight the session's current group by default, falling back to the
+        // "Ungrouped" entry (which sits just past the existing groups) when the
+        // session is not grouped yet.
+        self.group_choice_index = match current {
+            Some(g) => self
+                .group_choices
+                .iter()
+                .position(|name| *name == g)
+                .unwrap_or(self.group_choices.len()),
+            None => self.group_choices.len(),
+        };
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+    }
+
+    /// Total number of entries in the GroupSession list: every existing group,
+    /// then the "Ungrouped" and "New group" entries.
+    pub fn group_choice_count(&self) -> usize {
+        self.group_choices.len() + 2
+    }
+
+    /// The entry currently highlighted in the GroupSession list.
+    pub fn selected_group_choice(&self) -> GroupChoice {
+        let n = self.group_choices.len();
+        if self.group_choice_index < n {
+            GroupChoice::Existing(self.group_choices[self.group_choice_index].clone())
+        } else if self.group_choice_index == n {
+            GroupChoice::Ungrouped
+        } else {
+            GroupChoice::New
+        }
+    }
+
+    pub fn group_choice_up(&mut self) {
+        let n = self.group_choice_count();
+        self.group_choice_index = (self.group_choice_index + n - 1) % n;
+    }
+
+    pub fn group_choice_down(&mut self) {
+        let n = self.group_choice_count();
+        self.group_choice_index = (self.group_choice_index + 1) % n;
+    }
+
+    /// Switch the open GroupSession popup into text entry for a new group name.
+    pub fn begin_new_group_entry(&mut self) {
+        self.popup_mode = Some(PopupMode::NewGroup);
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+    }
+
     pub fn open_kill_session_popup(&mut self) {
         if !self.sessions.is_empty() {
             self.popup_mode = Some(PopupMode::ConfirmKill);
@@ -540,6 +667,8 @@ impl UIState {
         self.input_buffer.clear();
         self.input_cursor = 0;
         self.confirm_yes_selected = false;
+        self.group_choices.clear();
+        self.group_choice_index = 0;
     }
 
     pub fn toggle_confirm_selection(&mut self) {
@@ -560,6 +689,17 @@ impl UIState {
         self.sessions
             .get(self.selected_session)
             .map(|s| (s.name.clone(), new_name))
+    }
+
+    /// Get the group name typed in the GroupSession popup. An empty/whitespace
+    /// entry means "remove from any group" and is returned as `None`.
+    pub fn get_group_session_input(&self) -> Option<String> {
+        let trimmed = self.input_buffer.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 
     /// Get the session name to kill (for ConfirmKill popup)
@@ -587,7 +727,8 @@ impl UIState {
             .map(|s| s.name.clone());
 
         self.sessions = sessions;
-        self.session_sort.apply(&mut self.sessions);
+        self.apply_group_labels();
+        self.order_sessions();
 
         if let Some(name) = current_name
             && let Some(idx) = self.sessions.iter().position(|s| s.name == name)
@@ -597,6 +738,152 @@ impl UIState {
 
         self.validate_selections();
         self.last_error = None;
+    }
+
+    /// Stamp each session with its persisted group label. Called whenever fresh
+    /// session data arrives from tmux, since the tmux layer is group-agnostic.
+    fn apply_group_labels(&mut self) {
+        for session in &mut self.sessions {
+            session.group = self.groups.group_of(&session.name);
+        }
+    }
+
+    /// Order the session list: first by the active [`SessionSort`], then cluster
+    /// sessions of the same group together. Because the clustering pass is a
+    /// *stable* sort keyed only on the group, sessions keep their sort order
+    /// within each group, and ungrouped sessions fall to the bottom.
+    fn order_sessions(&mut self) {
+        self.session_sort.apply(&mut self.sessions);
+        self.sessions.sort_by(|a, b| match (&a.group, &b.group) {
+            (Some(x), Some(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+    }
+
+    /// Assign the currently-selected session to `group` (or remove it from any
+    /// group when `group` is `None`/empty), persist the change, and re-order the
+    /// list in place keeping that session highlighted. No tmux round-trip is
+    /// needed — grouping is entirely tmux-deck-side.
+    pub fn assign_selected_group(&mut self, group: Option<String>) {
+        let Some(session) = self.sessions.get(self.selected_session) else {
+            return;
+        };
+        let name = session.name.clone();
+        self.groups.set(&name, group.as_deref());
+        // Reveal the destination group so the user sees the session land, even
+        // if that group was folded.
+        self.collapsed_groups.remove(&group);
+        self.apply_group_labels();
+        self.resort_sessions_preserve_selection();
+    }
+
+    /// Whether any session carries a group label. When false there are no
+    /// headers and folding is a no-op (there is nothing to organise yet).
+    fn any_grouped(&self) -> bool {
+        self.sessions.iter().any(|s| s.group.is_some())
+    }
+
+    /// Whether `group` is currently folded. Folding only takes effect once
+    /// real groups exist, so a stray collapsed entry never hides a flat list.
+    fn is_collapsed(&self, group: &Option<String>) -> bool {
+        self.any_grouped() && self.collapsed_groups.contains(group)
+    }
+
+    /// Whether the session at `index` is the first of its group in the current
+    /// ordering — the row a folded group collapses onto.
+    fn is_group_head(&self, index: usize) -> bool {
+        match self.sessions.get(index) {
+            None => false,
+            Some(s) => index == 0 || self.sessions[index - 1].group != s.group,
+        }
+    }
+
+    /// Whether the cursor may rest on the session at `index`. A session is a
+    /// stop when it is visible, or when it is the head of a folded group — in
+    /// which case the cursor visually sits on that group's (collapsed) header,
+    /// so the group can be re-expanded with `za`.
+    fn is_cursor_stop(&self, index: usize) -> bool {
+        match self.sessions.get(index) {
+            None => false,
+            Some(s) => !self.is_collapsed(&s.group) || self.is_group_head(index),
+        }
+    }
+
+    /// Whether the selection currently sits on a folded group's header rather
+    /// than a visible session. Used by the renderer to highlight the header.
+    pub fn selection_on_folded_header(&self) -> bool {
+        self.sessions
+            .get(self.selected_session)
+            .map(|s| self.is_collapsed(&s.group))
+            .unwrap_or(false)
+    }
+
+    /// Toggle the fold state of the group containing the selected session.
+    /// When folding, the selection collapses onto the group's head so the
+    /// cursor stays on the (now folded) header and the group can be reopened
+    /// with another `za`.
+    pub fn toggle_fold_current_group(&mut self) {
+        if !self.any_grouped() {
+            return;
+        }
+        let Some(session) = self.sessions.get(self.selected_session) else {
+            return;
+        };
+        let group = session.group.clone();
+        if self.collapsed_groups.contains(&group) {
+            self.collapsed_groups.remove(&group);
+        } else {
+            self.collapsed_groups.insert(group.clone());
+            // Park the selection on the group's head so it remains a valid
+            // cursor stop (the folded header) instead of a hidden member.
+            if let Some(head) = self.sessions.iter().position(|s| s.group == group) {
+                self.selected_session = head;
+                self.selected_window = 0;
+                self.selected_pane = 0;
+                self.window_list_state.select(Some(0));
+                self.pane_list_state.select(Some(0));
+            }
+        }
+    }
+
+    fn next_cursor_stop(&self, from: usize) -> Option<usize> {
+        ((from + 1)..self.sessions.len()).find(|&i| self.is_cursor_stop(i))
+    }
+
+    fn prev_cursor_stop(&self, from: usize) -> Option<usize> {
+        (0..from).rev().find(|&i| self.is_cursor_stop(i))
+    }
+
+    /// Build the rendered Sessions rows, inserting group headers and dropping
+    /// the members of folded groups. When no session is grouped the result is a
+    /// flat list of [`SessionRow::Session`] rows (no headers), matching the
+    /// pre-grouping behaviour exactly.
+    pub fn session_rows(&self) -> Vec<SessionRow> {
+        let any_grouped = self.any_grouped();
+        let mut rows = Vec::with_capacity(self.sessions.len());
+        let mut current: Option<&Option<String>> = None;
+        for (index, session) in self.sessions.iter().enumerate() {
+            let collapsed = any_grouped && self.collapsed_groups.contains(&session.group);
+            if any_grouped && current != Some(&session.group) {
+                let count = self
+                    .sessions
+                    .iter()
+                    .filter(|s| s.group == session.group)
+                    .count();
+                rows.push(SessionRow::Header {
+                    group: session.group.clone(),
+                    count,
+                    collapsed,
+                });
+                current = Some(&session.group);
+            }
+            if !collapsed {
+                rows.push(SessionRow::Session { index });
+            }
+        }
+        rows
     }
 
     /// Advance to the next [`SessionSort`] and re-sort the list in place,
@@ -612,7 +899,7 @@ impl UIState {
             .get(self.selected_session)
             .map(|s| s.name.clone());
 
-        self.session_sort.apply(&mut self.sessions);
+        self.order_sessions();
 
         if let Some(name) = current_name
             && let Some(idx) = self.sessions.iter().position(|s| s.name == name)
@@ -689,8 +976,8 @@ impl UIState {
     pub fn tree_move_up(&mut self) {
         match self.focus {
             Focus::Sessions => {
-                if self.selected_session > 0 {
-                    self.selected_session -= 1;
+                if let Some(prev) = self.prev_cursor_stop(self.selected_session) {
+                    self.selected_session = prev;
                     self.selected_window = 0;
                     self.selected_pane = 0;
                     self.window_list_state.select(Some(0));
@@ -718,8 +1005,8 @@ impl UIState {
     pub fn tree_move_down(&mut self) {
         match self.focus {
             Focus::Sessions => {
-                if self.selected_session < self.sessions.len().saturating_sub(1) {
-                    self.selected_session += 1;
+                if let Some(next) = self.next_cursor_stop(self.selected_session) {
+                    self.selected_session = next;
                     self.selected_window = 0;
                     self.selected_pane = 0;
                     self.window_list_state.select(Some(0));
@@ -804,5 +1091,221 @@ impl UIState {
         {
             self.multi_window += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(name: &str) -> TmuxSession {
+        TmuxSession {
+            name: name.to_string(),
+            windows: Vec::new(),
+            has_claude: false,
+            claude_state: None,
+            last_attached: 0,
+            activity: 0,
+            group: None,
+        }
+    }
+
+    /// Build a UIState with an in-memory (no-disk) group store and the given
+    /// assignments, then load `names` as the session list.
+    fn state_with(names: &[&str], groups: &[(&str, &str)]) -> UIState {
+        let mut state = UIState::new(100);
+        state.groups = GroupStore::default();
+        for (sess, grp) in groups {
+            state.groups.set(sess, Some(grp));
+        }
+        state.update_sessions(names.iter().map(|n| session(n)).collect());
+        state
+    }
+
+    #[test]
+    fn ungrouped_sessions_have_no_headers() {
+        let state = state_with(&["a", "b", "c"], &[]);
+        let rows = state.session_rows();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| matches!(r, SessionRow::Session { .. })));
+    }
+
+    #[test]
+    fn grouped_sessions_cluster_with_ungrouped_last() {
+        // a, c -> "work"; b ungrouped. Names tie-break ascending within a group.
+        let state = state_with(&["a", "b", "c"], &[("a", "work"), ("c", "work")]);
+        let ordered: Vec<&str> = state.sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(ordered, vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn rows_insert_one_header_per_group() {
+        let state = state_with(
+            &["a", "b", "c"],
+            &[("a", "work"), ("c", "work"), ("b", "play")],
+        );
+        let rows = state.session_rows();
+        // play(b) sorts before work(a,c) alphabetically; ungrouped bucket absent.
+        let labels: Vec<String> = rows
+            .iter()
+            .filter_map(|r| match r {
+                SessionRow::Header { group, count, .. } => {
+                    Some(format!("{}:{}", group.as_deref().unwrap_or("none"), count))
+                }
+                SessionRow::Session { .. } => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["play:1".to_string(), "work:2".to_string()]);
+    }
+
+    #[test]
+    fn ungrouped_bucket_gets_a_header_when_mixed() {
+        let state = state_with(&["a", "b"], &[("a", "work")]);
+        let rows = state.session_rows();
+        let has_ungrouped_header = rows.iter().any(|r| {
+            matches!(r, SessionRow::Header { group: None, count, .. } if *count == 1)
+        });
+        assert!(has_ungrouped_header);
+    }
+
+    #[test]
+    fn folding_hides_members_but_keeps_header() {
+        // work: a, c ; play: b. Select "a" (in work) and fold its group.
+        let mut state = state_with(
+            &["a", "b", "c"],
+            &[("a", "work"), ("c", "work"), ("b", "play")],
+        );
+        let work_idx = state.sessions.iter().position(|s| s.name == "a").unwrap();
+        state.selected_session = work_idx;
+        state.toggle_fold_current_group();
+
+        let rows = state.session_rows();
+        // No "work" member sessions remain visible, but its header stays
+        // (now marked collapsed); play's member is still shown.
+        let work_collapsed = rows.iter().any(|r| matches!(
+            r,
+            SessionRow::Header { group: Some(g), collapsed: true, .. } if g == "work"
+        ));
+        assert!(work_collapsed);
+        let visible_sessions: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                SessionRow::Session { index } => Some(state.sessions[*index].name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(visible_sessions, vec!["b"]);
+        // Selection parks on the folded group's head, so the cursor sits on the
+        // (collapsed) "work" header and can re-open it.
+        assert!(state.selection_on_folded_header());
+        assert_eq!(state.sessions[state.selected_session].group.as_deref(), Some("work"));
+
+        // Toggling again from the folded header re-expands the group — this is
+        // the regression that previously had no way to recover.
+        state.toggle_fold_current_group();
+        let rows = state.session_rows();
+        let names: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                SessionRow::Session { index } => Some(state.sessions[*index].name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(names.contains(&"a") && names.contains(&"c"));
+        assert!(!state.selection_on_folded_header());
+    }
+
+    #[test]
+    fn navigation_lands_on_folded_group_then_reopens() {
+        let mut state = state_with(
+            &["a", "b", "c"],
+            &[("a", "work"), ("c", "work"), ("b", "play")],
+        );
+        // Order is play(b), work(a,c). Fold work (selection parks on work head).
+        state.selected_session = state.sessions.iter().position(|s| s.name == "a").unwrap();
+        state.toggle_fold_current_group();
+        // From the visible "b", moving down stops on the folded work header
+        // rather than skipping it entirely.
+        state.selected_session = state.sessions.iter().position(|s| s.name == "b").unwrap();
+        state.tree_move_down();
+        assert!(state.selection_on_folded_header());
+        assert_eq!(state.sessions[state.selected_session].group.as_deref(), Some("work"));
+        // And `za` there expands it back.
+        state.toggle_fold_current_group();
+        assert!(!state.selection_on_folded_header());
+    }
+
+    #[test]
+    fn fold_is_noop_without_groups() {
+        let mut state = state_with(&["a", "b"], &[]);
+        state.toggle_fold_current_group();
+        let rows = state.session_rows();
+        // No headers, all sessions still visible.
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| matches!(r, SessionRow::Session { .. })));
+    }
+
+    #[test]
+    fn assigning_group_updates_store_and_order() {
+        let mut state = state_with(&["a", "b"], &[]);
+        state.selected_session = 1; // "b"
+        state.assign_selected_group(Some("work".to_string()));
+        assert_eq!(state.groups.group_of("b"), Some("work".to_string()));
+        // "b" is now grouped and clusters above the ungrouped "a".
+        let ordered: Vec<&str> = state.sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(ordered, vec!["b", "a"]);
+        // Selection still tracks "b" after the reorder.
+        assert_eq!(state.sessions[state.selected_session].name, "b");
+    }
+
+    #[test]
+    fn group_popup_lists_existing_groups_and_highlights_current() {
+        let state = state_with(
+            &["a", "b", "c"],
+            &[("a", "work"), ("b", "personal"), ("c", "work")],
+        );
+        // Sorted, deduplicated existing groups.
+        assert_eq!(state.groups.group_names(), vec!["personal", "work"]);
+
+        let mut state = state;
+        state.selected_session = state.sessions.iter().position(|s| s.name == "b").unwrap();
+        state.open_group_session_popup();
+        assert_eq!(state.popup_mode, Some(PopupMode::GroupSession));
+        // "b" is in "personal", so that entry starts highlighted.
+        assert_eq!(
+            state.selected_group_choice(),
+            GroupChoice::Existing("personal".to_string())
+        );
+        // Entries: 2 groups + Ungrouped + New.
+        assert_eq!(state.group_choice_count(), 4);
+    }
+
+    #[test]
+    fn group_popup_defaults_to_ungrouped_for_ungrouped_session() {
+        let mut state = state_with(&["a", "b"], &[("b", "work")]);
+        state.selected_session = state.sessions.iter().position(|s| s.name == "a").unwrap();
+        state.open_group_session_popup();
+        // Index sits on the "Ungrouped" entry, just past the single group.
+        assert_eq!(state.selected_group_choice(), GroupChoice::Ungrouped);
+    }
+
+    #[test]
+    fn group_choice_navigation_wraps_and_reaches_new() {
+        let mut state = state_with(&["a"], &[("a", "work")]);
+        state.open_group_session_popup();
+        // Entries: ["work", Ungrouped, New]. Starts on "work".
+        assert_eq!(
+            state.selected_group_choice(),
+            GroupChoice::Existing("work".to_string())
+        );
+        state.group_choice_up(); // wraps to last entry
+        assert_eq!(state.selected_group_choice(), GroupChoice::New);
+        state.group_choice_down(); // wraps back to first
+        assert_eq!(
+            state.selected_group_choice(),
+            GroupChoice::Existing("work".to_string())
+        );
+        state.group_choice_down();
+        assert_eq!(state.selected_group_choice(), GroupChoice::Ungrouped);
     }
 }
