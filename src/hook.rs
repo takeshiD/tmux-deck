@@ -79,6 +79,49 @@ fn pane_file_stem(pane: &str) -> String {
 // Reporter: `tmux-deck hook report`
 // =============================================================================
 
+/// Max length of the one-line activity digest stored in a state file. The full
+/// `tool_input` is never persisted — only a short, single-line summary.
+const ACTIVITY_MAX: usize = 80;
+
+/// Collapse a string into a single trimmed line, capped at [`ACTIVITY_MAX`]
+/// chars (with an ellipsis when truncated).
+fn one_line(s: &str) -> String {
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > ACTIVITY_MAX {
+        let head: String = collapsed.chars().take(ACTIVITY_MAX - 1).collect();
+        format!("{head}…")
+    } else {
+        collapsed
+    }
+}
+
+/// Build a short, human-readable description of what Claude is doing, derived
+/// from the hook event and a *digest* of its `tool_input`. Returns `None` for
+/// events that carry no useful activity (e.g. `Stop`). The raw `tool_input` is
+/// intentionally never stored — only this one-line summary.
+fn summarize_activity(event: &str, value: &Value) -> Option<String> {
+    match event {
+        "PreToolUse" | "PostToolUse" => {
+            let tool = value.get("tool_name").and_then(|t| t.as_str())?;
+            let detail = value.get("tool_input").and_then(|i| match tool {
+                "Bash" => i.get("command").and_then(|c| c.as_str()).map(one_line),
+                "Edit" | "Write" | "Read" | "NotebookEdit" => {
+                    i.get("file_path").and_then(|f| f.as_str()).map(one_line)
+                }
+                "Grep" | "Glob" => i.get("pattern").and_then(|p| p.as_str()).map(one_line),
+                _ => None,
+            });
+            Some(match detail {
+                Some(d) => format!("{tool}: {d}"),
+                None => tool.to_string(),
+            })
+        }
+        "Notification" => value.get("message").and_then(|m| m.as_str()).map(one_line),
+        "UserPromptSubmit" => Some("prompt submitted".to_string()),
+        _ => None,
+    }
+}
+
 /// Entry point for `tmux-deck hook report`.
 ///
 /// Always exits quietly (the caller — Claude — should never be disrupted by a
@@ -93,15 +136,14 @@ pub fn run_report() {
         _ => return,
     };
 
-    let event = serde_json::from_str::<Value>(&input)
-        .ok()
-        .and_then(|v| {
-            v.get("hook_event_name")
-                .and_then(|e| e.as_str())
-                .map(String::from)
-        });
-    let event = match event {
-        Some(e) => e,
+    // Parse the whole payload once: besides the event name we now mine it for
+    // the activity detail (tool, cwd, message, ...) shown in the dashboard.
+    let value = match serde_json::from_str::<Value>(&input) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let event = match value.get("hook_event_name").and_then(|e| e.as_str()) {
+        Some(e) => e.to_string(),
         None => return,
     };
 
@@ -114,13 +156,47 @@ pub fn run_report() {
 
     match ClaudeState::from_hook_event(&event) {
         Some(state) => {
-            let record = json!({
-                "pane": pane,
-                "state": state.as_token(),
-                "event": event,
-                "ts": now_secs(),
-            });
-            let _ = std::fs::write(&file, record.to_string());
+            let now = now_secs();
+
+            // `state_since` marks when the *current* state began, so the UI can
+            // show how long a pane has been working/waiting. Carry it forward
+            // while the state is unchanged; reset it on any transition.
+            let prev = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+            let same_state = prev
+                .as_ref()
+                .and_then(|p| p.get("state").and_then(|s| s.as_str()))
+                == Some(state.as_token());
+            let state_since = if same_state {
+                prev.as_ref()
+                    .and_then(|p| p.get("state_since").and_then(|t| t.as_i64()))
+                    .unwrap_or(now)
+            } else {
+                now
+            };
+
+            let mut record = serde_json::Map::new();
+            record.insert("pane".into(), json!(pane));
+            record.insert("state".into(), json!(state.as_token()));
+            record.insert("event".into(), json!(event));
+            record.insert("ts".into(), json!(now));
+            record.insert("state_since".into(), json!(state_since));
+            // Optional context, only stored when present. `tool_input` itself is
+            // never persisted — only the one-line `activity` digest below.
+            if let Some(s) = value.get("session_id").and_then(|s| s.as_str()) {
+                record.insert("session_id".into(), json!(s));
+            }
+            if let Some(c) = value.get("cwd").and_then(|c| c.as_str()) {
+                record.insert("cwd".into(), json!(c));
+            }
+            if let Some(t) = value.get("tool_name").and_then(|t| t.as_str()) {
+                record.insert("tool_name".into(), json!(t));
+            }
+            if let Some(a) = summarize_activity(&event, &value) {
+                record.insert("activity".into(), json!(a));
+            }
+            let _ = std::fs::write(&file, Value::Object(record).to_string());
         }
         None => {
             // SessionEnd (and any other terminal/unmapped event) clears the
@@ -357,6 +433,37 @@ mod tests {
     fn pane_file_stem_is_safe() {
         assert_eq!(pane_file_stem("%3"), "_3");
         assert_eq!(pane_file_stem("%12"), "_12");
+    }
+
+    #[test]
+    fn one_line_collapses_and_caps() {
+        // Newlines and runs of whitespace collapse to single spaces.
+        assert_eq!(one_line("cargo   test\n--all"), "cargo test --all");
+        // Long input is truncated with an ellipsis and never exceeds the cap.
+        let long = "x".repeat(200);
+        let out = one_line(&long);
+        assert!(out.chars().count() <= ACTIVITY_MAX);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn summarize_activity_digests_tool_input() {
+        // Tool calls become "<tool>: <digest>"; the raw input is never echoed.
+        let edit = json!({
+            "tool_name": "Edit",
+            "tool_input": { "file_path": "src/app.rs", "new_string": "SECRET" }
+        });
+        let s = summarize_activity("PreToolUse", &edit).unwrap();
+        assert_eq!(s, "Edit: src/app.rs");
+        assert!(!s.contains("SECRET"));
+
+        // Notifications surface their message; Stop carries no activity.
+        let note = json!({ "message": "needs your permission" });
+        assert_eq!(
+            summarize_activity("Notification", &note).as_deref(),
+            Some("needs your permission")
+        );
+        assert_eq!(summarize_activity("Stop", &json!({})), None);
     }
 
     #[test]
