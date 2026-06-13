@@ -8,7 +8,7 @@ Monitoring multi session Realtime preview.
 - 📄 Easy management Windows and Panes between Sessions
 - 👀 Realtime Preview
 - 🤖 Claude Code status markers (working / waiting / done) driven by hooks
-- 🛰️ Claude fleet dashboard (`d`): a live grid mirroring every Claude agent's screen; `Tab` to focus, `Enter` to attach
+- 🛰️ Claude fleet dashboard (`d`): agent-view-style list grouped by attention (Needs input / Working / Completed); `Space` to peek & reply, `Enter` to attach
 - ⚙️ Easy Configure
 
 # Quick Start

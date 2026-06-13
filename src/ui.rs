@@ -459,130 +459,163 @@ fn format_elapsed(secs: Option<i64>) -> String {
     }
 }
 
-/// Render the fleet dashboard: a grid of live mirrors, one tile per Claude
-/// pane, each showing the agent's real captured screen. `Tab`/arrows move the
-/// focus between tiles; `Enter` attaches to the focused agent.
+/// Render the fleet dashboard: an agent-view-style list of Claude panes,
+/// grouped by attention (Needs input / Working / Completed). `Space` peeks the
+/// selected pane (latest output + reply), `Enter` attaches.
 fn render_dashboard(frame: &mut Frame, state: &UIState) {
     let area = frame.area();
     let theme = state.theme;
 
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
-    let grid_area = chunks[0];
+    let list_area = chunks[0];
     let status_area = chunks[1];
 
     let rows = state.dashboard_rows();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Claude Fleet ({}) ", rows.len()));
 
     if rows.is_empty() {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Claude Fleet (0) ");
         let empty = Paragraph::new(
             "No panes are running Claude.\n\nStart Claude in a pane (and `tmux-deck hook install` for live state).",
         )
         .style(Style::default().fg(theme.unfocus_border))
         .block(block);
-        frame.render_widget(empty, grid_area);
+        frame.render_widget(empty, list_area);
         render_dashboard_status_bar(frame, state, status_area);
         return;
     }
 
-    let focused = state.dashboard_selected.min(rows.len() - 1);
+    let selected = state.dashboard_selected.min(rows.len() - 1);
 
-    // Near-square grid: `cols` columns, enough rows to hold every tile.
-    let cols = (rows.len() as f64).sqrt().ceil() as usize;
-    let grid_rows = rows.len().div_ceil(cols);
-
-    let row_areas = Layout::vertical(
-        std::iter::repeat_n(Constraint::Ratio(1, grid_rows as u32), grid_rows).collect::<Vec<_>>(),
-    )
-    .split(grid_area);
-
-    for (r, row_area) in row_areas.iter().enumerate() {
-        let col_areas = Layout::horizontal(
-            std::iter::repeat_n(Constraint::Ratio(1, cols as u32), cols).collect::<Vec<_>>(),
-        )
-        .split(*row_area);
-        for (c, cell_area) in col_areas.iter().enumerate() {
-            let idx = r * cols + c;
-            if let Some(row) = rows.get(idx) {
-                render_dashboard_tile(frame, state, row, *cell_area, idx == focused);
-            }
+    // Build list items, inserting a header line whenever the group changes.
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut last_group: Option<crate::app::DashboardGroup> = None;
+    for (idx, row) in rows.iter().enumerate() {
+        let group = row.group();
+        if last_group != Some(group) {
+            items.push(ListItem::new(Line::from(Span::styled(
+                group.label().to_string(),
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ))));
+            last_group = Some(group);
         }
+        items.push(dashboard_row_item(state, row, idx == selected));
     }
 
+    frame.render_widget(List::new(items).block(block), list_area);
     render_dashboard_status_bar(frame, state, status_area);
+
+    if state.dashboard_peek {
+        render_dashboard_peek(frame, state, area, &rows[selected]);
+    }
 }
 
-/// Render one dashboard tile: a bordered mirror of a single Claude pane.
-fn render_dashboard_tile(
-    frame: &mut Frame,
-    state: &UIState,
-    row: &DashboardRow,
-    area: Rect,
-    focused: bool,
-) {
+/// One list row: state marker, session:pane, activity summary, elapsed time.
+fn dashboard_row_item<'a>(state: &UIState, row: &DashboardRow, selected: bool) -> ListItem<'a> {
     let theme = state.theme;
     let (glyph, color) = claude_marker(&state.hooks.claude, row.state, true)
         .unwrap_or_else(|| ("•".to_string(), theme.unfocus_border));
 
-    let border_style = if focused {
-        Style::default().fg(theme.focus_border).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(color)
-    };
+    let cursor = if selected { "▌" } else { " " };
+    let activity = row.activity.clone().unwrap_or_else(|| "—".to_string());
+    let line = Line::from(vec![
+        Span::styled(format!("{cursor}{glyph} "), Style::default().fg(color)),
+        Span::styled(
+            format!("{:<18} ", format!("{}:{}", row.session, row.pane_id)),
+            Style::default().fg(theme.focus_border),
+        ),
+        Span::raw(format!("{activity:<44} ")),
+        Span::styled(
+            format!("{:>5}", format_elapsed(row.elapsed_secs)),
+            Style::default().fg(theme.unfocus_border),
+        ),
+    ]);
 
-    let mut title = vec![
+    let style = if selected {
+        Style::default().bg(theme.selection_bg).fg(theme.selection_fg)
+    } else {
+        Style::default()
+    };
+    ListItem::new(line).style(style)
+}
+
+/// A rect centred in `area`, sized as a percentage of it.
+fn centered_rect(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
+    let w = area.width * pct_w / 100;
+    let h = area.height * pct_h / 100;
+    Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+/// Centred peek overlay: the selected pane's latest captured output plus a
+/// reply line. Mirrors the agent view's Space peek.
+fn render_dashboard_peek(frame: &mut Frame, state: &UIState, area: Rect, row: &DashboardRow) {
+    let theme = state.theme;
+    let popup = centered_rect(80, 70, area);
+    frame.render_widget(Clear, popup);
+
+    let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(popup);
+    let content_area = outer[0];
+    let reply_area = outer[1];
+
+    let (glyph, color) = claude_marker(&state.hooks.claude, row.state, true)
+        .unwrap_or_else(|| ("•".to_string(), theme.unfocus_border));
+    let title = Line::from(vec![
         Span::styled(format!(" {glyph} "), Style::default().fg(color)),
         Span::styled(
             format!("{}:{} ", row.session, row.pane_id),
-            Style::default().fg(theme.focus_border),
+            Style::default().fg(theme.focus_border).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("{} ", claude_state_label(row.state)),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            Style::default().fg(color),
         ),
-    ];
-    if let Some(elapsed) = row.elapsed_secs {
-        title.push(Span::styled(
-            format!("{} ", format_elapsed(Some(elapsed))),
-            Style::default().fg(theme.unfocus_border),
-        ));
-    }
-
-    let block = Block::default()
+    ]);
+    let content_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(Line::from(title));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    // Tile body: tail of the live capture so the latest output is visible.
+        .border_style(Style::default().fg(theme.accent))
+        .title(title);
+    let inner = content_block.inner(content_area);
     let max_lines = inner.height as usize;
     let body = match state.dashboard_capture(&row.target) {
         Some(parsed) if !parsed.lines.is_empty() => {
             let start = parsed.lines.len().saturating_sub(max_lines);
             Text::from(parsed.lines[start..].to_vec())
         }
-        _ => {
-            let hint = row.activity.clone().unwrap_or_else(|| "capturing…".to_string());
-            Text::styled(hint, Style::default().fg(theme.unfocus_border))
-        }
+        _ => Text::styled("capturing…", Style::default().fg(theme.unfocus_border)),
     };
-    frame.render_widget(Paragraph::new(body), inner);
+    frame.render_widget(Paragraph::new(body).block(content_block), content_area);
+
+    // Reply line: typed text is sent to the pane (with Enter) on submit.
+    let reply_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.focus_border))
+        .title(" reply → Enter sends · Esc closes · ↑↓ peek · → attach ");
+    let reply = Paragraph::new(Line::from(vec![
+        Span::styled("> ", Style::default().fg(theme.accent)),
+        Span::raw(state.input_buffer.clone()),
+    ]))
+    .block(reply_block);
+    frame.render_widget(reply, reply_area);
 }
 
 fn render_dashboard_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
     let theme = state.theme;
     let kb = &state.keybindings;
     let status_text = Line::from(vec![
-        Span::styled("Tab", Style::default().fg(theme.focus_border)),
-        Span::raw(":focus "),
+        Span::styled("j/k", Style::default().fg(theme.focus_border)),
+        Span::raw(":move "),
+        Span::styled("Space", Style::default().fg(theme.highlight)),
+        Span::raw(":peek "),
         Span::styled(kb.label(Action::Enter), Style::default().fg(theme.highlight)),
         Span::raw(":attach "),
         Span::styled(kb.label(Action::Dashboard), Style::default().fg(theme.focus_border)),
         Span::raw(":back "),
-        Span::styled(kb.label(Action::Refresh), Style::default().fg(theme.focus_border)),
-        Span::raw(":refresh "),
         Span::styled(kb.label(Action::Quit), Style::default().fg(theme.focus_border)),
         Span::raw(":quit"),
     ]);
@@ -1140,9 +1173,9 @@ mod cursor_alignment_tests {
     }
 
     #[test]
-    fn dashboard_grid_renders_tiles_without_panic() {
-        // Three Claude panes -> a 2-col grid with one trailing empty cell.
-        // Exercises the grid layout, tile capture/tail and focus highlight.
+    fn dashboard_list_and_peek_render_without_panic() {
+        // Three Claude panes across the attention groups. Exercises the grouped
+        // list (headers + selection) and the peek overlay with reply text.
         fn pane(id: &str, idx: u32, st: Option<ClaudeState>) -> TmuxPane {
             TmuxPane {
                 id: id.to_string(),
@@ -1185,6 +1218,12 @@ mod cursor_alignment_tests {
         state.update_dashboard_capture("s:0.0".to_string(), "line1\nline2".to_string());
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        // Grouped list.
+        term.draw(|f| render_ui(f, &mut state)).unwrap();
+        // Peek overlay with a reply in progress.
+        state.open_dashboard_peek();
+        state.input_char('h');
+        state.input_char('i');
         term.draw(|f| render_ui(f, &mut state)).unwrap();
     }
 }

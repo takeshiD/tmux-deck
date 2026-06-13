@@ -183,6 +183,46 @@ pub enum ViewMode {
     Dashboard,
 }
 
+/// Attention groups for the fleet list, mirroring Claude Code's agent view.
+/// Sessions needing the user float to the top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardGroup {
+    NeedsInput,
+    Working,
+    Completed,
+}
+
+impl DashboardGroup {
+    /// Which group a pane state belongs to. `None` (running, no hook state yet)
+    /// is treated as Working; `Error` is collected under Completed like the
+    /// agent view does.
+    pub fn of(state: Option<ClaudeState>) -> Self {
+        match state {
+            Some(ClaudeState::Waiting) => Self::NeedsInput,
+            Some(ClaudeState::Working) | None => Self::Working,
+            Some(ClaudeState::Done) | Some(ClaudeState::Error) => Self::Completed,
+        }
+    }
+
+    /// Display order (smaller = higher up): attention first.
+    fn order(self) -> u8 {
+        match self {
+            Self::NeedsInput => 0,
+            Self::Working => 1,
+            Self::Completed => 2,
+        }
+    }
+
+    /// Header label shown above the group.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NeedsInput => "Needs input",
+            Self::Working => "Working",
+            Self::Completed => "Completed",
+        }
+    }
+}
+
 /// One row of the fleet dashboard: a single pane running Claude, with the
 /// context needed to render it and to jump to it.
 #[derive(Debug, Clone)]
@@ -196,6 +236,14 @@ pub struct DashboardRow {
     pub state: Option<ClaudeState>,
     pub activity: Option<String>,
     pub elapsed_secs: Option<i64>,
+    /// Visible pane height, used to size the peek capture.
+    pub height: u32,
+}
+
+impl DashboardRow {
+    pub fn group(&self) -> DashboardGroup {
+        DashboardGroup::of(self.state)
+    }
 }
 
 /// Focus area in TreeView mode
@@ -425,10 +473,11 @@ pub struct UIState {
 
     /// Focused tile index in the fleet dashboard grid (`ViewMode::Dashboard`).
     pub dashboard_selected: usize,
-    /// Live captured screen content per Claude pane, keyed by tmux target
-    /// (`session:window.pane`). Refreshed while the dashboard is open so each
-    /// tile mirrors the agent's real TUI.
+    /// Captured screen content keyed by tmux target (`session:window.pane`),
+    /// used to populate the peek panel for the selected pane.
     pub dashboard_captures: HashMap<String, Text<'static>>,
+    /// Whether the peek panel (latest output + reply) is open.
+    pub dashboard_peek: bool,
 
     // Shared state
     pub pane_content: String,
@@ -493,6 +542,7 @@ impl UIState {
 
             dashboard_selected: 0,
             dashboard_captures: HashMap::new(),
+            dashboard_peek: false,
 
             pane_content: String::new(),
             pane_content_parsed: None,
@@ -582,10 +632,11 @@ impl UIState {
     // Fleet Dashboard
     // =========================================================================
 
-    /// Toggle the fleet dashboard on/off. Entering it resets the focus and
-    /// drops any stale captures so tiles repopulate from scratch.
+    /// Toggle the fleet dashboard on/off. Entering it resets the selection and
+    /// drops stale captures; leaving it also closes any open peek panel.
     pub fn toggle_dashboard(&mut self) {
         if self.view_mode == ViewMode::Dashboard {
+            self.close_dashboard_peek();
             self.view_mode = ViewMode::TreeView;
         } else {
             self.dashboard_selected = 0;
@@ -594,32 +645,14 @@ impl UIState {
         }
     }
 
-    /// tmux targets + visible height of every Claude pane, used to schedule the
-    /// periodic capture that feeds the dashboard tiles.
-    pub fn claude_capture_targets(&self) -> Vec<(String, i32)> {
-        let mut out = Vec::new();
-        for session in &self.sessions {
-            for window in &session.windows {
-                for pane in &window.panes {
-                    if pane.claude_state.is_some() || pane.has_claude {
-                        let target = format!("{}:{}.{}", session.name, window.index, pane.index);
-                        let height = i32::try_from(pane.height).unwrap_or(i32::MAX);
-                        out.push((target, height));
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// Store a freshly captured pane screen for the dashboard, parsing ANSI.
+    /// Store a freshly captured pane screen for the peek panel, parsing ANSI.
     pub fn update_dashboard_capture(&mut self, target: String, content: String) {
         if let Ok(text) = content.as_bytes().into_text() {
             self.dashboard_captures.insert(target, text);
         }
     }
 
-    /// Captured screen for a dashboard tile, if one has arrived yet.
+    /// Captured screen for a pane, if one has arrived yet.
     pub fn dashboard_capture(&self, target: &str) -> Option<&Text<'static>> {
         self.dashboard_captures.get(target)
     }
@@ -627,9 +660,9 @@ impl UIState {
     /// All panes running Claude across every session: any pane with a hook
     /// state, plus panes where a Claude process is detected even if no hook
     /// event has arrived yet (or hooks are not installed) — those show with a
-    /// `None` state. Sorted by attention priority (Waiting → Error → Working →
-    /// Done → unknown) and then by how long they have been in that state
-    /// (longest first), so a stuck/old item floats up within its group.
+    /// `None` state. Ordered by attention group (Needs input → Working →
+    /// Completed) and, within a group, longest-in-state first so a stuck/old
+    /// item floats up.
     pub fn dashboard_rows(&self) -> Vec<DashboardRow> {
         let mut rows: Vec<DashboardRow> = Vec::new();
         for session in &self.sessions {
@@ -645,22 +678,22 @@ impl UIState {
                         state: pane.claude_state,
                         activity: pane.claude_activity.clone(),
                         elapsed_secs: pane.claude_state_elapsed_secs(),
+                        height: pane.height,
                     });
                 }
             }
         }
-        // A known state outranks an unknown (running-only) one; within a tier,
-        // the longer-running item comes first.
-        let rank = |s: Option<ClaudeState>| s.map(|s| i16::from(s.priority())).unwrap_or(-1);
         rows.sort_by(|a, b| {
-            rank(b.state)
-                .cmp(&rank(a.state))
+            a.group()
+                .order()
+                .cmp(&b.group().order())
                 .then(b.elapsed_secs.cmp(&a.elapsed_secs))
         });
         rows
     }
 
-    /// Move tile focus to the previous Claude pane (wraps around).
+    /// Move the list selection to the previous Claude pane (wraps around).
+    /// Refreshing the capture target invalidates a stale peek capture.
     pub fn dashboard_focus_prev(&mut self) {
         let len = self.dashboard_rows().len();
         if len > 0 {
@@ -668,7 +701,7 @@ impl UIState {
         }
     }
 
-    /// Move tile focus to the next Claude pane (wraps around).
+    /// Move the list selection to the next Claude pane (wraps around).
     pub fn dashboard_focus_next(&mut self) {
         let len = self.dashboard_rows().len();
         if len > 0 {
@@ -676,11 +709,40 @@ impl UIState {
         }
     }
 
-    /// tmux target of the currently highlighted dashboard row, if any.
+    /// tmux target of the currently selected dashboard row, if any.
     pub fn get_dashboard_target(&self) -> Option<String> {
         self.dashboard_rows()
             .get(self.dashboard_selected)
             .map(|r| r.target.clone())
+    }
+
+    /// tmux target + capture height of the selected row, used to refresh the
+    /// peek panel content each tick.
+    pub fn dashboard_capture_target(&self) -> Option<(String, i32)> {
+        self.dashboard_rows().get(self.dashboard_selected).map(|r| {
+            (r.target.clone(), i32::try_from(r.height).unwrap_or(i32::MAX))
+        })
+    }
+
+    // =========================================================================
+    // Dashboard peek panel
+    // =========================================================================
+
+    /// Open the peek panel for the selected pane and start a reply buffer.
+    pub fn open_dashboard_peek(&mut self) {
+        if self.dashboard_rows().is_empty() {
+            return;
+        }
+        self.dashboard_peek = true;
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+    }
+
+    /// Close the peek panel, discarding any unsent reply text.
+    pub fn close_dashboard_peek(&mut self) {
+        self.dashboard_peek = false;
+        self.input_buffer.clear();
+        self.input_cursor = 0;
     }
 
     // =========================================================================

@@ -135,7 +135,11 @@ impl UIActor {
                                     }
                                 }
                                 ViewMode::Dashboard => {
-                                    for (target, height) in self.state.claude_capture_targets() {
+                                    // Capture only the selected pane; its content
+                                    // feeds the peek panel.
+                                    if let Some((target, height)) =
+                                        self.state.dashboard_capture_target()
+                                    {
                                         let _ = self
                                             .tmux_capture_tx
                                             .send(TmuxCommand::CapturePane {
@@ -182,6 +186,11 @@ impl UIActor {
             // Handle popup mode first
             if let Some(popup_mode) = self.state.popup_mode {
                 return self.handle_popup_key(key, popup_mode).await;
+            }
+
+            // The dashboard peek panel captures keys while open (reply + nav).
+            if self.state.dashboard_peek {
+                return self.handle_dashboard_peek_key(key).await;
             }
 
             // Handle input mode
@@ -345,7 +354,13 @@ impl UIActor {
                     return Ok(false);
                 }
                 KeyCode::Char(' ') => {
-                    self.state.handle_space_press();
+                    // In the dashboard, Space opens the peek panel; elsewhere it
+                    // drives the double-Space view toggle.
+                    if self.state.view_mode == ViewMode::Dashboard {
+                        self.state.open_dashboard_peek();
+                    } else {
+                        self.state.handle_space_press();
+                    }
                     return Ok(false);
                 }
                 _ => {}
@@ -451,6 +466,63 @@ impl UIActor {
         Ok(())
     }
 
+    /// Keys while the dashboard peek panel is open: edit/send a reply, peek
+    /// adjacent rows, attach, or close.
+    async fn handle_dashboard_peek_key(&mut self, key: event::KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => self.state.close_dashboard_peek(),
+            // Up/Down peek the neighbouring session without leaving the panel.
+            KeyCode::Up => self.state.dashboard_focus_prev(),
+            KeyCode::Down => self.state.dashboard_focus_next(),
+            // Right attaches to the peeked session.
+            KeyCode::Right => {
+                if let Some(target) = self.state.get_dashboard_target() {
+                    self.state.close_dashboard_peek();
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let _ = self
+                        .tmux_cmd_tx
+                        .send(TmuxCommand::SwitchClient {
+                            target,
+                            reply: Some(reply_tx),
+                        })
+                        .await;
+                    let _ = reply_rx.await;
+                    if self.state.behavior.exit_on_switch {
+                        return Ok(true);
+                    }
+                }
+            }
+            // Enter sends the typed reply to the peeked pane (text + Enter).
+            KeyCode::Enter => {
+                let keys = self.state.input_buffer.clone();
+                if !keys.is_empty()
+                    && let Some(target) = self.state.get_dashboard_target()
+                {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let _ = self
+                        .tmux_cmd_tx
+                        .send(TmuxCommand::SendKeys {
+                            target,
+                            keys,
+                            reply: Some(reply_tx),
+                        })
+                        .await;
+                    let _ = reply_rx.await;
+                    self.state.input_buffer.clear();
+                    self.state.input_cursor = 0;
+                }
+            }
+            KeyCode::Backspace => self.state.input_backspace(),
+            KeyCode::Delete => self.state.input_delete(),
+            KeyCode::Left => self.state.input_move_left(),
+            KeyCode::Home => self.state.input_move_home(),
+            KeyCode::End => self.state.input_move_end(),
+            KeyCode::Char(c) => self.state.input_char(c),
+            _ => {}
+        }
+        Ok(false)
+    }
+
     fn handle_navigation_key(&mut self, code: KeyCode) {
         match self.state.view_mode {
             ViewMode::TreeView => match code {
@@ -470,16 +542,12 @@ impl UIActor {
                 _ => {}
             },
             ViewMode::Dashboard => match code {
-                KeyCode::Tab
-                | KeyCode::Down
-                | KeyCode::Right
-                | KeyCode::Char('j')
-                | KeyCode::Char('l') => self.state.dashboard_focus_next(),
-                KeyCode::BackTab
-                | KeyCode::Up
-                | KeyCode::Left
-                | KeyCode::Char('k')
-                | KeyCode::Char('h') => self.state.dashboard_focus_prev(),
+                KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                    self.state.dashboard_focus_next()
+                }
+                KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+                    self.state.dashboard_focus_prev()
+                }
                 _ => {}
             },
         }
