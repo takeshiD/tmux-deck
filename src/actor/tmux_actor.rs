@@ -766,6 +766,9 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                             pid,
                             has_claude: false,
                             claude_state: None,
+                            claude_activity: None,
+                            claude_state_since: None,
+                            claude_cwd: None,
                         },
                     ));
                 }
