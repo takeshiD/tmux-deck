@@ -4,8 +4,8 @@ use ratatui::{
 };
 
 use crate::app::{
-    ClaudeState, Focus, InputMode, PopupMode, SessionRow, TmuxPane, TmuxWindow, UIState,
-    UNGROUPED_LABEL, ViewMode,
+    ClaudeState, DashboardRow, Focus, InputMode, PopupMode, SessionRow, TmuxPane, TmuxWindow,
+    UIState, UNGROUPED_LABEL, ViewMode,
 };
 use crate::config::{Action, MarkerSet, Theme};
 
@@ -75,6 +75,7 @@ pub fn render_ui(frame: &mut Frame, state: &mut UIState) {
     match state.view_mode {
         ViewMode::TreeView => render_tree_view(frame, state),
         ViewMode::MultiPreview => render_multi_preview(frame, state),
+        ViewMode::Dashboard => render_dashboard(frame, state),
     }
 
     // Render input popup if in input mode
@@ -413,6 +414,8 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
             Span::raw(":fold "),
             Span::styled("Space×2", Style::default().fg(theme.highlight)),
             Span::raw(":multi "),
+            Span::styled(kb.label(Action::Dashboard), Style::default().fg(theme.focus_border)),
+            Span::raw(":fleet "),
             Span::styled(kb.label(Action::NewSession), Style::default().fg(theme.success)),
             Span::raw(":new "),
             Span::styled(kb.label(Action::RenameSession), Style::default().fg(theme.success)),
@@ -424,6 +427,120 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
         ])
     };
 
+    frame.render_widget(
+        Paragraph::new(status_text).style(Style::default().bg(theme.status_bar_bg)),
+        area,
+    );
+}
+
+// =============================================================================
+// Fleet Dashboard Rendering
+// =============================================================================
+
+/// Short uppercase label for a Claude state, used in the dashboard rows.
+fn claude_state_label(state: ClaudeState) -> &'static str {
+    match state {
+        ClaudeState::Waiting => "WAITING",
+        ClaudeState::Error => "ERROR",
+        ClaudeState::Working => "WORKING",
+        ClaudeState::Done => "DONE",
+    }
+}
+
+/// Human-friendly elapsed time: `12s`, `3m`, `2h`. `None` renders as `-`.
+fn format_elapsed(secs: Option<i64>) -> String {
+    match secs {
+        None => "-".to_string(),
+        Some(s) if s < 60 => format!("{s}s"),
+        Some(s) if s < 3600 => format!("{}m", s / 60),
+        Some(s) => format!("{}h", s / 3600),
+    }
+}
+
+/// Render the fleet dashboard: every pane running Claude, sorted by attention
+/// priority, with a one-line activity digest and how long it has been in its
+/// current state. Enter switches to the highlighted pane.
+fn render_dashboard(frame: &mut Frame, state: &UIState) {
+    let area = frame.area();
+    let theme = state.theme;
+
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    let list_area = chunks[0];
+    let status_area = chunks[1];
+
+    let rows = state.dashboard_rows();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Claude Fleet ({}) ", rows.len()));
+
+    if rows.is_empty() {
+        let empty = Paragraph::new("No panes are running Claude.")
+            .style(Style::default().fg(theme.unfocus_border))
+            .block(block);
+        frame.render_widget(empty, list_area);
+    } else {
+        let selected = state.dashboard_selected.min(rows.len() - 1);
+        let items: Vec<ListItem> = rows
+            .iter()
+            .enumerate()
+            .map(|(idx, row)| dashboard_item(state, row, idx == selected))
+            .collect();
+        frame.render_widget(List::new(items).block(block), list_area);
+    }
+
+    render_dashboard_status_bar(frame, state, status_area);
+}
+
+/// Build a single dashboard row line.
+fn dashboard_item<'a>(state: &UIState, row: &DashboardRow, selected: bool) -> ListItem<'a> {
+    let theme = state.theme;
+    let (glyph, color) = claude_marker(&state.hooks.claude, Some(row.state), true)
+        .unwrap_or_else(|| ("•".to_string(), theme.unfocus_border));
+
+    let activity = row.activity.clone().unwrap_or_else(|| "—".to_string());
+    let line = Line::from(vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(color)),
+        Span::styled(
+            format!("{:<7} ", claude_state_label(row.state)),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{}:{:<6} ", row.session, row.pane_id),
+            Style::default().fg(theme.focus_border),
+        ),
+        Span::raw(format!("{activity:<40} ")),
+        Span::styled(
+            format!("{:>5}", format_elapsed(row.elapsed_secs)),
+            Style::default().fg(theme.unfocus_border),
+        ),
+    ]);
+
+    let style = if selected {
+        Style::default()
+            .bg(theme.selection_bg)
+            .fg(theme.selection_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    ListItem::new(line).style(style)
+}
+
+fn render_dashboard_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
+    let theme = state.theme;
+    let kb = &state.keybindings;
+    let status_text = Line::from(vec![
+        Span::styled("j/k", Style::default().fg(theme.focus_border)),
+        Span::raw(":move "),
+        Span::styled(kb.label(Action::Enter), Style::default().fg(theme.highlight)),
+        Span::raw(":jump "),
+        Span::styled(kb.label(Action::Dashboard), Style::default().fg(theme.focus_border)),
+        Span::raw(":back "),
+        Span::styled(kb.label(Action::Refresh), Style::default().fg(theme.focus_border)),
+        Span::raw(":refresh "),
+        Span::styled(kb.label(Action::Quit), Style::default().fg(theme.focus_border)),
+        Span::raw(":quit"),
+    ]);
     frame.render_widget(
         Paragraph::new(status_text).style(Style::default().bg(theme.status_bar_bg)),
         area,
@@ -917,6 +1034,16 @@ mod cursor_alignment_tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
 
+    #[test]
+    fn format_elapsed_scales_units() {
+        assert_eq!(format_elapsed(None), "-");
+        assert_eq!(format_elapsed(Some(0)), "0s");
+        assert_eq!(format_elapsed(Some(59)), "59s");
+        assert_eq!(format_elapsed(Some(60)), "1m");
+        assert_eq!(format_elapsed(Some(3599)), "59m");
+        assert_eq!(format_elapsed(Some(3600)), "1h");
+    }
+
     /// 白背景（カーソルブロック）のセルの (x, y) を返す。
     fn cursor_cell(buf: &ratatui::buffer::Buffer) -> Option<(u16, u16)> {
         for y in 0..buf.area.height {
@@ -956,5 +1083,14 @@ mod cursor_alignment_tests {
         let empty = render_name_popup_cursor("").expect("cursor visible when empty");
         let jp = render_name_popup_cursor("あい").expect("cursor visible with text");
         assert_eq!(empty.1, jp.1, "cursor row must not shift with multibyte input");
+    }
+
+    #[test]
+    fn dashboard_renders_without_panic() {
+        // Empty fleet: exercises the empty-state and status-bar paths.
+        let mut state = UIState::new(crate::config::Config::default());
+        state.view_mode = ViewMode::Dashboard;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render_ui(f, &mut state)).unwrap();
     }
 }

@@ -61,6 +61,7 @@ enter          = "Enter"
 new_session    = "C-n"
 rename_session = "C-r"
 kill_session   = "C-x"
+dashboard      = "d"            # toggle the Claude fleet dashboard
 
 # -----------------------------------------------------------------------------
 # Markers shown for hook-driven agent states. Each marker has a `glyph` and a
