@@ -113,6 +113,27 @@ pub struct TmuxPane {
     pub has_claude: bool,
     /// Latest state reported by Claude Code hooks for this pane, if any.
     pub claude_state: Option<ClaudeState>,
+    /// One-line summary of what Claude is currently doing (e.g. `Edit: src/app.rs`),
+    /// sourced from the hook activity digest. `None` when unknown.
+    /// Consumed by the fleet dashboard (#21).
+    #[allow(dead_code)]
+    pub claude_activity: Option<String>,
+    /// Unix timestamp (secs) when the current Claude state began. Used to show
+    /// how long a pane has been working/waiting.
+    #[allow(dead_code)]
+    pub claude_state_since: Option<i64>,
+    /// Working directory Claude reported for this pane (repo identification).
+    #[allow(dead_code)]
+    pub claude_cwd: Option<String>,
+}
+
+impl TmuxPane {
+    /// Seconds elapsed since the current Claude state began, if known.
+    #[allow(dead_code)]
+    pub fn claude_state_elapsed_secs(&self) -> Option<i64> {
+        self.claude_state_since
+            .map(|since| crate::hook::now_secs().saturating_sub(since).max(0))
+    }
 }
 
 /// Represents a tmux window with captured content

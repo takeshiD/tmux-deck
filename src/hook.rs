@@ -59,7 +59,9 @@ fn state_dir() -> Option<PathBuf> {
     Some(base.join("claude"))
 }
 
-fn now_secs() -> i64 {
+/// Current Unix time in seconds. Public so the UI can compute how long a pane
+/// has been in its current Claude state (`now - state_since`).
+pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -212,9 +214,20 @@ pub fn run_report() {
 // Reader: fold state files into the session tree
 // =============================================================================
 
-/// Load the current per-pane states, keyed by tmux pane id (`%N`).
+/// The per-pane Claude context read back from a state file. `state` is the only
+/// required field; the rest enrich the dashboard and may be absent (e.g. for
+/// state files written by older versions, or events that carry no activity).
+#[derive(Debug, Clone)]
+pub struct ClaudeInfo {
+    pub state: ClaudeState,
+    pub activity: Option<String>,
+    pub state_since: Option<i64>,
+    pub cwd: Option<String>,
+}
+
+/// Load the current per-pane Claude info, keyed by tmux pane id (`%N`).
 /// Stale files are removed as a side effect.
-fn load_states() -> HashMap<String, ClaudeState> {
+fn load_states() -> HashMap<String, ClaudeInfo> {
     let mut map = HashMap::new();
     let dir = match state_dir() {
         Some(d) => d,
@@ -249,17 +262,34 @@ fn load_states() -> HashMap<String, ClaudeState> {
             Some(p) => p.to_string(),
             None => continue,
         };
-        let state = match value
-            .get("state")
-            .and_then(|s| s.as_str())
-            .and_then(ClaudeState::from_token)
-        {
-            Some(s) => s,
-            None => continue,
-        };
-        map.insert(pane, state);
+        if let Some(info) = info_from_value(&value, ts) {
+            map.insert(pane, info);
+        }
     }
     map
+}
+
+/// Parse a [`ClaudeInfo`] out of a state-file JSON object. `ts` is the file's
+/// own timestamp, used as a fallback for `state_since` so older state files
+/// (written before that field existed) still yield a meaningful elapsed time.
+/// Returns `None` when the required `state` token is missing/unrecognised.
+fn info_from_value(value: &Value, ts: i64) -> Option<ClaudeInfo> {
+    let state = value
+        .get("state")
+        .and_then(|s| s.as_str())
+        .and_then(ClaudeState::from_token)?;
+    Some(ClaudeInfo {
+        state,
+        activity: value
+            .get("activity")
+            .and_then(|a| a.as_str())
+            .map(String::from),
+        state_since: value
+            .get("state_since")
+            .and_then(|t| t.as_i64())
+            .or(Some(ts)),
+        cwd: value.get("cwd").and_then(|c| c.as_str()).map(String::from),
+    })
 }
 
 /// Apply the current hook states to a session tree, recomputing the
@@ -272,7 +302,20 @@ pub fn apply_states(sessions: &mut [TmuxSession]) {
         for window in session.windows.iter_mut() {
             let mut window_state = None;
             for pane in window.panes.iter_mut() {
-                pane.claude_state = map.get(&pane.id).copied();
+                match map.get(&pane.id) {
+                    Some(info) => {
+                        pane.claude_state = Some(info.state);
+                        pane.claude_activity = info.activity.clone();
+                        pane.claude_state_since = info.state_since;
+                        pane.claude_cwd = info.cwd.clone();
+                    }
+                    None => {
+                        pane.claude_state = None;
+                        pane.claude_activity = None;
+                        pane.claude_state_since = None;
+                        pane.claude_cwd = None;
+                    }
+                }
                 window_state = ClaudeState::merge(window_state, pane.claude_state);
             }
             window.claude_state = window_state;
@@ -444,6 +487,34 @@ mod tests {
         let out = one_line(&long);
         assert!(out.chars().count() <= ACTIVITY_MAX);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn info_from_value_reads_enriched_fields() {
+        let v = json!({
+            "pane": "%3", "state": "working", "ts": 100, "state_since": 90,
+            "activity": "Edit: src/app.rs", "cwd": "/repo"
+        });
+        let info = info_from_value(&v, 100).unwrap();
+        assert_eq!(info.state, ClaudeState::Working);
+        assert_eq!(info.activity.as_deref(), Some("Edit: src/app.rs"));
+        assert_eq!(info.state_since, Some(90));
+        assert_eq!(info.cwd.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn info_from_value_is_backward_compatible() {
+        // An old-format file (only pane/state/ts) still parses; `state_since`
+        // falls back to the file timestamp and the rest are absent.
+        let v = json!({ "pane": "%3", "state": "waiting", "ts": 42 });
+        let info = info_from_value(&v, 42).unwrap();
+        assert_eq!(info.state, ClaudeState::Waiting);
+        assert_eq!(info.state_since, Some(42));
+        assert!(info.activity.is_none());
+        assert!(info.cwd.is_none());
+
+        // A missing/garbage state yields nothing.
+        assert!(info_from_value(&json!({ "pane": "%3" }), 0).is_none());
     }
 
     #[test]
