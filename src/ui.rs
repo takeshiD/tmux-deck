@@ -459,83 +459,126 @@ fn format_elapsed(secs: Option<i64>) -> String {
     }
 }
 
-/// Render the fleet dashboard: every pane running Claude, sorted by attention
-/// priority, with a one-line activity digest and how long it has been in its
-/// current state. Enter switches to the highlighted pane.
+/// Render the fleet dashboard: a grid of live mirrors, one tile per Claude
+/// pane, each showing the agent's real captured screen. `Tab`/arrows move the
+/// focus between tiles; `Enter` attaches to the focused agent.
 fn render_dashboard(frame: &mut Frame, state: &UIState) {
     let area = frame.area();
     let theme = state.theme;
 
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
-    let list_area = chunks[0];
+    let grid_area = chunks[0];
     let status_area = chunks[1];
 
     let rows = state.dashboard_rows();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" Claude Fleet ({}) ", rows.len()));
 
     if rows.is_empty() {
-        let empty = Paragraph::new("No panes are running Claude.")
-            .style(Style::default().fg(theme.unfocus_border))
-            .block(block);
-        frame.render_widget(empty, list_area);
-    } else {
-        let selected = state.dashboard_selected.min(rows.len() - 1);
-        let items: Vec<ListItem> = rows
-            .iter()
-            .enumerate()
-            .map(|(idx, row)| dashboard_item(state, row, idx == selected))
-            .collect();
-        frame.render_widget(List::new(items).block(block), list_area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Claude Fleet (0) ");
+        let empty = Paragraph::new(
+            "No panes are running Claude.\n\nStart Claude in a pane (and `tmux-deck hook install` for live state).",
+        )
+        .style(Style::default().fg(theme.unfocus_border))
+        .block(block);
+        frame.render_widget(empty, grid_area);
+        render_dashboard_status_bar(frame, state, status_area);
+        return;
+    }
+
+    let focused = state.dashboard_selected.min(rows.len() - 1);
+
+    // Near-square grid: `cols` columns, enough rows to hold every tile.
+    let cols = (rows.len() as f64).sqrt().ceil() as usize;
+    let grid_rows = rows.len().div_ceil(cols);
+
+    let row_areas = Layout::vertical(
+        std::iter::repeat_n(Constraint::Ratio(1, grid_rows as u32), grid_rows).collect::<Vec<_>>(),
+    )
+    .split(grid_area);
+
+    for (r, row_area) in row_areas.iter().enumerate() {
+        let col_areas = Layout::horizontal(
+            std::iter::repeat_n(Constraint::Ratio(1, cols as u32), cols).collect::<Vec<_>>(),
+        )
+        .split(*row_area);
+        for (c, cell_area) in col_areas.iter().enumerate() {
+            let idx = r * cols + c;
+            if let Some(row) = rows.get(idx) {
+                render_dashboard_tile(frame, state, row, *cell_area, idx == focused);
+            }
+        }
     }
 
     render_dashboard_status_bar(frame, state, status_area);
 }
 
-/// Build a single dashboard row line.
-fn dashboard_item<'a>(state: &UIState, row: &DashboardRow, selected: bool) -> ListItem<'a> {
+/// Render one dashboard tile: a bordered mirror of a single Claude pane.
+fn render_dashboard_tile(
+    frame: &mut Frame,
+    state: &UIState,
+    row: &DashboardRow,
+    area: Rect,
+    focused: bool,
+) {
     let theme = state.theme;
     let (glyph, color) = claude_marker(&state.hooks.claude, row.state, true)
         .unwrap_or_else(|| ("•".to_string(), theme.unfocus_border));
 
-    let activity = row.activity.clone().unwrap_or_else(|| "—".to_string());
-    let line = Line::from(vec![
-        Span::styled(format!("{glyph} "), Style::default().fg(color)),
+    let border_style = if focused {
+        Style::default().fg(theme.focus_border).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color)
+    };
+
+    let mut title = vec![
+        Span::styled(format!(" {glyph} "), Style::default().fg(color)),
         Span::styled(
-            format!("{:<7} ", claude_state_label(row.state)),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{}:{:<6} ", row.session, row.pane_id),
+            format!("{}:{} ", row.session, row.pane_id),
             Style::default().fg(theme.focus_border),
         ),
-        Span::raw(format!("{activity:<40} ")),
         Span::styled(
-            format!("{:>5}", format_elapsed(row.elapsed_secs)),
-            Style::default().fg(theme.unfocus_border),
+            format!("{} ", claude_state_label(row.state)),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-    ]);
+    ];
+    if let Some(elapsed) = row.elapsed_secs {
+        title.push(Span::styled(
+            format!("{} ", format_elapsed(Some(elapsed))),
+            Style::default().fg(theme.unfocus_border),
+        ));
+    }
 
-    let style = if selected {
-        Style::default()
-            .bg(theme.selection_bg)
-            .fg(theme.selection_fg)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(Line::from(title));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Tile body: tail of the live capture so the latest output is visible.
+    let max_lines = inner.height as usize;
+    let body = match state.dashboard_capture(&row.target) {
+        Some(parsed) if !parsed.lines.is_empty() => {
+            let start = parsed.lines.len().saturating_sub(max_lines);
+            Text::from(parsed.lines[start..].to_vec())
+        }
+        _ => {
+            let hint = row.activity.clone().unwrap_or_else(|| "capturing…".to_string());
+            Text::styled(hint, Style::default().fg(theme.unfocus_border))
+        }
     };
-    ListItem::new(line).style(style)
+    frame.render_widget(Paragraph::new(body), inner);
 }
 
 fn render_dashboard_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
     let theme = state.theme;
     let kb = &state.keybindings;
     let status_text = Line::from(vec![
-        Span::styled("j/k", Style::default().fg(theme.focus_border)),
-        Span::raw(":move "),
+        Span::styled("Tab", Style::default().fg(theme.focus_border)),
+        Span::raw(":focus "),
         Span::styled(kb.label(Action::Enter), Style::default().fg(theme.highlight)),
-        Span::raw(":jump "),
+        Span::raw(":attach "),
         Span::styled(kb.label(Action::Dashboard), Style::default().fg(theme.focus_border)),
         Span::raw(":back "),
         Span::styled(kb.label(Action::Refresh), Style::default().fg(theme.focus_border)),
@@ -1092,6 +1135,55 @@ mod cursor_alignment_tests {
         // Empty fleet: exercises the empty-state and status-bar paths.
         let mut state = UIState::new(crate::config::Config::default());
         state.view_mode = ViewMode::Dashboard;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render_ui(f, &mut state)).unwrap();
+    }
+
+    #[test]
+    fn dashboard_grid_renders_tiles_without_panic() {
+        // Three Claude panes -> a 2-col grid with one trailing empty cell.
+        // Exercises the grid layout, tile capture/tail and focus highlight.
+        fn pane(id: &str, idx: u32, st: Option<ClaudeState>) -> TmuxPane {
+            TmuxPane {
+                id: id.to_string(),
+                index: idx,
+                width: 80,
+                height: 24,
+                active: false,
+                current_command: String::new(),
+                pid: 0,
+                has_claude: true,
+                claude_state: st,
+                claude_activity: Some("Edit: src/app.rs".to_string()),
+                claude_state_since: Some(0),
+                claude_cwd: None,
+            }
+        }
+        let window = TmuxWindow {
+            index: 0,
+            name: "w".to_string(),
+            panes: vec![
+                pane("%1", 0, Some(ClaudeState::Working)),
+                pane("%2", 1, Some(ClaudeState::Waiting)),
+                pane("%3", 2, None),
+            ],
+            has_claude: true,
+            claude_state: Some(ClaudeState::Waiting),
+        };
+        let session = crate::app::TmuxSession {
+            name: "s".to_string(),
+            windows: vec![window],
+            has_claude: true,
+            claude_state: Some(ClaudeState::Waiting),
+            last_attached: 0,
+            activity: 0,
+            group: None,
+        };
+        let mut state = UIState::new(crate::config::Config::default());
+        state.view_mode = ViewMode::Dashboard;
+        state.sessions = vec![session];
+        state.update_dashboard_capture("s:0.0".to_string(), "line1\nline2".to_string());
+
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render_ui(f, &mut state)).unwrap();
     }

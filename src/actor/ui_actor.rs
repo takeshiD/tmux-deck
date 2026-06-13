@@ -120,15 +120,33 @@ impl UIActor {
                             // tmux refreshes.
                             self.state.refresh_claude_states();
 
-                            // Request pane capture if in TreeView mode (low-priority channel)
-                            if self.state.view_mode == ViewMode::TreeView
-                                && let Some((target, start, end)) =
-                                    self.state.get_selected_pane_target_with_capture_range()
-                            {
-                                let _ = self
-                                    .tmux_capture_tx
-                                    .send(TmuxCommand::CapturePane { target, start, end })
-                                    .await;
+                            // Request pane capture (low-priority channel). TreeView
+                            // captures only the selected pane; the dashboard mirrors
+                            // every Claude pane so each tile shows live content.
+                            match self.state.view_mode {
+                                ViewMode::TreeView => {
+                                    if let Some((target, start, end)) =
+                                        self.state.get_selected_pane_target_with_capture_range()
+                                    {
+                                        let _ = self
+                                            .tmux_capture_tx
+                                            .send(TmuxCommand::CapturePane { target, start, end })
+                                            .await;
+                                    }
+                                }
+                                ViewMode::Dashboard => {
+                                    for (target, height) in self.state.claude_capture_targets() {
+                                        let _ = self
+                                            .tmux_capture_tx
+                                            .send(TmuxCommand::CapturePane {
+                                                target,
+                                                start: 0,
+                                                end: height,
+                                            })
+                                            .await;
+                                    }
+                                }
+                                ViewMode::MultiPreview => {}
                             }
                         }
                         UIEvent::Shutdown => {
@@ -452,8 +470,16 @@ impl UIActor {
                 _ => {}
             },
             ViewMode::Dashboard => match code {
-                KeyCode::Up | KeyCode::Char('k') => self.state.dashboard_move_up(),
-                KeyCode::Down | KeyCode::Char('j') => self.state.dashboard_move_down(),
+                KeyCode::Tab
+                | KeyCode::Down
+                | KeyCode::Right
+                | KeyCode::Char('j')
+                | KeyCode::Char('l') => self.state.dashboard_focus_next(),
+                KeyCode::BackTab
+                | KeyCode::Up
+                | KeyCode::Left
+                | KeyCode::Char('k')
+                | KeyCode::Char('h') => self.state.dashboard_focus_prev(),
                 _ => {}
             },
         }
@@ -464,8 +490,14 @@ impl UIActor {
             TmuxResponse::SessionsRefreshed { sessions } => {
                 self.state.update_sessions(sessions);
             }
-            TmuxResponse::PaneCaptured { target: _, content } => {
-                self.state.update_pane_content(content);
+            TmuxResponse::PaneCaptured { target, content } => {
+                // In the dashboard, captures fan out to per-pane tiles; elsewhere
+                // they feed the single TreeView preview.
+                if self.state.view_mode == ViewMode::Dashboard {
+                    self.state.update_dashboard_capture(target, content);
+                } else {
+                    self.state.update_pane_content(content);
+                }
             }
             TmuxResponse::SessionCreated {
                 name,

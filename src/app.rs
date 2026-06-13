@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
@@ -423,8 +423,12 @@ pub struct UIState {
     pub multi_session: usize,
     pub multi_window: usize,
 
-    /// Selected row index in the fleet dashboard (`ViewMode::Dashboard`).
+    /// Focused tile index in the fleet dashboard grid (`ViewMode::Dashboard`).
     pub dashboard_selected: usize,
+    /// Live captured screen content per Claude pane, keyed by tmux target
+    /// (`session:window.pane`). Refreshed while the dashboard is open so each
+    /// tile mirrors the agent's real TUI.
+    pub dashboard_captures: HashMap<String, Text<'static>>,
 
     // Shared state
     pub pane_content: String,
@@ -488,6 +492,7 @@ impl UIState {
             multi_window: 0,
 
             dashboard_selected: 0,
+            dashboard_captures: HashMap::new(),
 
             pane_content: String::new(),
             pane_content_parsed: None,
@@ -577,14 +582,46 @@ impl UIState {
     // Fleet Dashboard
     // =========================================================================
 
-    /// Toggle the fleet dashboard on/off. Entering it resets the selection.
+    /// Toggle the fleet dashboard on/off. Entering it resets the focus and
+    /// drops any stale captures so tiles repopulate from scratch.
     pub fn toggle_dashboard(&mut self) {
         if self.view_mode == ViewMode::Dashboard {
             self.view_mode = ViewMode::TreeView;
         } else {
             self.dashboard_selected = 0;
+            self.dashboard_captures.clear();
             self.view_mode = ViewMode::Dashboard;
         }
+    }
+
+    /// tmux targets + visible height of every Claude pane, used to schedule the
+    /// periodic capture that feeds the dashboard tiles.
+    pub fn claude_capture_targets(&self) -> Vec<(String, i32)> {
+        let mut out = Vec::new();
+        for session in &self.sessions {
+            for window in &session.windows {
+                for pane in &window.panes {
+                    if pane.claude_state.is_some() || pane.has_claude {
+                        let target = format!("{}:{}.{}", session.name, window.index, pane.index);
+                        let height = i32::try_from(pane.height).unwrap_or(i32::MAX);
+                        out.push((target, height));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Store a freshly captured pane screen for the dashboard, parsing ANSI.
+    pub fn update_dashboard_capture(&mut self, target: String, content: String) {
+        if let Ok(text) = content.as_bytes().into_text() {
+            self.dashboard_captures.insert(target, text);
+        }
+    }
+
+    /// Captured screen for a dashboard tile, if one has arrived yet.
+    pub fn dashboard_capture(&self, target: &str) -> Option<&Text<'static>> {
+        self.dashboard_captures.get(target)
     }
 
     /// All panes running Claude across every session: any pane with a hook
@@ -623,14 +660,19 @@ impl UIState {
         rows
     }
 
-    pub fn dashboard_move_up(&mut self) {
-        self.dashboard_selected = self.dashboard_selected.saturating_sub(1);
-    }
-
-    pub fn dashboard_move_down(&mut self) {
+    /// Move tile focus to the previous Claude pane (wraps around).
+    pub fn dashboard_focus_prev(&mut self) {
         let len = self.dashboard_rows().len();
         if len > 0 {
-            self.dashboard_selected = (self.dashboard_selected + 1).min(len - 1);
+            self.dashboard_selected = (self.dashboard_selected + len - 1) % len;
+        }
+    }
+
+    /// Move tile focus to the next Claude pane (wraps around).
+    pub fn dashboard_focus_next(&mut self) {
+        let len = self.dashboard_rows().len();
+        if len > 0 {
+            self.dashboard_selected = (self.dashboard_selected + 1) % len;
         }
     }
 
