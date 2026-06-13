@@ -379,6 +379,7 @@ impl UIActor {
                         }
                     }
                 }
+                Action::Dashboard => self.state.toggle_dashboard(),
                 // Context-gated actions whose gate is not satisfied fall through
                 // to navigation so the key is not swallowed.
                 Action::Sort | Action::Group => {
@@ -448,6 +449,11 @@ impl UIActor {
                 KeyCode::Down | KeyCode::Char('j') => self.state.multi_move_down(),
                 KeyCode::Left | KeyCode::Char('h') => self.state.multi_move_left(),
                 KeyCode::Right | KeyCode::Char('l') => self.state.multi_move_right(),
+                _ => {}
+            },
+            ViewMode::Dashboard => match code {
+                KeyCode::Up | KeyCode::Char('k') => self.state.dashboard_move_up(),
+                KeyCode::Down | KeyCode::Char('j') => self.state.dashboard_move_down(),
                 _ => {}
             },
         }

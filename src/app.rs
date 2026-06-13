@@ -115,12 +115,9 @@ pub struct TmuxPane {
     pub claude_state: Option<ClaudeState>,
     /// One-line summary of what Claude is currently doing (e.g. `Edit: src/app.rs`),
     /// sourced from the hook activity digest. `None` when unknown.
-    /// Consumed by the fleet dashboard (#21).
-    #[allow(dead_code)]
     pub claude_activity: Option<String>,
     /// Unix timestamp (secs) when the current Claude state began. Used to show
     /// how long a pane has been working/waiting.
-    #[allow(dead_code)]
     pub claude_state_since: Option<i64>,
     /// Working directory Claude reported for this pane (repo identification).
     #[allow(dead_code)]
@@ -129,7 +126,6 @@ pub struct TmuxPane {
 
 impl TmuxPane {
     /// Seconds elapsed since the current Claude state began, if known.
-    #[allow(dead_code)]
     pub fn claude_state_elapsed_secs(&self) -> Option<i64> {
         self.claude_state_since
             .map(|since| crate::hook::now_secs().saturating_sub(since).max(0))
@@ -182,6 +178,22 @@ pub struct TmuxSession {
 pub enum ViewMode {
     TreeView,
     MultiPreview,
+    /// Full-screen fleet dashboard: every pane running Claude across all
+    /// sessions, sorted by how much it wants attention.
+    Dashboard,
+}
+
+/// One row of the fleet dashboard: a single pane running Claude, with the
+/// context needed to render it and to jump to it.
+#[derive(Debug, Clone)]
+pub struct DashboardRow {
+    /// tmux target (`session:window.pane`) for switching to this pane.
+    pub target: String,
+    pub session: String,
+    pub pane_id: String,
+    pub state: ClaudeState,
+    pub activity: Option<String>,
+    pub elapsed_secs: Option<i64>,
 }
 
 /// Focus area in TreeView mode
@@ -409,6 +421,9 @@ pub struct UIState {
     pub multi_session: usize,
     pub multi_window: usize,
 
+    /// Selected row index in the fleet dashboard (`ViewMode::Dashboard`).
+    pub dashboard_selected: usize,
+
     // Shared state
     pub pane_content: String,
     pub pane_content_parsed: Option<Text<'static>>,
@@ -469,6 +484,8 @@ impl UIState {
 
             multi_session: 0,
             multi_window: 0,
+
+            dashboard_selected: 0,
 
             pane_content: String::new(),
             pane_content_parsed: None,
@@ -548,7 +565,74 @@ impl UIState {
                 self.pane_list_state.select(Some(0));
                 ViewMode::TreeView
             }
+            // Double-space cycles only Tree <-> Multi; leaving the dashboard
+            // returns to the tree.
+            ViewMode::Dashboard => ViewMode::TreeView,
         };
+    }
+
+    // =========================================================================
+    // Fleet Dashboard
+    // =========================================================================
+
+    /// Toggle the fleet dashboard on/off. Entering it resets the selection.
+    pub fn toggle_dashboard(&mut self) {
+        if self.view_mode == ViewMode::Dashboard {
+            self.view_mode = ViewMode::TreeView;
+        } else {
+            self.dashboard_selected = 0;
+            self.view_mode = ViewMode::Dashboard;
+        }
+    }
+
+    /// All panes currently running Claude (or carrying a hook state), across
+    /// every session, sorted by attention priority (Waiting → Error → Working
+    /// → Done) and then by how long they have been in that state (longest
+    /// first), so a stuck/old item floats up within its group.
+    pub fn dashboard_rows(&self) -> Vec<DashboardRow> {
+        let mut rows: Vec<DashboardRow> = Vec::new();
+        for session in &self.sessions {
+            for window in &session.windows {
+                for pane in &window.panes {
+                    let Some(state) = pane.claude_state else {
+                        continue;
+                    };
+                    rows.push(DashboardRow {
+                        target: format!("{}:{}.{}", session.name, window.index, pane.index),
+                        session: session.name.clone(),
+                        pane_id: pane.id.clone(),
+                        state,
+                        activity: pane.claude_activity.clone(),
+                        elapsed_secs: pane.claude_state_elapsed_secs(),
+                    });
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            b.state
+                .priority()
+                .cmp(&a.state.priority())
+                .then(b.elapsed_secs.cmp(&a.elapsed_secs))
+        });
+        rows
+    }
+
+    pub fn dashboard_move_up(&mut self) {
+        self.dashboard_selected = self.dashboard_selected.saturating_sub(1);
+    }
+
+    pub fn dashboard_move_down(&mut self) {
+        let len = self.dashboard_rows().len();
+        if len > 0 {
+            self.dashboard_selected = (self.dashboard_selected + 1).min(len - 1);
+        }
+    }
+
+    /// tmux target of the currently highlighted dashboard row, if any.
+    pub fn get_dashboard_target(&self) -> Option<String> {
+        self.dashboard_rows()
+            .get(self.dashboard_selected)
+            .map(|r| r.target.clone())
     }
 
     // =========================================================================
@@ -571,6 +655,7 @@ impl UIState {
         match self.view_mode {
             ViewMode::TreeView => self.get_selected_pane_target(),
             ViewMode::MultiPreview => self.get_multi_selected_target(),
+            ViewMode::Dashboard => self.get_dashboard_target(),
         }
     }
 
@@ -589,6 +674,7 @@ impl UIState {
                 Focus::Panes => self.get_selected_pane_target(),
             },
             ViewMode::MultiPreview => self.get_multi_selected_target(),
+            ViewMode::Dashboard => self.get_dashboard_target(),
         }
     }
 
@@ -1196,6 +1282,65 @@ mod tests {
         }
         state.update_sessions(names.iter().map(|n| session(n)).collect());
         state
+    }
+
+    /// Build a session with a single window holding the given panes, each
+    /// described as `(pane_id, index, claude_state, state_since)`.
+    fn session_with_panes(
+        name: &str,
+        panes: &[(&str, u32, Option<ClaudeState>, Option<i64>)],
+    ) -> TmuxSession {
+        let panes = panes
+            .iter()
+            .map(|(id, index, state, since)| TmuxPane {
+                id: id.to_string(),
+                index: *index,
+                width: 80,
+                height: 24,
+                active: false,
+                current_command: String::new(),
+                pid: 0,
+                has_claude: state.is_some(),
+                claude_state: *state,
+                claude_activity: None,
+                claude_state_since: *since,
+                claude_cwd: None,
+            })
+            .collect();
+        let mut s = session(name);
+        s.windows = vec![TmuxWindow {
+            index: 0,
+            name: "w".to_string(),
+            panes,
+            has_claude: false,
+            claude_state: None,
+        }];
+        s
+    }
+
+    #[test]
+    fn dashboard_rows_sort_by_attention_then_age() {
+        let mut state = UIState::new(Config::default());
+        state.groups = GroupStore::default();
+        // working(old) / working(new) / waiting / done — plus a non-Claude pane.
+        state.sessions = vec![session_with_panes(
+            "s",
+            &[
+                ("%1", 0, Some(ClaudeState::Working), Some(100)), // older working
+                ("%2", 1, Some(ClaudeState::Working), Some(200)), // newer working
+                ("%3", 2, Some(ClaudeState::Waiting), Some(150)),
+                ("%4", 3, Some(ClaudeState::Done), Some(10)),
+                ("%5", 4, None, None), // no Claude -> excluded
+            ],
+        )];
+
+        let rows = state.dashboard_rows();
+        // Waiting first; then the two Working (older = larger elapsed first);
+        // then Done. The non-Claude pane is excluded.
+        let order: Vec<&str> = rows.iter().map(|r| r.pane_id.as_str()).collect();
+        assert_eq!(order, vec!["%3", "%1", "%2", "%4"]);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].target, "s:0.2");
     }
 
     #[test]

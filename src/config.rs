@@ -561,6 +561,8 @@ pub enum Action {
     NewSession,
     RenameSession,
     KillSession,
+    /// Toggle the fleet dashboard (all Claude panes, sorted by attention).
+    Dashboard,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -584,6 +586,8 @@ pub struct KeyBindings {
     pub rename_session: Vec<KeySpec>,
     #[serde(deserialize_with = "de_keys")]
     pub kill_session: Vec<KeySpec>,
+    #[serde(deserialize_with = "de_keys")]
+    pub dashboard: Vec<KeySpec>,
 }
 
 impl Default for KeyBindings {
@@ -599,6 +603,7 @@ impl Default for KeyBindings {
             new_session: vec![ctrl('n')],
             rename_session: vec![ctrl('r')],
             kill_session: vec![ctrl('x')],
+            dashboard: vec![key('d')],
         }
     }
 }
@@ -606,7 +611,7 @@ impl Default for KeyBindings {
 impl KeyBindings {
     /// Pairs of (action, bindings) in match priority order. Modifier-bearing
     /// bindings (e.g. `C-r`) are listed so they win over the plain `r` refresh.
-    fn entries(&self) -> [(Action, &Vec<KeySpec>); 9] {
+    fn entries(&self) -> [(Action, &Vec<KeySpec>); 10] {
         [
             (Action::NewSession, &self.new_session),
             (Action::RenameSession, &self.rename_session),
@@ -617,6 +622,7 @@ impl KeyBindings {
             (Action::Group, &self.group),
             (Action::Input, &self.input),
             (Action::Enter, &self.enter),
+            (Action::Dashboard, &self.dashboard),
         ]
     }
 

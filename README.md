@@ -8,6 +8,7 @@ Monitoring multi session Realtime preview.
 - 📄 Easy management Windows and Panes between Sessions
 - 👀 Realtime Preview
 - 🤖 Claude Code status markers (working / waiting / done) driven by hooks
+- 🛰️ Claude fleet dashboard (`d`): every Claude pane sorted by attention, jump with `Enter`
 - ⚙️ Easy Configure
 
 # Quick Start
@@ -136,7 +137,7 @@ The remappable actions and their defaults:
 | `refresh` | `r`        | `rename_session` | `C-r`   |
 | `sort`    | `s`        | `kill_session`   | `C-x`   |
 | `group`   | `g`        | `enter`          | `Enter` |
-| `input`   | `i`        |                  |         |
+| `input`   | `i`        | `dashboard`      | `d`     |
 
 A binding is one key string or a list. Modifiers are joined with `-` (`C`/`Ctrl`,
 `S`/`Shift`, `A`/`M`/`Alt`); keys are a single character or a name (`Esc`, `Tab`,
