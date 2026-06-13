@@ -438,12 +438,14 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
 // =============================================================================
 
 /// Short uppercase label for a Claude state, used in the dashboard rows.
-fn claude_state_label(state: ClaudeState) -> &'static str {
+/// `None` (Claude running but no hook state yet) shows as `RUNNING`.
+fn claude_state_label(state: Option<ClaudeState>) -> &'static str {
     match state {
-        ClaudeState::Waiting => "WAITING",
-        ClaudeState::Error => "ERROR",
-        ClaudeState::Working => "WORKING",
-        ClaudeState::Done => "DONE",
+        Some(ClaudeState::Waiting) => "WAITING",
+        Some(ClaudeState::Error) => "ERROR",
+        Some(ClaudeState::Working) => "WORKING",
+        Some(ClaudeState::Done) => "DONE",
+        None => "RUNNING",
     }
 }
 
@@ -494,7 +496,7 @@ fn render_dashboard(frame: &mut Frame, state: &UIState) {
 /// Build a single dashboard row line.
 fn dashboard_item<'a>(state: &UIState, row: &DashboardRow, selected: bool) -> ListItem<'a> {
     let theme = state.theme;
-    let (glyph, color) = claude_marker(&state.hooks.claude, Some(row.state), true)
+    let (glyph, color) = claude_marker(&state.hooks.claude, row.state, true)
         .unwrap_or_else(|| ("•".to_string(), theme.unfocus_border));
 
     let activity = row.activity.clone().unwrap_or_else(|| "—".to_string());

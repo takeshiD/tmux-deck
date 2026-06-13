@@ -191,7 +191,9 @@ pub struct DashboardRow {
     pub target: String,
     pub session: String,
     pub pane_id: String,
-    pub state: ClaudeState,
+    /// Hook-reported state, or `None` when Claude is detected as running in the
+    /// pane but no hook event has arrived yet (or hooks are not installed).
+    pub state: Option<ClaudeState>,
     pub activity: Option<String>,
     pub elapsed_secs: Option<i64>,
 }
@@ -585,33 +587,37 @@ impl UIState {
         }
     }
 
-    /// All panes currently running Claude (or carrying a hook state), across
-    /// every session, sorted by attention priority (Waiting → Error → Working
-    /// → Done) and then by how long they have been in that state (longest
-    /// first), so a stuck/old item floats up within its group.
+    /// All panes running Claude across every session: any pane with a hook
+    /// state, plus panes where a Claude process is detected even if no hook
+    /// event has arrived yet (or hooks are not installed) — those show with a
+    /// `None` state. Sorted by attention priority (Waiting → Error → Working →
+    /// Done → unknown) and then by how long they have been in that state
+    /// (longest first), so a stuck/old item floats up within its group.
     pub fn dashboard_rows(&self) -> Vec<DashboardRow> {
         let mut rows: Vec<DashboardRow> = Vec::new();
         for session in &self.sessions {
             for window in &session.windows {
                 for pane in &window.panes {
-                    let Some(state) = pane.claude_state else {
+                    if pane.claude_state.is_none() && !pane.has_claude {
                         continue;
-                    };
+                    }
                     rows.push(DashboardRow {
                         target: format!("{}:{}.{}", session.name, window.index, pane.index),
                         session: session.name.clone(),
                         pane_id: pane.id.clone(),
-                        state,
+                        state: pane.claude_state,
                         activity: pane.claude_activity.clone(),
                         elapsed_secs: pane.claude_state_elapsed_secs(),
                     });
                 }
             }
         }
+        // A known state outranks an unknown (running-only) one; within a tier,
+        // the longer-running item comes first.
+        let rank = |s: Option<ClaudeState>| s.map(|s| i16::from(s.priority())).unwrap_or(-1);
         rows.sort_by(|a, b| {
-            b.state
-                .priority()
-                .cmp(&a.state.priority())
+            rank(b.state)
+                .cmp(&rank(a.state))
                 .then(b.elapsed_secs.cmp(&a.elapsed_secs))
         });
         rows
@@ -1341,6 +1347,25 @@ mod tests {
         assert_eq!(order, vec!["%3", "%1", "%2", "%4"]);
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].target, "s:0.2");
+    }
+
+    #[test]
+    fn dashboard_includes_running_panes_without_hook_state() {
+        // A pane with a Claude process but no hook event yet (state None,
+        // has_claude true) must still appear, ranked below any hook state.
+        let mut state = UIState::new(Config::default());
+        state.groups = GroupStore::default();
+        let mut running = session_with_panes("s", &[("%1", 0, None, None)]);
+        running.windows[0].panes[0].has_claude = true;
+        let mut waiting = session_with_panes("t", &[("%2", 0, Some(ClaudeState::Waiting), Some(5))]);
+        waiting.windows[0].panes[0].has_claude = true;
+        state.sessions = vec![running, waiting];
+
+        let rows = state.dashboard_rows();
+        let order: Vec<&str> = rows.iter().map(|r| r.pane_id.as_str()).collect();
+        // Waiting (known state) outranks the unknown running-only pane.
+        assert_eq!(order, vec!["%2", "%1"]);
+        assert_eq!(rows[1].state, None);
     }
 
     #[test]
