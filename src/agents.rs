@@ -277,10 +277,14 @@ fn transcript_record_lines(v: &Value) -> Vec<String> {
     };
 
     let mut out = Vec::new();
+    // Two spaces after the marker: the geometric/emoji glyphs are East Asian
+    // *Ambiguous* width, so some terminals render them 2 cells wide while
+    // unicode-width counts 1. The extra space keeps text from overlapping the
+    // icon in those terminals.
     let mut push = |prefix: &str, text: String| {
         let t = one_line(&text, 200);
         if !t.is_empty() {
-            out.push(format!("{prefix} {t}"));
+            out.push(format!("{prefix}  {t}"));
         }
     };
 
