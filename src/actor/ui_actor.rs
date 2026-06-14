@@ -2,7 +2,11 @@ use std::io;
 use std::time::Duration;
 
 use color_eyre::Result;
+use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, oneshot};
@@ -120,10 +124,8 @@ impl UIActor {
                             // tmux refreshes.
                             self.state.refresh_claude_states();
 
-                            // Request pane capture (low-priority channel). TreeView
-                            // captures only the selected pane; the dashboard mirrors
-                            // every Claude pane so each tile shows live content.
                             match self.state.view_mode {
+                                // TreeView captures the selected pane for its preview.
                                 ViewMode::TreeView => {
                                     if let Some((target, start, end)) =
                                         self.state.get_selected_pane_target_with_capture_range()
@@ -134,22 +136,8 @@ impl UIActor {
                                             .await;
                                     }
                                 }
-                                ViewMode::Dashboard => {
-                                    // Capture only the selected pane; its content
-                                    // feeds the peek panel.
-                                    if let Some((target, height)) =
-                                        self.state.dashboard_capture_target()
-                                    {
-                                        let _ = self
-                                            .tmux_capture_tx
-                                            .send(TmuxCommand::CapturePane {
-                                                target,
-                                                start: 0,
-                                                end: height,
-                                            })
-                                            .await;
-                                    }
-                                }
+                                // The agent view reloads background sessions from disk.
+                                ViewMode::Dashboard => self.state.refresh_agents(),
                                 ViewMode::MultiPreview => {}
                             }
                         }
@@ -164,6 +152,13 @@ impl UIActor {
                 _ = anim.tick() => {
                     redraw = self.state.has_working_claude();
                 }
+            }
+
+            // An attach request suspends the TUI, hands the terminal to
+            // `claude attach <id>`, then restores the TUI when it returns.
+            if let Some(id) = self.state.pending_attach.take() {
+                self.attach_agent(&id)?;
+                continue;
             }
 
             // Render UI after processing event (event-driven rendering)
@@ -186,11 +181,6 @@ impl UIActor {
             // Handle popup mode first
             if let Some(popup_mode) = self.state.popup_mode {
                 return self.handle_popup_key(key, popup_mode).await;
-            }
-
-            // The dashboard peek panel captures keys while open (reply + nav).
-            if self.state.dashboard_peek {
-                return self.handle_dashboard_peek_key(key).await;
             }
 
             // Handle input mode
@@ -353,14 +343,8 @@ impl UIActor {
                     self.state.pending_z = true;
                     return Ok(false);
                 }
-                KeyCode::Char(' ') => {
-                    // In the dashboard, Space opens the peek panel; elsewhere it
-                    // drives the double-Space view toggle.
-                    if self.state.view_mode == ViewMode::Dashboard {
-                        self.state.open_dashboard_peek();
-                    } else {
-                        self.state.handle_space_press();
-                    }
+                KeyCode::Char(' ') if self.state.view_mode != ViewMode::Dashboard => {
+                    self.state.handle_space_press();
                     return Ok(false);
                 }
                 _ => {}
@@ -394,6 +378,11 @@ impl UIActor {
                 Action::KillSession => {
                     self.state.open_kill_session_popup();
                     self.refresh_control.pause();
+                }
+                Action::Enter if self.state.view_mode == ViewMode::Dashboard => {
+                    // Attach to the selected background session. The UI loop
+                    // consumes `pending_attach` to run `claude attach <id>`.
+                    self.state.pending_attach = self.state.selected_agent_id();
                 }
                 Action::Enter => {
                     if let Some(target) = self.state.get_enter_target() {
@@ -466,61 +455,31 @@ impl UIActor {
         Ok(())
     }
 
-    /// Keys while the dashboard peek panel is open: edit/send a reply, peek
-    /// adjacent rows, attach, or close.
-    async fn handle_dashboard_peek_key(&mut self, key: event::KeyEvent) -> Result<bool> {
-        match key.code {
-            KeyCode::Esc => self.state.close_dashboard_peek(),
-            // Up/Down peek the neighbouring session without leaving the panel.
-            KeyCode::Up => self.state.dashboard_focus_prev(),
-            KeyCode::Down => self.state.dashboard_focus_next(),
-            // Right attaches to the peeked session.
-            KeyCode::Right => {
-                if let Some(target) = self.state.get_dashboard_target() {
-                    self.state.close_dashboard_peek();
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    let _ = self
-                        .tmux_cmd_tx
-                        .send(TmuxCommand::SwitchClient {
-                            target,
-                            reply: Some(reply_tx),
-                        })
-                        .await;
-                    let _ = reply_rx.await;
-                    if self.state.behavior.exit_on_switch {
-                        return Ok(true);
-                    }
-                }
-            }
-            // Enter sends the typed reply to the peeked pane (text + Enter).
-            KeyCode::Enter => {
-                let keys = self.state.input_buffer.clone();
-                if !keys.is_empty()
-                    && let Some(target) = self.state.get_dashboard_target()
-                {
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    let _ = self
-                        .tmux_cmd_tx
-                        .send(TmuxCommand::SendKeys {
-                            target,
-                            keys,
-                            reply: Some(reply_tx),
-                        })
-                        .await;
-                    let _ = reply_rx.await;
-                    self.state.input_buffer.clear();
-                    self.state.input_cursor = 0;
-                }
-            }
-            KeyCode::Backspace => self.state.input_backspace(),
-            KeyCode::Delete => self.state.input_delete(),
-            KeyCode::Left => self.state.input_move_left(),
-            KeyCode::Home => self.state.input_move_home(),
-            KeyCode::End => self.state.input_move_end(),
-            KeyCode::Char(c) => self.state.input_char(c),
-            _ => {}
+    /// Suspend the TUI, run `claude attach <id>` with the terminal handed over,
+    /// then restore the TUI. Mirrors the agent view's attach/detach: when the
+    /// user detaches (or the session ends) we come back to the list.
+    fn attach_agent(&mut self, id: &str) -> Result<()> {
+        // Tear down our TUI so claude owns a clean terminal.
+        self.refresh_control.pause();
+        disable_raw_mode()?;
+        io::stdout().execute(LeaveAlternateScreen)?;
+
+        let status = std::process::Command::new("claude")
+            .arg("attach")
+            .arg(id)
+            .status();
+
+        // Restore the TUI regardless of how claude exited.
+        enable_raw_mode()?;
+        io::stdout().execute(EnterAlternateScreen)?;
+        self.terminal.clear()?;
+        self.refresh_control.resume();
+
+        if let Err(e) = status {
+            self.state.set_error(format!("claude attach failed: {e}"));
         }
-        Ok(false)
+        self.state.refresh_agents();
+        Ok(())
     }
 
     fn handle_navigation_key(&mut self, code: KeyCode) {
@@ -543,10 +502,10 @@ impl UIActor {
             },
             ViewMode::Dashboard => match code {
                 KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
-                    self.state.dashboard_focus_next()
+                    self.state.agent_select_next()
                 }
                 KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
-                    self.state.dashboard_focus_prev()
+                    self.state.agent_select_prev()
                 }
                 _ => {}
             },
@@ -558,14 +517,8 @@ impl UIActor {
             TmuxResponse::SessionsRefreshed { sessions } => {
                 self.state.update_sessions(sessions);
             }
-            TmuxResponse::PaneCaptured { target, content } => {
-                // In the dashboard, captures fan out to per-pane tiles; elsewhere
-                // they feed the single TreeView preview.
-                if self.state.view_mode == ViewMode::Dashboard {
-                    self.state.update_dashboard_capture(target, content);
-                } else {
-                    self.state.update_pane_content(content);
-                }
+            TmuxResponse::PaneCaptured { target: _, content } => {
+                self.state.update_pane_content(content);
             }
             TmuxResponse::SessionCreated {
                 name,

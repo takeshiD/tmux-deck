@@ -3,9 +3,10 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
+use crate::agents::{self, AgentSession, AgentState};
 use crate::app::{
-    ClaudeState, DashboardRow, Focus, InputMode, PopupMode, SessionRow, TmuxPane, TmuxWindow,
-    UIState, UNGROUPED_LABEL, ViewMode,
+    ClaudeState, Focus, InputMode, PopupMode, SessionRow, TmuxPane, TmuxWindow, UIState,
+    UNGROUPED_LABEL, ViewMode,
 };
 use crate::config::{Action, MarkerSet, Theme};
 
@@ -437,47 +438,63 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
 // Fleet Dashboard Rendering
 // =============================================================================
 
-/// Short uppercase label for a Claude state, used in the dashboard rows.
-/// `None` (Claude running but no hook state yet) shows as `RUNNING`.
-fn claude_state_label(state: Option<ClaudeState>) -> &'static str {
-    match state {
-        Some(ClaudeState::Waiting) => "WAITING",
-        Some(ClaudeState::Error) => "ERROR",
-        Some(ClaudeState::Working) => "WORKING",
-        Some(ClaudeState::Done) => "DONE",
-        None => "RUNNING",
-    }
-}
-
-/// Human-friendly elapsed time: `12s`, `3m`, `2h`. `None` renders as `-`.
-fn format_elapsed(secs: Option<i64>) -> String {
+/// Human-friendly elapsed time: `12s`, `3m`, `2h`.
+fn format_elapsed(secs: i64) -> String {
     match secs {
-        None => "-".to_string(),
-        Some(s) if s < 60 => format!("{s}s"),
-        Some(s) if s < 3600 => format!("{}m", s / 60),
-        Some(s) => format!("{}h", s / 3600),
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s => format!("{}h", s / 3600),
     }
 }
 
-/// Render the fleet dashboard: an agent-view-style list of Claude panes,
-/// grouped by attention (Needs input / Working / Completed). `Space` peeks the
-/// selected pane (latest output + reply), `Enter` attaches.
+/// Marker glyph + colour for a background-session state, reusing the user's
+/// configured Claude marker set.
+fn agent_marker(markers: &MarkerSet, state: AgentState, theme: &Theme) -> (String, Color) {
+    let mapped = match state {
+        AgentState::Blocked => Some(ClaudeState::Waiting),
+        AgentState::Working => Some(ClaudeState::Working),
+        AgentState::Done => Some(ClaudeState::Done),
+        AgentState::Failed => Some(ClaudeState::Error),
+        AgentState::Idle | AgentState::Stopped | AgentState::Unknown => None,
+    };
+    let has_claude = matches!(state, AgentState::Idle);
+    claude_marker(markers, mapped, has_claude)
+        .unwrap_or_else(|| ("∙".to_string(), theme.unfocus_border))
+}
+
+/// Render the agent view: Claude Code background sessions grouped by working
+/// directory, like `claude agents`. `Enter` attaches to the selected session.
 fn render_dashboard(frame: &mut Frame, state: &UIState) {
     let area = frame.area();
     let theme = state.theme;
 
-    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
-    let list_area = chunks[0];
-    let status_area = chunks[1];
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let header_area = chunks[0];
+    let list_area = chunks[1];
+    let status_area = chunks[2];
 
-    let rows = state.dashboard_rows();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" Claude Fleet ({}) ", rows.len()));
+    // Header: summary counts, like the agent view's "N awaiting input · …".
+    let (needs, working, completed) = state.agent_group_counts();
+    let header = Line::from(vec![
+        Span::styled(" Claude Agents ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{needs} awaiting input"), Style::default().fg(theme.highlight)),
+        Span::raw(" · "),
+        Span::styled(format!("{working} working"), Style::default().fg(theme.focus_border)),
+        Span::raw(" · "),
+        Span::styled(format!("{completed} completed"), Style::default().fg(theme.unfocus_border)),
+    ]);
+    frame.render_widget(Paragraph::new(header), header_area);
 
-    if rows.is_empty() {
+    let block = Block::default().borders(Borders::ALL);
+
+    if state.agent_sessions.is_empty() {
         let empty = Paragraph::new(
-            "No panes are running Claude.\n\nStart Claude in a pane (and `tmux-deck hook install` for live state).",
+            "No background sessions.\n\nStart one with `claude --bg \"<task>\"` or `/bg` inside a session.",
         )
         .style(Style::default().fg(theme.unfocus_border))
         .block(block);
@@ -486,122 +503,73 @@ fn render_dashboard(frame: &mut Frame, state: &UIState) {
         return;
     }
 
-    let selected = state.dashboard_selected.min(rows.len() - 1);
+    let selected = state.agent_selected.min(state.agent_sessions.len() - 1);
 
-    // Build list items, inserting a header line whenever the group changes.
+    // Build rows, inserting a directory header whenever the cwd changes.
     let mut items: Vec<ListItem> = Vec::new();
-    let mut last_group: Option<crate::app::DashboardGroup> = None;
-    for (idx, row) in rows.iter().enumerate() {
-        let group = row.group();
-        if last_group != Some(group) {
+    let mut last_cwd: Option<&str> = None;
+    for (idx, s) in state.agent_sessions.iter().enumerate() {
+        if last_cwd != Some(s.cwd.as_str()) {
             items.push(ListItem::new(Line::from(Span::styled(
-                group.label().to_string(),
+                agents::abbreviate_path(&s.cwd),
                 Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
             ))));
-            last_group = Some(group);
+            last_cwd = Some(s.cwd.as_str());
         }
-        items.push(dashboard_row_item(state, row, idx == selected));
+        items.push(agent_row_item(state, s, idx == selected));
     }
 
     frame.render_widget(List::new(items).block(block), list_area);
     render_dashboard_status_bar(frame, state, status_area);
-
-    if state.dashboard_peek {
-        render_dashboard_peek(frame, state, area, &rows[selected]);
-    }
 }
 
-/// One list row: state marker, session:pane, activity summary, elapsed time.
-fn dashboard_row_item<'a>(state: &UIState, row: &DashboardRow, selected: bool) -> ListItem<'a> {
+/// One agent-view row: state marker, name, summary, PR labels, elapsed time.
+fn agent_row_item<'a>(state: &UIState, session: &AgentSession, selected: bool) -> ListItem<'a> {
     let theme = state.theme;
-    let (glyph, color) = claude_marker(&state.hooks.claude, row.state, true)
-        .unwrap_or_else(|| ("•".to_string(), theme.unfocus_border));
+    let (mut glyph, color) = agent_marker(&state.hooks.claude, session.state, &theme);
+    // A finished/exited worker is shown with the agent view's "∙" dot shape.
+    if !session.alive {
+        glyph = "∙".to_string();
+    }
 
     let cursor = if selected { "▌" } else { " " };
-    let activity = row.activity.clone().unwrap_or_else(|| "—".to_string());
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(format!("{cursor}{glyph} "), Style::default().fg(color)),
         Span::styled(
-            format!("{:<18} ", format!("{}:{}", row.session, row.pane_id)),
+            format!("{:<24} ", truncate(&session.name, 24)),
             Style::default().fg(theme.focus_border),
         ),
-        Span::raw(format!("{activity:<44} ")),
-        Span::styled(
-            format!("{:>5}", format_elapsed(row.elapsed_secs)),
-            Style::default().fg(theme.unfocus_border),
-        ),
-    ]);
+        Span::raw(format!("{:<46} ", truncate(&session.summary, 46))),
+    ];
+    if !session.prs.is_empty() {
+        let label = if session.prs.len() == 1 {
+            format!("PR #{}", session.prs[0].id)
+        } else {
+            format!("{} PRs", session.prs.len())
+        };
+        spans.push(Span::styled(format!("{label:<8} "), Style::default().fg(theme.success)));
+    }
+    spans.push(Span::styled(
+        format!("{:>4}", format_elapsed(session.elapsed_secs)),
+        Style::default().fg(theme.unfocus_border),
+    ));
 
     let style = if selected {
         Style::default().bg(theme.selection_bg).fg(theme.selection_fg)
     } else {
         Style::default()
     };
-    ListItem::new(line).style(style)
+    ListItem::new(Line::from(spans)).style(style)
 }
 
-/// A rect centred in `area`, sized as a percentage of it.
-fn centered_rect(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
-    let w = area.width * pct_w / 100;
-    let h = area.height * pct_h / 100;
-    Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
+/// Truncate to `max` display chars with an ellipsis, padding handled by caller.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let head: String = s.chars().take(max - 1).collect();
+        format!("{head}…")
+    } else {
+        s.to_string()
     }
-}
-
-/// Centred peek overlay: the selected pane's latest captured output plus a
-/// reply line. Mirrors the agent view's Space peek.
-fn render_dashboard_peek(frame: &mut Frame, state: &UIState, area: Rect, row: &DashboardRow) {
-    let theme = state.theme;
-    let popup = centered_rect(80, 70, area);
-    frame.render_widget(Clear, popup);
-
-    let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(popup);
-    let content_area = outer[0];
-    let reply_area = outer[1];
-
-    let (glyph, color) = claude_marker(&state.hooks.claude, row.state, true)
-        .unwrap_or_else(|| ("•".to_string(), theme.unfocus_border));
-    let title = Line::from(vec![
-        Span::styled(format!(" {glyph} "), Style::default().fg(color)),
-        Span::styled(
-            format!("{}:{} ", row.session, row.pane_id),
-            Style::default().fg(theme.focus_border).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{} ", claude_state_label(row.state)),
-            Style::default().fg(color),
-        ),
-    ]);
-    let content_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .title(title);
-    let inner = content_block.inner(content_area);
-    let max_lines = inner.height as usize;
-    let body = match state.dashboard_capture(&row.target) {
-        Some(parsed) if !parsed.lines.is_empty() => {
-            let start = parsed.lines.len().saturating_sub(max_lines);
-            Text::from(parsed.lines[start..].to_vec())
-        }
-        _ => Text::styled("capturing…", Style::default().fg(theme.unfocus_border)),
-    };
-    frame.render_widget(Paragraph::new(body).block(content_block), content_area);
-
-    // Reply line: typed text is sent to the pane (with Enter) on submit.
-    let reply_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.focus_border))
-        .title(" reply → Enter sends · Esc closes · ↑↓ peek · → attach ");
-    let reply = Paragraph::new(Line::from(vec![
-        Span::styled("> ", Style::default().fg(theme.accent)),
-        Span::raw(state.input_buffer.clone()),
-    ]))
-    .block(reply_block);
-    frame.render_widget(reply, reply_area);
 }
 
 fn render_dashboard_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
@@ -610,8 +578,6 @@ fn render_dashboard_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
     let status_text = Line::from(vec![
         Span::styled("j/k", Style::default().fg(theme.focus_border)),
         Span::raw(":move "),
-        Span::styled("Space", Style::default().fg(theme.highlight)),
-        Span::raw(":peek "),
         Span::styled(kb.label(Action::Enter), Style::default().fg(theme.highlight)),
         Span::raw(":attach "),
         Span::styled(kb.label(Action::Dashboard), Style::default().fg(theme.focus_border)),
@@ -1114,12 +1080,11 @@ mod cursor_alignment_tests {
 
     #[test]
     fn format_elapsed_scales_units() {
-        assert_eq!(format_elapsed(None), "-");
-        assert_eq!(format_elapsed(Some(0)), "0s");
-        assert_eq!(format_elapsed(Some(59)), "59s");
-        assert_eq!(format_elapsed(Some(60)), "1m");
-        assert_eq!(format_elapsed(Some(3599)), "59m");
-        assert_eq!(format_elapsed(Some(3600)), "1h");
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(59), "59s");
+        assert_eq!(format_elapsed(60), "1m");
+        assert_eq!(format_elapsed(3599), "59m");
+        assert_eq!(format_elapsed(3600), "1h");
     }
 
     /// 白背景（カーソルブロック）のセルの (x, y) を返す。
@@ -1165,7 +1130,7 @@ mod cursor_alignment_tests {
 
     #[test]
     fn dashboard_renders_without_panic() {
-        // Empty fleet: exercises the empty-state and status-bar paths.
+        // Empty agent view: exercises the empty-state, header and status bar.
         let mut state = UIState::new(crate::config::Config::default());
         state.view_mode = ViewMode::Dashboard;
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -1173,57 +1138,30 @@ mod cursor_alignment_tests {
     }
 
     #[test]
-    fn dashboard_list_and_peek_render_without_panic() {
-        // Three Claude panes across the attention groups. Exercises the grouped
-        // list (headers + selection) and the peek overlay with reply text.
-        fn pane(id: &str, idx: u32, st: Option<ClaudeState>) -> TmuxPane {
-            TmuxPane {
+    fn agent_view_renders_grouped_sessions_without_panic() {
+        // Sessions across two directories and several states. Exercises the
+        // directory headers, state markers, PR labels and selection highlight.
+        fn sess(id: &str, name: &str, state: AgentState, cwd: &str, prs: &[&str]) -> AgentSession {
+            AgentSession {
                 id: id.to_string(),
-                index: idx,
-                width: 80,
-                height: 24,
-                active: false,
-                current_command: String::new(),
-                pid: 0,
-                has_claude: true,
-                claude_state: st,
-                claude_activity: Some("Edit: src/app.rs".to_string()),
-                claude_state_since: Some(0),
-                claude_cwd: None,
+                name: name.to_string(),
+                state,
+                summary: "did some work".to_string(),
+                cwd: cwd.to_string(),
+                elapsed_secs: 120,
+                prs: prs.iter().map(|p| crate::agents::PrRef { id: p.to_string() }).collect(),
+                alive: true,
             }
         }
-        let window = TmuxWindow {
-            index: 0,
-            name: "w".to_string(),
-            panes: vec![
-                pane("%1", 0, Some(ClaudeState::Working)),
-                pane("%2", 1, Some(ClaudeState::Waiting)),
-                pane("%3", 2, None),
-            ],
-            has_claude: true,
-            claude_state: Some(ClaudeState::Waiting),
-        };
-        let session = crate::app::TmuxSession {
-            name: "s".to_string(),
-            windows: vec![window],
-            has_claude: true,
-            claude_state: Some(ClaudeState::Waiting),
-            last_attached: 0,
-            activity: 0,
-            group: None,
-        };
         let mut state = UIState::new(crate::config::Config::default());
         state.view_mode = ViewMode::Dashboard;
-        state.sessions = vec![session];
-        state.update_dashboard_capture("s:0.0".to_string(), "line1\nline2".to_string());
+        state.agent_sessions = vec![
+            sess("a1", "telemetry fix", AgentState::Blocked, "/home/u/proj-a", &["12"]),
+            sess("a2", "refactor", AgentState::Working, "/home/u/proj-a", &[]),
+            sess("b1", "docs", AgentState::Done, "/home/u/proj-b", &["3", "4"]),
+        ];
 
-        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        // Grouped list.
-        term.draw(|f| render_ui(f, &mut state)).unwrap();
-        // Peek overlay with a reply in progress.
-        state.open_dashboard_peek();
-        state.input_char('h');
-        state.input_char('i');
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         term.draw(|f| render_ui(f, &mut state)).unwrap();
     }
 }
