@@ -11,6 +11,31 @@ use crate::config::{
 };
 use crate::group::GroupStore;
 
+/// How the agent-view preview panel renders the selected session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewMode {
+    /// Reconstructed conversation from the transcript JSONL (fast, plain).
+    Transcript,
+    /// Reconstructed terminal screen from `claude logs` (faithful, heavier).
+    Screen,
+}
+
+impl PreviewMode {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "screen" => Self::Screen,
+            _ => Self::Transcript,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Transcript => "transcript",
+            Self::Screen => "screen",
+        }
+    }
+}
+
 /// State of an on-demand execution summary for a background session.
 #[derive(Debug, Clone)]
 pub enum SummaryStatus {
@@ -435,12 +460,17 @@ pub struct UIState {
     /// Set to a session id when the user asks to attach; the UI loop consumes it
     /// to run `claude attach <id>` and clears it.
     pub pending_attach: Option<String>,
-    /// Whether the agent-view transcript preview panel is shown (`p`).
+    /// Whether the agent-view preview panel is shown (`p`).
     pub agent_preview: bool,
+    /// How the preview renders (transcript vs screen); toggled with `v`.
+    pub agent_preview_mode: PreviewMode,
     /// Whether the execution-summary popup is open (`s`); independent of preview.
     pub agent_summary_open: bool,
     /// On-demand execution summaries, keyed by session short id.
     pub agent_summaries: HashMap<String, SummaryStatus>,
+    /// Cached `claude logs` output (raw PTY bytes) per session id, for the
+    /// screen preview mode.
+    pub agent_logs: HashMap<String, Vec<u8>>,
     /// Agent-view config (e.g. summary model).
     pub agents_config: AgentsConfig,
 
@@ -509,8 +539,10 @@ impl UIState {
             agent_selected: 0,
             pending_attach: None,
             agent_preview: false,
+            agent_preview_mode: PreviewMode::from_str(&config.agents.preview_mode),
             agent_summary_open: false,
             agent_summaries: HashMap::new(),
+            agent_logs: HashMap::new(),
             agents_config: config.agents,
 
             pane_content: String::new(),
@@ -646,9 +678,27 @@ impl UIState {
         self.agent_sessions.get(self.agent_selected)
     }
 
-    /// Toggle the transcript preview panel for the selected session.
+    /// Toggle the preview panel for the selected session.
     pub fn toggle_agent_preview(&mut self) {
         self.agent_preview = !self.agent_preview;
+    }
+
+    /// Switch the preview between transcript and screen rendering (`v`).
+    pub fn cycle_preview_mode(&mut self) {
+        self.agent_preview_mode = match self.agent_preview_mode {
+            PreviewMode::Transcript => PreviewMode::Screen,
+            PreviewMode::Screen => PreviewMode::Transcript,
+        };
+    }
+
+    /// Store freshly fetched `claude logs` output for the screen preview.
+    pub fn update_agent_logs(&mut self, id: String, bytes: Vec<u8>) {
+        self.agent_logs.insert(id, bytes);
+    }
+
+    /// Cached `claude logs` bytes for a session, if fetched.
+    pub fn agent_logs_for(&self, id: &str) -> Option<&Vec<u8>> {
+        self.agent_logs.get(id)
     }
 
     /// Open the execution-summary popup (independent of the preview panel).
