@@ -163,6 +163,47 @@ same), so they stay legible on any terminal palette:
 Windows and sessions roll up to the most attention-worthy state of their
 children (waiting > error > working > done).
 
+## Agent view
+
+Press `d` to open the **agent view** — a full-screen list of Claude Code
+*background sessions* (the ones `claude agents` manages, started with
+`claude --bg` or `/bg`), read straight from `~/.claude/jobs`. Sessions are
+grouped by working directory, with a header summarising how many are awaiting
+input / working / completed. Each row shows the state marker, name, a one-line
+summary, any pull requests it opened, and how long since it last changed.
+
+| Key     | Action                                                              |
+| ------- | ------------------------------------------------------------------- |
+| `j`/`k` | Move the selection                                                  |
+| `Enter` | Attach to the session (`claude attach`); detach returns to the list |
+| `p`     | Toggle the preview panel for the selected session                   |
+| `v`     | Switch the preview between **transcript** and **screen** mode       |
+| `s`     | Generate an execution summary in a popup (`claude -p`, async)       |
+| `d`     | Back to the tree view                                               |
+
+The preview has two modes (default set by `[agents] preview_mode`, toggled with
+`v`):
+
+- **transcript** — the conversation reconstructed from the session's JSONL,
+  coloured by role (user / assistant / tool). Fast, no subprocess.
+- **screen** — the session's terminal screen reconstructed from `claude logs`
+  through a built-in ANSI emulator. Closer to the real display, but heavier
+  (logs are fetched in the background and throttled).
+
+The execution summary (`s`) runs `claude -p` against a transcript digest in the
+background — statelessly, so it never touches the live session — and shows a
+short bulleted summary. Both behaviours are configurable:
+
+```toml
+[agents]
+summary_model = "haiku"      # any `claude --model` value (alias or full id)
+preview_mode  = "transcript" # or "screen"
+```
+
+> The agent view reads Claude Code's own background-session state, so it needs a
+> Claude Code version that has the agent view. It is independent of the tmux
+> hook markers above.
+
 ## Setup
 
 Install the hooks into Claude Code's user settings (`~/.claude/settings.json`):
