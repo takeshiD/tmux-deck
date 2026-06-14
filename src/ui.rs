@@ -533,64 +533,97 @@ fn render_dashboard(frame: &mut Frame, state: &UIState) {
         render_agent_preview(frame, state, &state.agent_sessions[selected], preview_rect);
     }
     render_dashboard_status_bar(frame, state, status_area);
+
+    // The summary popup is independent of the preview panel.
+    if state.agent_summary_open {
+        render_agent_summary_popup(frame, state, &state.agent_sessions[selected], area);
+    }
 }
 
-/// Preview panel for the selected session: an execution summary section (on
-/// demand, via `claude -p`) above a tail of the conversation transcript.
+/// Style a reconstructed transcript line by its leading glyph: user prompts,
+/// assistant text and tool calls each get a distinct colour.
+fn transcript_line_style(line: &str, theme: &Theme) -> Style {
+    match line.chars().next() {
+        Some('▸') => Style::default().fg(theme.highlight), // user
+        Some('⏺') => Style::default().fg(theme.success),   // tool call
+        Some('●') => Style::default().fg(theme.focus_border), // assistant
+        _ => Style::default(),
+    }
+}
+
+/// Preview panel for the selected session: a tail of the conversation
+/// transcript, coloured by role. (The execution summary is a separate popup.)
 fn render_agent_preview(frame: &mut Frame, state: &UIState, session: &AgentSession, area: Rect) {
     let theme = state.theme;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
-        .title(format!(" {} ", truncate(&session.name, area.width.saturating_sub(4) as usize)));
+        .title(format!(
+            " {} ",
+            truncate(&session.name, area.width.saturating_sub(4) as usize)
+        ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Summary section (top) + transcript (bottom).
-    let rows = Layout::vertical([Constraint::Length(7), Constraint::Min(1)]).split(inner);
-    let summary_area = rows[0];
-    let transcript_area = rows[1];
-
-    // --- Summary ---
-    let mut summary_lines = vec![Line::from(Span::styled(
-        "Summary (s to generate)",
-        Style::default().fg(theme.highlight).add_modifier(Modifier::BOLD),
-    ))];
-    match state.summary_status(&session.id) {
-        Some(crate::app::SummaryStatus::Pending) => {
-            summary_lines.push(Line::from(Span::styled(
-                "summarizing…",
-                Style::default().fg(theme.unfocus_border),
-            )));
-        }
-        Some(crate::app::SummaryStatus::Ready(text)) => {
-            for l in text.lines().take(5) {
-                summary_lines.push(Line::from(l.to_string()));
-            }
-        }
-        Some(crate::app::SummaryStatus::Failed(e)) => {
-            summary_lines.push(Line::from(Span::styled(
-                format!("summary failed: {e}"),
-                Style::default().fg(theme.error),
-            )));
-        }
-        None => {
-            summary_lines.push(Line::from(Span::styled(
-                "press s to summarize this session",
-                Style::default().fg(theme.unfocus_border),
-            )));
-        }
-    }
-    frame.render_widget(Paragraph::new(summary_lines), summary_area);
-
-    // --- Transcript tail ---
     let tail = session
         .transcript_path
         .as_ref()
-        .map(|p| agents::transcript_tail(p, transcript_area.height as usize))
+        .map(|p| agents::transcript_tail(p, inner.height as usize))
         .unwrap_or_else(|| vec!["(no transcript)".to_string()]);
-    let lines: Vec<Line> = tail.into_iter().map(Line::from).collect();
-    frame.render_widget(Paragraph::new(lines), transcript_area);
+    let lines: Vec<Line> = tail
+        .into_iter()
+        .map(|l| {
+            let style = transcript_line_style(&l, &theme);
+            Line::from(Span::styled(l, style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Centred popup showing the on-demand execution summary for a session,
+/// independent of the preview panel. Opened with `s`, closed with `Esc`.
+fn render_agent_summary_popup(
+    frame: &mut Frame,
+    state: &UIState,
+    session: &AgentSession,
+    area: Rect,
+) {
+    let theme = state.theme;
+    let popup = centered_rect(70, 50, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.highlight))
+        .title(format!(" Summary — {} ", truncate(&session.name, 30)))
+        .title_bottom(Line::from(" s:regenerate · Esc:close ").centered());
+
+    let body = match state.summary_status(&session.id) {
+        Some(crate::app::SummaryStatus::Pending) => {
+            Text::styled("summarizing…", Style::default().fg(theme.unfocus_border))
+        }
+        Some(crate::app::SummaryStatus::Ready(text)) => Text::raw(text.clone()),
+        Some(crate::app::SummaryStatus::Failed(e)) => {
+            Text::styled(format!("summary failed: {e}"), Style::default().fg(theme.error))
+        }
+        None => Text::styled(
+            "press s to summarize",
+            Style::default().fg(theme.unfocus_border),
+        ),
+    };
+    frame.render_widget(Paragraph::new(body).block(block).wrap(ratatui::widgets::Wrap { trim: false }), popup);
+}
+
+/// A rect centred in `area`, sized as a percentage of it.
+fn centered_rect(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
+    let w = area.width * pct_w / 100;
+    let h = area.height * pct_h / 100;
+    Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 /// One agent-view row: state marker, name, summary, PR labels, elapsed time.
@@ -1237,6 +1270,15 @@ mod cursor_alignment_tests {
         ];
 
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| render_ui(f, &mut state)).unwrap();
+
+        // With the transcript preview split open.
+        state.agent_preview = true;
+        term.draw(|f| render_ui(f, &mut state)).unwrap();
+
+        // With the (independent) summary popup open.
+        state.agent_summary_open = true;
+        state.set_summary_pending("a1".to_string());
         term.draw(|f| render_ui(f, &mut state)).unwrap();
     }
 }

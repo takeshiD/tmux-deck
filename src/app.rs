@@ -435,8 +435,10 @@ pub struct UIState {
     /// Set to a session id when the user asks to attach; the UI loop consumes it
     /// to run `claude attach <id>` and clears it.
     pub pending_attach: Option<String>,
-    /// Whether the agent-view preview panel (transcript + summary) is shown.
+    /// Whether the agent-view transcript preview panel is shown (`p`).
     pub agent_preview: bool,
+    /// Whether the execution-summary popup is open (`s`); independent of preview.
+    pub agent_summary_open: bool,
     /// On-demand execution summaries, keyed by session short id.
     pub agent_summaries: HashMap<String, SummaryStatus>,
     /// Agent-view config (e.g. summary model).
@@ -507,6 +509,7 @@ impl UIState {
             agent_selected: 0,
             pending_attach: None,
             agent_preview: false,
+            agent_summary_open: false,
             agent_summaries: HashMap::new(),
             agents_config: config.agents,
 
@@ -643,9 +646,19 @@ impl UIState {
         self.agent_sessions.get(self.agent_selected)
     }
 
-    /// Toggle the preview panel (transcript + summary) for the selected session.
+    /// Toggle the transcript preview panel for the selected session.
     pub fn toggle_agent_preview(&mut self) {
         self.agent_preview = !self.agent_preview;
+    }
+
+    /// Open the execution-summary popup (independent of the preview panel).
+    pub fn open_agent_summary(&mut self) {
+        self.agent_summary_open = true;
+    }
+
+    /// Close the execution-summary popup.
+    pub fn close_agent_summary(&mut self) {
+        self.agent_summary_open = false;
     }
 
     /// Mark a session's summary as generating.

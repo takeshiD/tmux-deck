@@ -366,7 +366,16 @@ impl UIActor {
                     return Ok(false);
                 }
                 KeyCode::Char('s') if self.state.view_mode == ViewMode::Dashboard => {
+                    self.state.open_agent_summary();
                     self.request_agent_summary();
+                    return Ok(false);
+                }
+                // Esc closes the summary popup before falling through to quit.
+                KeyCode::Esc
+                    if self.state.view_mode == ViewMode::Dashboard
+                        && self.state.agent_summary_open =>
+                {
+                    self.state.close_agent_summary();
                     return Ok(false);
                 }
                 _ => {}
