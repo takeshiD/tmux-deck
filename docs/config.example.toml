@@ -16,6 +16,13 @@
 interval = 50
 
 # -----------------------------------------------------------------------------
+[agents]
+# Model used by `claude -p` when generating an execution summary for the
+# selected background session in the agent view (press `s`). Accepts any
+# `claude --model` value: an alias (haiku / sonnet / opus) or a full model id.
+summary_model = "haiku"
+
+# -----------------------------------------------------------------------------
 [theme]
 # A named colour preset. One of:
 #   default       monochrome   dracula     nord        gruvbox

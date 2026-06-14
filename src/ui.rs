@@ -505,6 +505,15 @@ fn render_dashboard(frame: &mut Frame, state: &UIState) {
 
     let selected = state.agent_selected.min(state.agent_sessions.len() - 1);
 
+    // With the preview open, split the body into list | preview.
+    let (list_rect, preview_rect) = if state.agent_preview {
+        let cols = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(list_area);
+        (cols[0], Some(cols[1]))
+    } else {
+        (list_area, None)
+    };
+
     // Build rows, inserting a directory header whenever the cwd changes.
     let mut items: Vec<ListItem> = Vec::new();
     let mut last_cwd: Option<&str> = None;
@@ -519,8 +528,69 @@ fn render_dashboard(frame: &mut Frame, state: &UIState) {
         items.push(agent_row_item(state, s, idx == selected));
     }
 
-    frame.render_widget(List::new(items).block(block), list_area);
+    frame.render_widget(List::new(items).block(block), list_rect);
+    if let Some(preview_rect) = preview_rect {
+        render_agent_preview(frame, state, &state.agent_sessions[selected], preview_rect);
+    }
     render_dashboard_status_bar(frame, state, status_area);
+}
+
+/// Preview panel for the selected session: an execution summary section (on
+/// demand, via `claude -p`) above a tail of the conversation transcript.
+fn render_agent_preview(frame: &mut Frame, state: &UIState, session: &AgentSession, area: Rect) {
+    let theme = state.theme;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(format!(" {} ", truncate(&session.name, area.width.saturating_sub(4) as usize)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Summary section (top) + transcript (bottom).
+    let rows = Layout::vertical([Constraint::Length(7), Constraint::Min(1)]).split(inner);
+    let summary_area = rows[0];
+    let transcript_area = rows[1];
+
+    // --- Summary ---
+    let mut summary_lines = vec![Line::from(Span::styled(
+        "Summary (s to generate)",
+        Style::default().fg(theme.highlight).add_modifier(Modifier::BOLD),
+    ))];
+    match state.summary_status(&session.id) {
+        Some(crate::app::SummaryStatus::Pending) => {
+            summary_lines.push(Line::from(Span::styled(
+                "summarizing…",
+                Style::default().fg(theme.unfocus_border),
+            )));
+        }
+        Some(crate::app::SummaryStatus::Ready(text)) => {
+            for l in text.lines().take(5) {
+                summary_lines.push(Line::from(l.to_string()));
+            }
+        }
+        Some(crate::app::SummaryStatus::Failed(e)) => {
+            summary_lines.push(Line::from(Span::styled(
+                format!("summary failed: {e}"),
+                Style::default().fg(theme.error),
+            )));
+        }
+        None => {
+            summary_lines.push(Line::from(Span::styled(
+                "press s to summarize this session",
+                Style::default().fg(theme.unfocus_border),
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(summary_lines), summary_area);
+
+    // --- Transcript tail ---
+    let tail = session
+        .transcript_path
+        .as_ref()
+        .map(|p| agents::transcript_tail(p, transcript_area.height as usize))
+        .unwrap_or_else(|| vec!["(no transcript)".to_string()]);
+    let lines: Vec<Line> = tail.into_iter().map(Line::from).collect();
+    frame.render_widget(Paragraph::new(lines), transcript_area);
 }
 
 /// One agent-view row: state marker, name, summary, PR labels, elapsed time.
@@ -580,6 +650,10 @@ fn render_dashboard_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
         Span::raw(":move "),
         Span::styled(kb.label(Action::Enter), Style::default().fg(theme.highlight)),
         Span::raw(":attach "),
+        Span::styled("p", Style::default().fg(theme.focus_border)),
+        Span::raw(":preview "),
+        Span::styled("s", Style::default().fg(theme.focus_border)),
+        Span::raw(":summary "),
         Span::styled(kb.label(Action::Dashboard), Style::default().fg(theme.focus_border)),
         Span::raw(":back "),
         Span::styled(kb.label(Action::Quit), Style::default().fg(theme.focus_border)),
@@ -1151,6 +1225,7 @@ mod cursor_alignment_tests {
                 elapsed_secs: 120,
                 prs: prs.iter().map(|p| crate::agents::PrRef { id: p.to_string() }).collect(),
                 alive: true,
+                transcript_path: None,
             }
         }
         let mut state = UIState::new(crate::config::Config::default());

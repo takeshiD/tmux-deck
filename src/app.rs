@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
@@ -6,8 +6,21 @@ use ratatui::text::Text;
 use ratatui::widgets::ListState;
 
 use crate::agents::{self, AgentSession};
-use crate::config::{BehaviorConfig, Config, HooksConfig, KeyBindings, LayoutConfig, Theme};
+use crate::config::{
+    AgentsConfig, BehaviorConfig, Config, HooksConfig, KeyBindings, LayoutConfig, Theme,
+};
 use crate::group::GroupStore;
+
+/// State of an on-demand execution summary for a background session.
+#[derive(Debug, Clone)]
+pub enum SummaryStatus {
+    /// A `claude -p` summary is being generated.
+    Pending,
+    /// Summary text ready to show.
+    Ready(String),
+    /// Generation failed (message).
+    Failed(String),
+}
 
 /// Label shown for the implicit group of sessions that have not been assigned
 /// to any user group. Only rendered when at least one session *is* grouped.
@@ -422,6 +435,12 @@ pub struct UIState {
     /// Set to a session id when the user asks to attach; the UI loop consumes it
     /// to run `claude attach <id>` and clears it.
     pub pending_attach: Option<String>,
+    /// Whether the agent-view preview panel (transcript + summary) is shown.
+    pub agent_preview: bool,
+    /// On-demand execution summaries, keyed by session short id.
+    pub agent_summaries: HashMap<String, SummaryStatus>,
+    /// Agent-view config (e.g. summary model).
+    pub agents_config: AgentsConfig,
 
     // Shared state
     pub pane_content: String,
@@ -487,6 +506,9 @@ impl UIState {
             agent_sessions: Vec::new(),
             agent_selected: 0,
             pending_attach: None,
+            agent_preview: false,
+            agent_summaries: HashMap::new(),
+            agents_config: config.agents,
 
             pane_content: String::new(),
             pane_content_parsed: None,
@@ -614,6 +636,35 @@ impl UIState {
         self.agent_sessions
             .get(self.agent_selected)
             .map(|s| s.id.clone())
+    }
+
+    /// The selected background session, if any.
+    pub fn selected_agent(&self) -> Option<&AgentSession> {
+        self.agent_sessions.get(self.agent_selected)
+    }
+
+    /// Toggle the preview panel (transcript + summary) for the selected session.
+    pub fn toggle_agent_preview(&mut self) {
+        self.agent_preview = !self.agent_preview;
+    }
+
+    /// Mark a session's summary as generating.
+    pub fn set_summary_pending(&mut self, id: String) {
+        self.agent_summaries.insert(id, SummaryStatus::Pending);
+    }
+
+    /// Store the outcome of a summary generation.
+    pub fn set_summary_result(&mut self, id: String, result: Result<String, String>) {
+        let status = match result {
+            Ok(text) => SummaryStatus::Ready(text),
+            Err(e) => SummaryStatus::Failed(e),
+        };
+        self.agent_summaries.insert(id, status);
+    }
+
+    /// Current summary status for a session, if any.
+    pub fn summary_status(&self, id: &str) -> Option<&SummaryStatus> {
+        self.agent_summaries.get(id)
     }
 
     /// Per-attention-group counts, used for the agent-view header summary.

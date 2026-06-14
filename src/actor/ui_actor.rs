@@ -52,6 +52,9 @@ pub struct UIActor {
     ui_event_rx: mpsc::Receiver<UIEvent>,
     key_rx: mpsc::Receiver<Event>,
     refresh_control: RefreshControl,
+    /// Results of background `claude -p` summary jobs: (session id, Ok(text)/Err).
+    agent_summary_tx: mpsc::Sender<(String, Result<String, String>)>,
+    agent_summary_rx: mpsc::Receiver<(String, Result<String, String>)>,
 }
 
 impl UIActor {
@@ -68,6 +71,8 @@ impl UIActor {
         let (key_tx, key_rx) = mpsc::channel::<Event>(64);
         spawn_key_event_poller(key_tx);
 
+        let (agent_summary_tx, agent_summary_rx) = mpsc::channel(8);
+
         Self {
             terminal,
             state,
@@ -77,6 +82,8 @@ impl UIActor {
             ui_event_rx,
             key_rx,
             refresh_control,
+            agent_summary_tx,
+            agent_summary_rx,
         }
     }
 
@@ -108,6 +115,11 @@ impl UIActor {
                     if self.handle_key_event(event).await? {
                         break; // Exit requested
                     }
+                }
+
+                // Completed background summary jobs.
+                Some((id, result)) = self.agent_summary_rx.recv() => {
+                    self.state.set_summary_result(id, result);
                 }
 
                 // TmuxActor responses
@@ -347,6 +359,16 @@ impl UIActor {
                     self.state.handle_space_press();
                     return Ok(false);
                 }
+                // Agent-view-only keys: `p` toggles the preview panel, `s`
+                // generates an execution summary for the selected session.
+                KeyCode::Char('p') if self.state.view_mode == ViewMode::Dashboard => {
+                    self.state.toggle_agent_preview();
+                    return Ok(false);
+                }
+                KeyCode::Char('s') if self.state.view_mode == ViewMode::Dashboard => {
+                    self.request_agent_summary();
+                    return Ok(false);
+                }
                 _ => {}
             }
         }
@@ -482,6 +504,38 @@ impl UIActor {
         Ok(())
     }
 
+    /// Kick off an execution summary for the selected background session by
+    /// running `claude -p` (stateless, against a transcript digest) in a
+    /// background task. The result is delivered over `agent_summary_rx`.
+    fn request_agent_summary(&mut self) {
+        let Some(session) = self.state.selected_agent() else {
+            return;
+        };
+        // Don't double-dispatch while one is already running.
+        if matches!(
+            self.state.summary_status(&session.id),
+            Some(crate::app::SummaryStatus::Pending)
+        ) {
+            return;
+        }
+        let Some(path) = session.transcript_path.clone() else {
+            self.state.set_summary_result(
+                session.id.clone(),
+                Err("no transcript for this session".into()),
+            );
+            return;
+        };
+        let id = session.id.clone();
+        let model = self.state.agents_config.summary_model.clone();
+        let tx = self.agent_summary_tx.clone();
+        self.state.set_summary_pending(id.clone());
+
+        tokio::spawn(async move {
+            let result = generate_summary(&path, &model).await;
+            let _ = tx.send((id, result)).await;
+        });
+    }
+
     fn handle_navigation_key(&mut self, code: KeyCode) {
         match self.state.view_mode {
             ViewMode::TreeView => match code {
@@ -580,6 +634,42 @@ impl UIActor {
                 self.state.set_error(message);
             }
         }
+    }
+}
+
+/// Run `claude -p` against a transcript digest to summarise what a background
+/// session did. Stateless (no `--resume`), so it never touches the live
+/// session or its transcript. Returns the summary text or an error message.
+async fn generate_summary(transcript_path: &str, model: &str) -> Result<String, String> {
+    let digest = crate::agents::transcript_digest(transcript_path, 6000);
+    if digest.trim().is_empty() {
+        return Err("transcript is empty".into());
+    }
+    let prompt = format!(
+        "以下は Claude Code セッションの会話抜粋です。このセッションがこれまでに\
+         何をしたかを、日本語で3〜5個の簡潔な箇条書きに要約してください。前置きや\
+         結びの文は不要です。\n\n---\n{digest}"
+    );
+
+    let output = tokio::process::Command::new("claude")
+        .arg("-p")
+        .arg(&prompt)
+        .arg("--model")
+        .arg(model)
+        .output()
+        .await
+        .map_err(|e| format!("failed to run claude: {e}"))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let msg = err.lines().next().unwrap_or("claude exited with error");
+        return Err(msg.to_string());
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        Err("empty summary".into())
+    } else {
+        Ok(text)
     }
 }
 

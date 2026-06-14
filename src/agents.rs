@@ -89,6 +89,8 @@ pub struct AgentSession {
     pub prs: Vec<PrRef>,
     /// True while the supervisor has a live worker process for this session.
     pub alive: bool,
+    /// Path to the conversation transcript JSONL, if known (for preview/summary).
+    pub transcript_path: Option<String>,
 }
 
 fn now_secs() -> i64 {
@@ -196,6 +198,11 @@ pub fn load_agent_sessions() -> Vec<AgentSession> {
             .map(|d| (now - d.as_secs() as i64).max(0))
             .unwrap_or(0);
 
+        let transcript_path = v
+            .get("linkScanPath")
+            .and_then(|s| s.as_str())
+            .map(String::from);
+
         sessions.push(AgentSession {
             alive: alive.contains(&id),
             id,
@@ -205,6 +212,7 @@ pub fn load_agent_sessions() -> Vec<AgentSession> {
             cwd,
             elapsed_secs,
             prs,
+            transcript_path,
         });
     }
 
@@ -250,6 +258,89 @@ fn sort_for_display(sessions: &mut [AgentSession]) {
     });
 }
 
+/// Extract human-readable lines from one transcript JSONL record. Returns
+/// labelled lines for user prompts, assistant text and tool calls; `thinking`
+/// blocks, snapshots and other internal records yield nothing.
+fn transcript_record_lines(v: &Value) -> Vec<String> {
+    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if ty != "user" && ty != "assistant" {
+        return Vec::new();
+    }
+    let role = v
+        .get("message")
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str())
+        .unwrap_or(ty);
+    let content = match v.get("message").and_then(|m| m.get("content")) {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    let mut push = |prefix: &str, text: String| {
+        let t = one_line(&text, 200);
+        if !t.is_empty() {
+            out.push(format!("{prefix} {t}"));
+        }
+    };
+
+    match content {
+        // User prompts are often a bare string.
+        Value::String(s) => push("▸", s.clone()),
+        Value::Array(blocks) => {
+            for b in blocks {
+                match b.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                            let prefix = if role == "user" { "▸" } else { "●" };
+                            push(prefix, t.to_string());
+                        }
+                    }
+                    Some("tool_use") => {
+                        let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                        push("⏺", name.to_string());
+                    }
+                    // Skip thinking, tool_result, images, etc.
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Read the tail of a transcript as readable lines (latest last), for the
+/// preview panel. Reads the whole file (transcripts are local and modest);
+/// returns at most `max_lines` formatted lines.
+pub fn transcript_tail(path: &str, max_lines: usize) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return vec!["(transcript unavailable)".to_string()];
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for raw in content.lines() {
+        if let Ok(v) = serde_json::from_str::<Value>(raw) {
+            lines.extend(transcript_record_lines(&v));
+        }
+    }
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    lines
+}
+
+/// Build a compact text digest of a transcript for the summary prompt, capped
+/// at roughly `max_chars` characters (keeping the most recent content).
+pub fn transcript_digest(path: &str, max_chars: usize) -> String {
+    let mut lines = transcript_tail(path, 400);
+    let mut digest = lines.join("\n");
+    while digest.chars().count() > max_chars && !lines.is_empty() {
+        lines.remove(0);
+        digest = lines.join("\n");
+    }
+    digest
+}
+
 /// Abbreviate a path for a group header, replacing `$HOME` with `~`.
 pub fn abbreviate_path(path: &str) -> String {
     if let Some(home) = std::env::var_os("HOME") {
@@ -275,6 +366,7 @@ mod tests {
             elapsed_secs: elapsed,
             prs: Vec::new(),
             alive: true,
+            transcript_path: None,
         }
     }
 
