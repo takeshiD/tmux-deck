@@ -21,6 +21,10 @@ interval = 50
 # selected background session in the agent view (press `s`). Accepts any
 # `claude --model` value: an alias (haiku / sonnet / opus) or a full model id.
 summary_model = "haiku"
+# Default preview mode in the agent view (`p`): "transcript" reconstructs the
+# conversation; "screen" reconstructs the terminal screen from `claude logs`.
+# Toggle at runtime with `v`.
+preview_mode = "transcript"
 
 # -----------------------------------------------------------------------------
 [theme]

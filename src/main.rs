@@ -5,6 +5,7 @@ mod cli;
 mod config;
 mod group;
 mod hook;
+mod termscreen;
 mod ui;
 
 use std::io;

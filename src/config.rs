@@ -113,12 +113,17 @@ pub struct AgentsConfig {
     /// selected background session (agent view, `s`). Accepts a `claude`
     /// `--model` value such as an alias (`haiku`, `sonnet`, `opus`) or a full id.
     pub summary_model: String,
+    /// Default preview mode in the agent view: `transcript` (reconstructed
+    /// conversation) or `screen` (reconstructed terminal screen via
+    /// `claude logs`). Toggle at runtime with `v`.
+    pub preview_mode: String,
 }
 
 impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
             summary_model: "haiku".to_string(),
+            preview_mode: "transcript".to_string(),
         }
     }
 }

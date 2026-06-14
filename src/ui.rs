@@ -551,33 +551,55 @@ fn transcript_line_style(line: &str, theme: &Theme) -> Style {
     }
 }
 
-/// Preview panel for the selected session: a tail of the conversation
-/// transcript, coloured by role. (The execution summary is a separate popup.)
+/// Preview panel for the selected session. Two modes (toggle with `v`):
+/// `transcript` reconstructs the conversation (coloured by role); `screen`
+/// reconstructs the terminal screen from `claude logs` via the emulator.
 fn render_agent_preview(frame: &mut Frame, state: &UIState, session: &AgentSession, area: Rect) {
     let theme = state.theme;
+    let mode = state.agent_preview_mode;
+    let title = format!(
+        " {} [{}] ",
+        truncate(&session.name, area.width.saturating_sub(12) as usize),
+        mode.label()
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
-        .title(format!(
-            " {} ",
-            truncate(&session.name, area.width.saturating_sub(4) as usize)
-        ));
+        .title(title)
+        .title_bottom(Line::from(" v:mode ").right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let tail = session
-        .transcript_path
-        .as_ref()
-        .map(|p| agents::transcript_tail(p, inner.height as usize))
-        .unwrap_or_else(|| vec!["(no transcript)".to_string()]);
-    let lines: Vec<Line> = tail
-        .into_iter()
-        .map(|l| {
-            let style = transcript_line_style(&l, &theme);
-            Line::from(Span::styled(l, style))
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+    match mode {
+        crate::app::PreviewMode::Transcript => {
+            let tail = session
+                .transcript_path
+                .as_ref()
+                .map(|p| agents::transcript_tail(p, inner.height as usize))
+                .unwrap_or_else(|| vec!["(no transcript)".to_string()]);
+            let lines: Vec<Line> = tail
+                .into_iter()
+                .map(|l| {
+                    let style = transcript_line_style(&l, &theme);
+                    Line::from(Span::styled(l, style))
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        crate::app::PreviewMode::Screen => match state.agent_logs_for(&session.id) {
+            Some(bytes) if !bytes.is_empty() => {
+                let screen = crate::termscreen::render_screen(bytes, inner.width, inner.height);
+                frame.render_widget(Paragraph::new(screen), inner);
+            }
+            _ => {
+                frame.render_widget(
+                    Paragraph::new("loading screen… (claude logs)")
+                        .style(Style::default().fg(theme.unfocus_border)),
+                    inner,
+                );
+            }
+        },
+    }
 }
 
 /// Centred popup showing the on-demand execution summary for a session,
@@ -685,6 +707,8 @@ fn render_dashboard_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
         Span::raw(":attach "),
         Span::styled("p", Style::default().fg(theme.focus_border)),
         Span::raw(":preview "),
+        Span::styled("v", Style::default().fg(theme.focus_border)),
+        Span::raw(":mode "),
         Span::styled("s", Style::default().fg(theme.focus_border)),
         Span::raw(":summary "),
         Span::styled(kb.label(Action::Dashboard), Style::default().fg(theme.focus_border)),

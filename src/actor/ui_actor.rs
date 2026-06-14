@@ -55,6 +55,13 @@ pub struct UIActor {
     /// Results of background `claude -p` summary jobs: (session id, Ok(text)/Err).
     agent_summary_tx: mpsc::Sender<(String, Result<String, String>)>,
     agent_summary_rx: mpsc::Receiver<(String, Result<String, String>)>,
+    /// Results of background `claude logs` fetches for the screen preview.
+    agent_logs_tx: mpsc::Sender<(String, Vec<u8>)>,
+    agent_logs_rx: mpsc::Receiver<(String, Vec<u8>)>,
+    /// Sessions whose `claude logs` fetch is in flight, and when each id was
+    /// last fetched (to throttle refresh).
+    logs_inflight: std::collections::HashSet<String>,
+    logs_fetched_at: std::collections::HashMap<String, std::time::Instant>,
 }
 
 impl UIActor {
@@ -72,6 +79,7 @@ impl UIActor {
         spawn_key_event_poller(key_tx);
 
         let (agent_summary_tx, agent_summary_rx) = mpsc::channel(8);
+        let (agent_logs_tx, agent_logs_rx) = mpsc::channel(8);
 
         Self {
             terminal,
@@ -84,6 +92,10 @@ impl UIActor {
             refresh_control,
             agent_summary_tx,
             agent_summary_rx,
+            agent_logs_tx,
+            agent_logs_rx,
+            logs_inflight: std::collections::HashSet::new(),
+            logs_fetched_at: std::collections::HashMap::new(),
         }
     }
 
@@ -122,6 +134,13 @@ impl UIActor {
                     self.state.set_summary_result(id, result);
                 }
 
+                // Completed `claude logs` fetches for the screen preview.
+                Some((id, bytes)) = self.agent_logs_rx.recv() => {
+                    self.logs_inflight.remove(&id);
+                    self.logs_fetched_at.insert(id.clone(), std::time::Instant::now());
+                    self.state.update_agent_logs(id, bytes);
+                }
+
                 // TmuxActor responses
                 Some(response) = self.tmux_res_rx.recv() => {
                     self.handle_tmux_response(response);
@@ -148,8 +167,13 @@ impl UIActor {
                                             .await;
                                     }
                                 }
-                                // The agent view reloads background sessions from disk.
-                                ViewMode::Dashboard => self.state.refresh_agents(),
+                                // The agent view reloads background sessions from
+                                // disk and, in screen-preview mode, refreshes the
+                                // selected session's `claude logs`.
+                                ViewMode::Dashboard => {
+                                    self.state.refresh_agents();
+                                    self.maybe_fetch_logs();
+                                }
                                 ViewMode::MultiPreview => {}
                             }
                         }
@@ -365,6 +389,10 @@ impl UIActor {
                     self.state.toggle_agent_preview();
                     return Ok(false);
                 }
+                KeyCode::Char('v') if self.state.view_mode == ViewMode::Dashboard => {
+                    self.state.cycle_preview_mode();
+                    return Ok(false);
+                }
                 KeyCode::Char('s') if self.state.view_mode == ViewMode::Dashboard => {
                     self.state.open_agent_summary();
                     self.request_agent_summary();
@@ -511,6 +539,44 @@ impl UIActor {
         }
         self.state.refresh_agents();
         Ok(())
+    }
+
+    /// In screen-preview mode, fetch the selected session's `claude logs`
+    /// output in the background, throttled per session. No-op unless the
+    /// preview is open in screen mode.
+    fn maybe_fetch_logs(&mut self) {
+        if !self.state.agent_preview
+            || self.state.agent_preview_mode != crate::app::PreviewMode::Screen
+        {
+            return;
+        }
+        let Some(session) = self.state.selected_agent() else {
+            return;
+        };
+        let id = session.id.clone();
+        if self.logs_inflight.contains(&id) {
+            return;
+        }
+        // Throttle: refetch a given session at most every ~3s.
+        let fresh = self
+            .logs_fetched_at
+            .get(&id)
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
+        if fresh {
+            return;
+        }
+        self.logs_inflight.insert(id.clone());
+        let tx = self.agent_logs_tx.clone();
+        tokio::spawn(async move {
+            let bytes = tokio::process::Command::new("claude")
+                .arg("logs")
+                .arg(&id)
+                .output()
+                .await
+                .map(|o| o.stdout)
+                .unwrap_or_default();
+            let _ = tx.send((id, bytes)).await;
+        });
     }
 
     /// Kick off an execution summary for the selected background session by
