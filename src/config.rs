@@ -40,6 +40,7 @@ pub struct Config {
     pub hooks: HooksConfig,
     pub layout: LayoutConfig,
     pub behavior: BehaviorConfig,
+    pub agents: AgentsConfig,
 }
 
 impl Config {
@@ -99,6 +100,27 @@ pub struct PreviewConfig {
     /// Preview refresh interval in milliseconds. `None` lets the CLI flag / the
     /// built-in default (300ms) win, so the precedence is CLI > config > 300.
     pub interval: Option<u64>,
+}
+
+// =============================================================================
+// [agents]
+// =============================================================================
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AgentsConfig {
+    /// Model passed to `claude -p` when generating an execution summary for the
+    /// selected background session (agent view, `s`). Accepts a `claude`
+    /// `--model` value such as an alias (`haiku`, `sonnet`, `opus`) or a full id.
+    pub summary_model: String,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            summary_model: "haiku".to_string(),
+        }
+    }
 }
 
 // =============================================================================

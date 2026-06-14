@@ -1,12 +1,26 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use ratatui::text::Text;
 use ratatui::widgets::ListState;
 
-use crate::config::{BehaviorConfig, Config, HooksConfig, KeyBindings, LayoutConfig, Theme};
+use crate::agents::{self, AgentSession};
+use crate::config::{
+    AgentsConfig, BehaviorConfig, Config, HooksConfig, KeyBindings, LayoutConfig, Theme,
+};
 use crate::group::GroupStore;
+
+/// State of an on-demand execution summary for a background session.
+#[derive(Debug, Clone)]
+pub enum SummaryStatus {
+    /// A `claude -p` summary is being generated.
+    Pending,
+    /// Summary text ready to show.
+    Ready(String),
+    /// Generation failed (message).
+    Failed(String),
+}
 
 /// Label shown for the implicit group of sessions that have not been assigned
 /// to any user group. Only rendered when at least one session *is* grouped.
@@ -113,11 +127,14 @@ pub struct TmuxPane {
     pub has_claude: bool,
     /// Latest state reported by Claude Code hooks for this pane, if any.
     pub claude_state: Option<ClaudeState>,
-    /// One-line summary of what Claude is currently doing (e.g. `Edit: src/app.rs`),
-    /// sourced from the hook activity digest. `None` when unknown.
+    // The hook (see [`crate::hook`]) still collects this per-pane context;
+    // it is reserved for an inline tree-view indicator and not yet displayed,
+    // so these carry `#[allow(dead_code)]`.
+    /// One-line summary of what Claude is currently doing (e.g. `Edit: src/app.rs`).
+    #[allow(dead_code)]
     pub claude_activity: Option<String>,
-    /// Unix timestamp (secs) when the current Claude state began. Used to show
-    /// how long a pane has been working/waiting.
+    /// Unix timestamp (secs) when the current Claude state began.
+    #[allow(dead_code)]
     pub claude_state_since: Option<i64>,
     /// Working directory Claude reported for this pane (repo identification).
     #[allow(dead_code)]
@@ -126,6 +143,7 @@ pub struct TmuxPane {
 
 impl TmuxPane {
     /// Seconds elapsed since the current Claude state began, if known.
+    #[allow(dead_code)]
     pub fn claude_state_elapsed_secs(&self) -> Option<i64> {
         self.claude_state_since
             .map(|since| crate::hook::now_secs().saturating_sub(since).max(0))
@@ -178,22 +196,9 @@ pub struct TmuxSession {
 pub enum ViewMode {
     TreeView,
     MultiPreview,
-    /// Full-screen fleet dashboard: every pane running Claude across all
-    /// sessions, sorted by how much it wants attention.
+    /// Full-screen fleet view of Claude Code background sessions (the
+    /// `claude agents` agent view), grouped by working directory.
     Dashboard,
-}
-
-/// One row of the fleet dashboard: a single pane running Claude, with the
-/// context needed to render it and to jump to it.
-#[derive(Debug, Clone)]
-pub struct DashboardRow {
-    /// tmux target (`session:window.pane`) for switching to this pane.
-    pub target: String,
-    pub session: String,
-    pub pane_id: String,
-    pub state: ClaudeState,
-    pub activity: Option<String>,
-    pub elapsed_secs: Option<i64>,
 }
 
 /// Focus area in TreeView mode
@@ -421,8 +426,23 @@ pub struct UIState {
     pub multi_session: usize,
     pub multi_window: usize,
 
-    /// Selected row index in the fleet dashboard (`ViewMode::Dashboard`).
-    pub dashboard_selected: usize,
+    /// Claude Code background sessions shown in the agent view, refreshed from
+    /// `~/.claude/jobs` while the dashboard is open. Order matches the rendered
+    /// (grouped-by-directory) order, so `agent_selected` indexes it directly.
+    pub agent_sessions: Vec<AgentSession>,
+    /// Selected row in the agent view (`ViewMode::Dashboard`).
+    pub agent_selected: usize,
+    /// Set to a session id when the user asks to attach; the UI loop consumes it
+    /// to run `claude attach <id>` and clears it.
+    pub pending_attach: Option<String>,
+    /// Whether the agent-view transcript preview panel is shown (`p`).
+    pub agent_preview: bool,
+    /// Whether the execution-summary popup is open (`s`); independent of preview.
+    pub agent_summary_open: bool,
+    /// On-demand execution summaries, keyed by session short id.
+    pub agent_summaries: HashMap<String, SummaryStatus>,
+    /// Agent-view config (e.g. summary model).
+    pub agents_config: AgentsConfig,
 
     // Shared state
     pub pane_content: String,
@@ -485,7 +505,13 @@ impl UIState {
             multi_session: 0,
             multi_window: 0,
 
-            dashboard_selected: 0,
+            agent_sessions: Vec::new(),
+            agent_selected: 0,
+            pending_attach: None,
+            agent_preview: false,
+            agent_summary_open: false,
+            agent_summaries: HashMap::new(),
+            agents_config: config.agents,
 
             pane_content: String::new(),
             pane_content_parsed: None,
@@ -572,67 +598,101 @@ impl UIState {
     }
 
     // =========================================================================
-    // Fleet Dashboard
+    // Agent View (Claude Code background sessions)
     // =========================================================================
 
-    /// Toggle the fleet dashboard on/off. Entering it resets the selection.
+    /// Toggle the agent view on/off. Entering it loads the current background
+    /// sessions and resets the selection.
     pub fn toggle_dashboard(&mut self) {
         if self.view_mode == ViewMode::Dashboard {
             self.view_mode = ViewMode::TreeView;
         } else {
-            self.dashboard_selected = 0;
+            self.agent_selected = 0;
+            self.refresh_agents();
             self.view_mode = ViewMode::Dashboard;
         }
     }
 
-    /// All panes currently running Claude (or carrying a hook state), across
-    /// every session, sorted by attention priority (Waiting → Error → Working
-    /// → Done) and then by how long they have been in that state (longest
-    /// first), so a stuck/old item floats up within its group.
-    pub fn dashboard_rows(&self) -> Vec<DashboardRow> {
-        let mut rows: Vec<DashboardRow> = Vec::new();
-        for session in &self.sessions {
-            for window in &session.windows {
-                for pane in &window.panes {
-                    let Some(state) = pane.claude_state else {
-                        continue;
-                    };
-                    rows.push(DashboardRow {
-                        target: format!("{}:{}.{}", session.name, window.index, pane.index),
-                        session: session.name.clone(),
-                        pane_id: pane.id.clone(),
-                        state,
-                        activity: pane.claude_activity.clone(),
-                        elapsed_secs: pane.claude_state_elapsed_secs(),
-                    });
-                }
+    /// Reload background sessions from `~/.claude/jobs`, keeping the selection
+    /// in range.
+    pub fn refresh_agents(&mut self) {
+        self.agent_sessions = agents::load_agent_sessions();
+        if self.agent_sessions.is_empty() {
+            self.agent_selected = 0;
+        } else {
+            self.agent_selected = self.agent_selected.min(self.agent_sessions.len() - 1);
+        }
+    }
+
+    pub fn agent_select_prev(&mut self) {
+        self.agent_selected = self.agent_selected.saturating_sub(1);
+    }
+
+    pub fn agent_select_next(&mut self) {
+        if !self.agent_sessions.is_empty() {
+            self.agent_selected = (self.agent_selected + 1).min(self.agent_sessions.len() - 1);
+        }
+    }
+
+    /// Id of the selected background session, for `claude attach <id>`.
+    pub fn selected_agent_id(&self) -> Option<String> {
+        self.agent_sessions
+            .get(self.agent_selected)
+            .map(|s| s.id.clone())
+    }
+
+    /// The selected background session, if any.
+    pub fn selected_agent(&self) -> Option<&AgentSession> {
+        self.agent_sessions.get(self.agent_selected)
+    }
+
+    /// Toggle the transcript preview panel for the selected session.
+    pub fn toggle_agent_preview(&mut self) {
+        self.agent_preview = !self.agent_preview;
+    }
+
+    /// Open the execution-summary popup (independent of the preview panel).
+    pub fn open_agent_summary(&mut self) {
+        self.agent_summary_open = true;
+    }
+
+    /// Close the execution-summary popup.
+    pub fn close_agent_summary(&mut self) {
+        self.agent_summary_open = false;
+    }
+
+    /// Mark a session's summary as generating.
+    pub fn set_summary_pending(&mut self, id: String) {
+        self.agent_summaries.insert(id, SummaryStatus::Pending);
+    }
+
+    /// Store the outcome of a summary generation.
+    pub fn set_summary_result(&mut self, id: String, result: Result<String, String>) {
+        let status = match result {
+            Ok(text) => SummaryStatus::Ready(text),
+            Err(e) => SummaryStatus::Failed(e),
+        };
+        self.agent_summaries.insert(id, status);
+    }
+
+    /// Current summary status for a session, if any.
+    pub fn summary_status(&self, id: &str) -> Option<&SummaryStatus> {
+        self.agent_summaries.get(id)
+    }
+
+    /// Per-attention-group counts, used for the agent-view header summary.
+    pub fn agent_group_counts(&self) -> (usize, usize, usize) {
+        let mut needs = 0;
+        let mut working = 0;
+        let mut completed = 0;
+        for s in &self.agent_sessions {
+            match s.state.group() {
+                crate::agents::AgentGroup::NeedsInput => needs += 1,
+                crate::agents::AgentGroup::Working => working += 1,
+                crate::agents::AgentGroup::Completed => completed += 1,
             }
         }
-        rows.sort_by(|a, b| {
-            b.state
-                .priority()
-                .cmp(&a.state.priority())
-                .then(b.elapsed_secs.cmp(&a.elapsed_secs))
-        });
-        rows
-    }
-
-    pub fn dashboard_move_up(&mut self) {
-        self.dashboard_selected = self.dashboard_selected.saturating_sub(1);
-    }
-
-    pub fn dashboard_move_down(&mut self) {
-        let len = self.dashboard_rows().len();
-        if len > 0 {
-            self.dashboard_selected = (self.dashboard_selected + 1).min(len - 1);
-        }
-    }
-
-    /// tmux target of the currently highlighted dashboard row, if any.
-    pub fn get_dashboard_target(&self) -> Option<String> {
-        self.dashboard_rows()
-            .get(self.dashboard_selected)
-            .map(|r| r.target.clone())
+        (needs, working, completed)
     }
 
     // =========================================================================
@@ -655,7 +715,8 @@ impl UIState {
         match self.view_mode {
             ViewMode::TreeView => self.get_selected_pane_target(),
             ViewMode::MultiPreview => self.get_multi_selected_target(),
-            ViewMode::Dashboard => self.get_dashboard_target(),
+            // Agent-view sessions are not tmux panes; they have no send-keys target.
+            ViewMode::Dashboard => None,
         }
     }
 
@@ -674,7 +735,8 @@ impl UIState {
                 Focus::Panes => self.get_selected_pane_target(),
             },
             ViewMode::MultiPreview => self.get_multi_selected_target(),
-            ViewMode::Dashboard => self.get_dashboard_target(),
+            // The agent view attaches via `claude attach`, not a tmux target.
+            ViewMode::Dashboard => None,
         }
     }
 
@@ -1286,62 +1348,6 @@ mod tests {
 
     /// Build a session with a single window holding the given panes, each
     /// described as `(pane_id, index, claude_state, state_since)`.
-    fn session_with_panes(
-        name: &str,
-        panes: &[(&str, u32, Option<ClaudeState>, Option<i64>)],
-    ) -> TmuxSession {
-        let panes = panes
-            .iter()
-            .map(|(id, index, state, since)| TmuxPane {
-                id: id.to_string(),
-                index: *index,
-                width: 80,
-                height: 24,
-                active: false,
-                current_command: String::new(),
-                pid: 0,
-                has_claude: state.is_some(),
-                claude_state: *state,
-                claude_activity: None,
-                claude_state_since: *since,
-                claude_cwd: None,
-            })
-            .collect();
-        let mut s = session(name);
-        s.windows = vec![TmuxWindow {
-            index: 0,
-            name: "w".to_string(),
-            panes,
-            has_claude: false,
-            claude_state: None,
-        }];
-        s
-    }
-
-    #[test]
-    fn dashboard_rows_sort_by_attention_then_age() {
-        let mut state = UIState::new(Config::default());
-        state.groups = GroupStore::default();
-        // working(old) / working(new) / waiting / done — plus a non-Claude pane.
-        state.sessions = vec![session_with_panes(
-            "s",
-            &[
-                ("%1", 0, Some(ClaudeState::Working), Some(100)), // older working
-                ("%2", 1, Some(ClaudeState::Working), Some(200)), // newer working
-                ("%3", 2, Some(ClaudeState::Waiting), Some(150)),
-                ("%4", 3, Some(ClaudeState::Done), Some(10)),
-                ("%5", 4, None, None), // no Claude -> excluded
-            ],
-        )];
-
-        let rows = state.dashboard_rows();
-        // Waiting first; then the two Working (older = larger elapsed first);
-        // then Done. The non-Claude pane is excluded.
-        let order: Vec<&str> = rows.iter().map(|r| r.pane_id.as_str()).collect();
-        assert_eq!(order, vec!["%3", "%1", "%2", "%4"]);
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0].target, "s:0.2");
-    }
 
     #[test]
     fn ungrouped_sessions_have_no_headers() {

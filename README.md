@@ -8,7 +8,7 @@ Monitoring multi session Realtime preview.
 - 📄 Easy management Windows and Panes between Sessions
 - 👀 Realtime Preview
 - 🤖 Claude Code status markers (working / waiting / done) driven by hooks
-- 🛰️ Claude fleet dashboard (`d`): every Claude pane sorted by attention, jump with `Enter`
+- 🛰️ Claude agent view (`d`): lists Claude Code background sessions (`claude agents`) grouped by directory — state, name, summary, PRs, elapsed. `Enter` attaches via `claude attach`, `p` toggles a transcript preview, `s` generates an execution summary (`claude -p`)
 - ⚙️ Easy Configure
 
 # Quick Start

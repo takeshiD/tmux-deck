@@ -2,7 +2,11 @@ use std::io;
 use std::time::Duration;
 
 use color_eyre::Result;
+use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, oneshot};
@@ -48,6 +52,9 @@ pub struct UIActor {
     ui_event_rx: mpsc::Receiver<UIEvent>,
     key_rx: mpsc::Receiver<Event>,
     refresh_control: RefreshControl,
+    /// Results of background `claude -p` summary jobs: (session id, Ok(text)/Err).
+    agent_summary_tx: mpsc::Sender<(String, Result<String, String>)>,
+    agent_summary_rx: mpsc::Receiver<(String, Result<String, String>)>,
 }
 
 impl UIActor {
@@ -64,6 +71,8 @@ impl UIActor {
         let (key_tx, key_rx) = mpsc::channel::<Event>(64);
         spawn_key_event_poller(key_tx);
 
+        let (agent_summary_tx, agent_summary_rx) = mpsc::channel(8);
+
         Self {
             terminal,
             state,
@@ -73,6 +82,8 @@ impl UIActor {
             ui_event_rx,
             key_rx,
             refresh_control,
+            agent_summary_tx,
+            agent_summary_rx,
         }
     }
 
@@ -106,6 +117,11 @@ impl UIActor {
                     }
                 }
 
+                // Completed background summary jobs.
+                Some((id, result)) = self.agent_summary_rx.recv() => {
+                    self.state.set_summary_result(id, result);
+                }
+
                 // TmuxActor responses
                 Some(response) = self.tmux_res_rx.recv() => {
                     self.handle_tmux_response(response);
@@ -120,15 +136,21 @@ impl UIActor {
                             // tmux refreshes.
                             self.state.refresh_claude_states();
 
-                            // Request pane capture if in TreeView mode (low-priority channel)
-                            if self.state.view_mode == ViewMode::TreeView
-                                && let Some((target, start, end)) =
-                                    self.state.get_selected_pane_target_with_capture_range()
-                            {
-                                let _ = self
-                                    .tmux_capture_tx
-                                    .send(TmuxCommand::CapturePane { target, start, end })
-                                    .await;
+                            match self.state.view_mode {
+                                // TreeView captures the selected pane for its preview.
+                                ViewMode::TreeView => {
+                                    if let Some((target, start, end)) =
+                                        self.state.get_selected_pane_target_with_capture_range()
+                                    {
+                                        let _ = self
+                                            .tmux_capture_tx
+                                            .send(TmuxCommand::CapturePane { target, start, end })
+                                            .await;
+                                    }
+                                }
+                                // The agent view reloads background sessions from disk.
+                                ViewMode::Dashboard => self.state.refresh_agents(),
+                                ViewMode::MultiPreview => {}
                             }
                         }
                         UIEvent::Shutdown => {
@@ -142,6 +164,13 @@ impl UIActor {
                 _ = anim.tick() => {
                     redraw = self.state.has_working_claude();
                 }
+            }
+
+            // An attach request suspends the TUI, hands the terminal to
+            // `claude attach <id>`, then restores the TUI when it returns.
+            if let Some(id) = self.state.pending_attach.take() {
+                self.attach_agent(&id)?;
+                continue;
             }
 
             // Render UI after processing event (event-driven rendering)
@@ -326,8 +355,27 @@ impl UIActor {
                     self.state.pending_z = true;
                     return Ok(false);
                 }
-                KeyCode::Char(' ') => {
+                KeyCode::Char(' ') if self.state.view_mode != ViewMode::Dashboard => {
                     self.state.handle_space_press();
+                    return Ok(false);
+                }
+                // Agent-view-only keys: `p` toggles the preview panel, `s`
+                // generates an execution summary for the selected session.
+                KeyCode::Char('p') if self.state.view_mode == ViewMode::Dashboard => {
+                    self.state.toggle_agent_preview();
+                    return Ok(false);
+                }
+                KeyCode::Char('s') if self.state.view_mode == ViewMode::Dashboard => {
+                    self.state.open_agent_summary();
+                    self.request_agent_summary();
+                    return Ok(false);
+                }
+                // Esc closes the summary popup before falling through to quit.
+                KeyCode::Esc
+                    if self.state.view_mode == ViewMode::Dashboard
+                        && self.state.agent_summary_open =>
+                {
+                    self.state.close_agent_summary();
                     return Ok(false);
                 }
                 _ => {}
@@ -361,6 +409,11 @@ impl UIActor {
                 Action::KillSession => {
                     self.state.open_kill_session_popup();
                     self.refresh_control.pause();
+                }
+                Action::Enter if self.state.view_mode == ViewMode::Dashboard => {
+                    // Attach to the selected background session. The UI loop
+                    // consumes `pending_attach` to run `claude attach <id>`.
+                    self.state.pending_attach = self.state.selected_agent_id();
                 }
                 Action::Enter => {
                     if let Some(target) = self.state.get_enter_target() {
@@ -433,6 +486,65 @@ impl UIActor {
         Ok(())
     }
 
+    /// Suspend the TUI, run `claude attach <id>` with the terminal handed over,
+    /// then restore the TUI. Mirrors the agent view's attach/detach: when the
+    /// user detaches (or the session ends) we come back to the list.
+    fn attach_agent(&mut self, id: &str) -> Result<()> {
+        // Tear down our TUI so claude owns a clean terminal.
+        self.refresh_control.pause();
+        disable_raw_mode()?;
+        io::stdout().execute(LeaveAlternateScreen)?;
+
+        let status = std::process::Command::new("claude")
+            .arg("attach")
+            .arg(id)
+            .status();
+
+        // Restore the TUI regardless of how claude exited.
+        enable_raw_mode()?;
+        io::stdout().execute(EnterAlternateScreen)?;
+        self.terminal.clear()?;
+        self.refresh_control.resume();
+
+        if let Err(e) = status {
+            self.state.set_error(format!("claude attach failed: {e}"));
+        }
+        self.state.refresh_agents();
+        Ok(())
+    }
+
+    /// Kick off an execution summary for the selected background session by
+    /// running `claude -p` (stateless, against a transcript digest) in a
+    /// background task. The result is delivered over `agent_summary_rx`.
+    fn request_agent_summary(&mut self) {
+        let Some(session) = self.state.selected_agent() else {
+            return;
+        };
+        // Don't double-dispatch while one is already running.
+        if matches!(
+            self.state.summary_status(&session.id),
+            Some(crate::app::SummaryStatus::Pending)
+        ) {
+            return;
+        }
+        let Some(path) = session.transcript_path.clone() else {
+            self.state.set_summary_result(
+                session.id.clone(),
+                Err("no transcript for this session".into()),
+            );
+            return;
+        };
+        let id = session.id.clone();
+        let model = self.state.agents_config.summary_model.clone();
+        let tx = self.agent_summary_tx.clone();
+        self.state.set_summary_pending(id.clone());
+
+        tokio::spawn(async move {
+            let result = generate_summary(&path, &model).await;
+            let _ = tx.send((id, result)).await;
+        });
+    }
+
     fn handle_navigation_key(&mut self, code: KeyCode) {
         match self.state.view_mode {
             ViewMode::TreeView => match code {
@@ -452,8 +564,12 @@ impl UIActor {
                 _ => {}
             },
             ViewMode::Dashboard => match code {
-                KeyCode::Up | KeyCode::Char('k') => self.state.dashboard_move_up(),
-                KeyCode::Down | KeyCode::Char('j') => self.state.dashboard_move_down(),
+                KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                    self.state.agent_select_next()
+                }
+                KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+                    self.state.agent_select_prev()
+                }
                 _ => {}
             },
         }
@@ -527,6 +643,42 @@ impl UIActor {
                 self.state.set_error(message);
             }
         }
+    }
+}
+
+/// Run `claude -p` against a transcript digest to summarise what a background
+/// session did. Stateless (no `--resume`), so it never touches the live
+/// session or its transcript. Returns the summary text or an error message.
+async fn generate_summary(transcript_path: &str, model: &str) -> Result<String, String> {
+    let digest = crate::agents::transcript_digest(transcript_path, 6000);
+    if digest.trim().is_empty() {
+        return Err("transcript is empty".into());
+    }
+    let prompt = format!(
+        "以下は Claude Code セッションの会話抜粋です。このセッションがこれまでに\
+         何をしたかを、日本語で3〜5個の簡潔な箇条書きに要約してください。前置きや\
+         結びの文は不要です。\n\n---\n{digest}"
+    );
+
+    let output = tokio::process::Command::new("claude")
+        .arg("-p")
+        .arg(&prompt)
+        .arg("--model")
+        .arg(model)
+        .output()
+        .await
+        .map_err(|e| format!("failed to run claude: {e}"))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let msg = err.lines().next().unwrap_or("claude exited with error");
+        return Err(msg.to_string());
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        Err("empty summary".into())
+    } else {
+        Ok(text)
     }
 }
 

@@ -1,4 +1,5 @@
 mod actor;
+mod agents;
 mod app;
 mod cli;
 mod config;
