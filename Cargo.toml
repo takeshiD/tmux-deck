@@ -7,7 +7,8 @@ repository = "https://github.com/takeshid/tmux-deck"
 keywords = ["tmux", "cli"]
 license-file = "LICENSE"
 readme = "README.md"
-description = "A Tmux session manager. Monitoring multi session Realtime preview."
+description = "Interactive tmux session manager with live pane previews."
+exclude = ["assets/**", "demo/**"]
 
 [dependencies]
 ratatui = "0.29"
