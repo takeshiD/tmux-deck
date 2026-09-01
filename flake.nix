@@ -1,6 +1,13 @@
 {
   description = "Cross compiling a rust program using rust-overlay";
 
+  nixConfig = {
+    extra-substituters = [ "https://takeshid.cachix.org" ];
+    extra-trusted-public-keys = [
+      "takeshid.cachix.org-1:2GsGTUZ3djVzbGzXgeia+SRV1ZJYOXySHyNfBPsEjRA="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";

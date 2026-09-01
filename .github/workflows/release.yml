@@ -1,106 +1,260 @@
 name: Release
+
 on:
   push:
     tags:
       - "v*.*.*"
-permissions:
-  contents: write
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  tag-check:
-    runs-on: ubuntu-latest
+  validate:
+    name: Validate release source
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - uses: actions/checkout@v6
-      - name: Check to match tag version and Cargo.toml version
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "::group::Tag validation"
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.90
+      - name: Validate tag, versions, and ancestry
+        id: release
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: .github/scripts/verify-release.sh
 
-          # 1. Must be a tag and match the regex
-          [[ "${GITHUB_REF_TYPE}" == "tag" ]] \
-            || { echo "❌  Not a tag push"; exit 1; }
-          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta)(\.[0-9]+)?)?$ ]] \
-            || { echo "❌  Tag '${GITHUB_REF_NAME}' doesn't match expected format"; exit 1; }
-
-          # 2. Extract versions
-          tag_ver="${GITHUB_REF_NAME#v}"
-          cargo_ver="$(grep -m1 '^version' Cargo.toml \
-                        | sed -E 's/version *= *"([^"]+)".*/\1/')"
-
-          # 3. Compare
-          [[ "${tag_ver}" == "${cargo_ver}" ]] \
-            || { echo "❌  Tag ${tag_ver} ≠ Cargo.toml ${cargo_ver}"; exit 1; }
-
-          echo "✅  Tag and Cargo.toml agree (${tag_ver})"
-          echo "::endgroup::"
-  build:
-    needs: tag-check
-    name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+  preflight:
+    name: Preflight
+    needs: validate
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --all --locked
+      - name: Lint
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Verify publishable package
+        run: cargo publish --dry-run --locked
+
+  rust-artifacts:
+    name: Rust - ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - runner: macos-latest
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.90
         with:
           targets: ${{ matrix.target }}
-      - name: Run tests
-        run: cargo test --all
-      - name: Build
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Run native tests
+        run: cargo test --all --locked --target ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package release binary
         shell: bash
-        run: cargo build --target ${{ matrix.target }} --release
-      - name: Package binary
-        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
+          set -euo pipefail
+          bin_name="tmux-deck"
+          archive="${bin_name}-${TARGET}.tar.gz"
           mkdir -p dist
-          bin_name="$(cargo metadata --no-deps --format-version=1 \
-                    | jq -r '.packages[0].targets[] | select(.kind[]=="bin").name')"
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
-            bin_file="${bin_name}".exe
+          cp "target/${TARGET}/release/${bin_name}" dist/
+          tar -czf "dist/${archive}" -C dist "${bin_name}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${archive}" > "${archive}.sha256")
           else
-            bin_file="${bin_name}"
+            (cd dist && shasum -a 256 "${archive}" > "${archive}.sha256")
           fi
-          cp target/${{ matrix.target }}/release/${bin_file} dist/
-          tar czf dist/${bin_name}-${{ matrix.target }}.tar.gz -C dist ${bin_file}
-      - name: Upload artifacts
+      - name: Upload release artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.target }}
-          path: dist/*.tar.gz
+          path: dist/*
+          if-no-files-found: error
 
-  release:
-    needs:
-      - tag-check
-      - build
-    name: Release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v6
-        with:
-          path: artifacts
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/**/*.tar.gz
-
-  cachix:
-    needs: tag-check
-    name: Cachix - ${{ matrix.runner }}
+  nix-build:
+    name: Nix - ${{ matrix.system }}
+    needs: validate
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
-        runner:
-          - ubuntu-latest
-          - macos-latest
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - runner: macos-15-intel
+            system: x86_64-darwin
+          - runner: macos-15
+            system: aarch64-darwin
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Build without publish credentials
+        run: nix build --accept-flake-config .#default --print-build-logs
+
+  publish-crate:
+    name: Publish crates.io
+    if: needs.validate.outputs.publish == 'true'
+    needs:
+      - validate
+      - preflight
+      - rust-artifacts
+      - nix-build
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.90
+      - name: Check whether this exact crate is already published
+        id: registry
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo package --locked
+          crate="target/package/tmux-deck-${VERSION}.crate"
+          local_checksum="$(sha256sum "${crate}" | cut -d ' ' -f 1)"
+          response="${RUNNER_TEMP}/crates-io-version.json"
+          status="$(curl --silent --show-error --output "${response}" --write-out '%{http_code}' \
+            --header 'User-Agent: tmux-deck-release-workflow (https://github.com/takeshiD/tmux-deck)' \
+            "https://crates.io/api/v1/crates/tmux-deck/${VERSION}")"
+
+          case "${status}" in
+            200)
+              published_checksum="$(jq -er '.version.checksum' "${response}")"
+              [[ "${published_checksum}" == "${local_checksum}" ]] || {
+                echo "crates.io already has tmux-deck ${VERSION}, but its checksum differs" >&2
+                exit 1
+              }
+              echo "tmux-deck ${VERSION} is already published with the expected checksum"
+              echo "publish_needed=false" >> "${GITHUB_OUTPUT}"
+              ;;
+            404)
+              echo "publish_needed=true" >> "${GITHUB_OUTPUT}"
+              ;;
+            *)
+              echo "crates.io returned HTTP ${status} while checking tmux-deck ${VERSION}" >&2
+              cat "${response}" >&2
+              exit 1
+              ;;
+          esac
+      - name: Authenticate to crates.io with OIDC
+        if: steps.registry.outputs.publish_needed == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish crate
+        if: steps.registry.outputs.publish_needed == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          cargo publish --locked
+          publish_status=$?
+          set -e
+          if [[ "${publish_status}" -eq 0 ]]; then
+            exit 0
+          fi
+
+          echo "cargo publish returned ${publish_status}; checking whether the upload completed"
+          crate="target/package/tmux-deck-${VERSION}.crate"
+          local_checksum="$(sha256sum "${crate}" | cut -d ' ' -f 1)"
+          response="${RUNNER_TEMP}/crates-io-version-after-publish.json"
+          for attempt in {1..12}; do
+            sleep 10
+            status="$(curl --silent --show-error --output "${response}" --write-out '%{http_code}' \
+              --header 'User-Agent: tmux-deck-release-workflow (https://github.com/takeshiD/tmux-deck)' \
+              "https://crates.io/api/v1/crates/tmux-deck/${VERSION}")"
+            if [[ "${status}" == "200" ]]; then
+              published_checksum="$(jq -er '.version.checksum' "${response}")" || exit 1
+              [[ "${published_checksum}" == "${local_checksum}" ]] || {
+                echo "published checksum differs from the release package" >&2
+                exit 1
+              }
+              echo "the upload completed despite cargo's non-zero exit"
+              exit 0
+            fi
+            [[ "${status}" == "404" ]] || {
+              echo "crates.io returned unexpected HTTP ${status}" >&2
+              exit 1
+            }
+            echo "waiting for crates.io index (${attempt}/12)"
+          done
+          exit "${publish_status}"
+
+  publish-cachix:
+    name: Publish Cachix - ${{ matrix.system }}
+    if: needs.validate.outputs.publish == 'true'
+    needs:
+      - validate
+      - preflight
+      - rust-artifacts
+      - nix-build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - runner: macos-15-intel
+            system: x86_64-darwin
+          - runner: macos-15
+            system: aarch64-darwin
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
@@ -111,5 +265,41 @@ jobs:
         with:
           name: takeshid
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - name: Build and push to Cachix
-        run: nix build .#default --print-build-logs
+      - name: Build and push
+        run: nix build --accept-flake-config .#default --print-build-logs
+
+  github-release:
+    name: Complete GitHub release
+    if: needs.validate.outputs.publish == 'true'
+    needs:
+      - validate
+      - publish-crate
+      - publish-cachix
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+      - name: Create or converge the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find artifacts -type f -print | sort)
+          [[ "${#assets[@]}" -gt 0 ]] || {
+            echo "no release assets were downloaded" >&2
+            exit 1
+          }
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${assets[@]}" --clobber
+          else
+            gh release create "${TAG}" "${assets[@]}" \
+              --verify-tag \
+              --title "${TAG}" \
+              --generate-notes
+          fi
