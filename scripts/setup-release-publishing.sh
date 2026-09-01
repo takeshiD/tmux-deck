@@ -184,7 +184,7 @@ finish() {
 # Replace the example below. Set TOTAL_STAGES to match the stages you write.
 # ──────────────────────────────────────────────────────────────────────────
 
-TOTAL_STAGES=1
+TOTAL_STAGES=2
 
 banner "tmux-deck trusted publishing setup"
 
@@ -202,5 +202,21 @@ confirm "Is the publisher listed with those exact values?" || {
   warn "setup was not confirmed; re-run this wizard when ready"
   exit 1
 }
+
+stage "Cachix: cache-scoped write token"
+say "Confirm that CI can push only to the takeshid cache."
+open_url "https://app.cachix.org/cache/takeshid"
+step "Open the cache settings and locate its auth or deployment tokens."
+if confirm "Is CACHIX_AUTH_TOKEN already backed by a takeshid-scoped write token?"; then
+  note "Keeping the existing GitHub Secret."
+else
+  step "Create a new token scoped to the takeshid cache with write access."
+  ask_secret CACHIX_AUTH_TOKEN "Paste the new Cachix write token:"
+  [[ -n "${CACHIX_AUTH_TOKEN}" ]] || {
+    warn "no token was entered; re-run this wizard when ready"
+    exit 1
+  }
+  set_secret CACHIX_AUTH_TOKEN "${CACHIX_AUTH_TOKEN}"
+fi
 
 finish

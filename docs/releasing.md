@@ -5,19 +5,20 @@ alpha, beta, or release-candidate tags: the release workflow rejects them.
 
 ## One-time publisher setup
 
-The repository already uses the `takeshid` Cachix cache and expects the
-`CACHIX_AUTH_TOKEN` repository secret to contain a per-cache write token.
-
-Create the crates.io Trusted Publisher once by running:
+The repository already uses the `takeshid` Cachix cache and has a
+`CACHIX_AUTH_TOKEN` repository secret. Its value cannot be inspected from
+GitHub, so confirm that it is a per-cache write token. Create the crates.io
+Trusted Publisher and verify the Cachix token once by running:
 
 ```console
 ./scripts/setup-release-publishing.sh
 ```
 
-The wizard opens the crate settings page and walks through the exact values.
-It does not request or store a crates.io API token. The GitHub `release`
-Environment must exist without required reviewers because pushing the tag is
-the approval operation.
+The wizard opens both service dashboards, walks through the exact values, and
+only replaces the Cachix secret if its scope cannot be confirmed. It does not
+request or store a crates.io API token. The GitHub `release` Environment must
+exist without required reviewers because pushing the tag is the approval
+operation.
 
 ## Preflight the runner matrix
 
