@@ -9,7 +9,7 @@ See every tmux session before you switch.
 sessions, windows, and panes in one keyboard-driven view, or open a dashboard
 that monitors several sessions at once.
 
-![tmux-deck demo](https://raw.githubusercontent.com/takeshiD/tmux-deck/main/assets/tmux-deck-demo.gif)
+![tmux-deck demo](assets/tmux-deck-demo.gif)
 
 ## Why tmux-deck?
 
@@ -61,7 +61,7 @@ bind-key Space display-popup -w 80% -h 80% -E \
 
 | Full session manager | tmux popup |
 | --- | --- |
-| <img src="https://raw.githubusercontent.com/takeshiD/tmux-deck/main/assets/tmux-deck-session-manager.png" alt="tmux-deck session manager with a live API pane preview" width="600"> | <img src="https://raw.githubusercontent.com/takeshiD/tmux-deck/main/assets/tmux-deck-popup.png" alt="tmux-deck running inside a tmux popup" width="600"> |
+| <img src="assets/tmux-deck-session-manager.png" alt="tmux-deck session manager with a live API pane preview" width="600"> | <img src="assets/tmux-deck-popup.png" alt="tmux-deck running inside a tmux popup" width="600"> |
 
 ## Essential keys
 
