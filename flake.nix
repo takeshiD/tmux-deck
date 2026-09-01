@@ -1,5 +1,5 @@
 {
-  description = "Cross compiling a rust program using rust-overlay";
+  description = "Interactive tmux session manager with live pane previews";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -32,12 +32,34 @@
             lockFile = ./Cargo.lock;
           };
         };
+        demo = pkgs.writeShellApplication {
+          name = "tmux-deck-demo";
+          runtimeInputs = [
+            tmux-deck
+            pkgs.tmux
+            pkgs.vhs
+          ];
+          text = ''
+            if [[ ! -f "$PWD/demo/render.sh" ]]; then
+              echo "Run this command from the tmux-deck repository root." >&2
+              exit 1
+            fi
+            exec bash "$PWD/demo/render.sh"
+          '';
+        };
       in
       {
         devShells.default = pkgs.mkShell {
           packages = [
             pkgs.rust-bin.stable.latest.default
+            pkgs.tmux
+            pkgs.vhs
           ];
+        };
+        apps.demo = {
+          type = "app";
+          program = "${demo}/bin/tmux-deck-demo";
+          meta.description = "Regenerate the README demo and screenshots";
         };
         packages = {
           inherit tmux-deck;
