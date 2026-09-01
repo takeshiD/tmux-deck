@@ -11,8 +11,12 @@ demo_tmp="$(mktemp -d "${TMPDIR:-/tmp}/tmux-deck-demo.XXXXXX")"
 export TMUX_TMPDIR="$demo_tmp/tmux"
 export XDG_CONFIG_HOME="$demo_tmp/config"
 export XDG_STATE_HOME="$demo_tmp/state"
+export TERM="xterm-256color"
+export COLORTERM="truecolor"
 mkdir -p "$TMUX_TMPDIR" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
-unset TMUX
+# The documentation render is a fixed visual artifact, so do not inherit a
+# developer's monochrome preference into the committed screenshots.
+unset TMUX NO_COLOR
 
 demo_socket=""
 

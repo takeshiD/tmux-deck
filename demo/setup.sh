@@ -45,6 +45,8 @@ new_session ops metrics ops
 new_window ops release deploy
 tmux select-window -t ops:metrics
 
+tmux set-option -g default-terminal 'tmux-256color'
+tmux set-option -as terminal-features ',xterm-256color:RGB'
 tmux set-option -g status-style 'bg=#1a1b26,fg=#a9b1d6'
 tmux set-option -g status-left '#[fg=#7aa2f7,bold] tmux-deck demo '
 tmux set-option -g status-right '#[fg=#9ece6a] synthetic data '
