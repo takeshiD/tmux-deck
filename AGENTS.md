@@ -8,6 +8,8 @@ These instructions apply to the whole repository.
   work, read and follow `.agents/skills/tmux-deck-workflow/SKILL.md`.
 - Keep the primary checkout clean. Do implementation in a dedicated Git
   worktree; read-only investigation may use the primary checkout.
+- Create worktrees under `.agents/worktrees/<task-slug>` at the repository
+  root. This directory is ignored by Git.
 - One agent owns one worktree. Never let multiple agents edit the same
   worktree concurrently.
 - Preserve unrelated user changes. Do not stash, reset, restore, or relocate a

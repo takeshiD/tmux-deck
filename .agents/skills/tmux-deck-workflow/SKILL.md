@@ -14,13 +14,15 @@ creating another nested worktree.
 1. Inspect `git status --short --branch` and `git worktree list` before edits.
 2. Derive a short lowercase task slug, using the issue number when one exists
    (for example, `issue-15-preview-scroll` or `codex-hooks`).
-3. Use `/tmp/tmux-deck-worktrees/<task-slug>` as the default worktree path and
-   `agent/<task-slug>` as its branch. A user-specified path or branch wins.
+3. Use `<repository-root>/.agents/worktrees/<task-slug>` as the default
+   worktree path and `agent/<task-slug>` as its branch. Resolve the repository
+   root first; do not assume the current directory is the root. A
+   user-specified path or branch wins.
 4. Create the worktree from the intended integration commit, normally the
    current `HEAD`:
 
    ```bash
-   git worktree add -b agent/<task-slug> /tmp/tmux-deck-worktrees/<task-slug> HEAD
+   git worktree add -b agent/<task-slug> <repository-root>/.agents/worktrees/<task-slug> HEAD
    ```
 
 If the primary checkout is dirty, stop before moving its changes. Continue
