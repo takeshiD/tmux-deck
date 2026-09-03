@@ -357,7 +357,7 @@ fn render_panes_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state.pane_list_state);
 }
 
-fn render_pane_preview_tree(frame: &mut Frame, state: &UIState, area: Rect) {
+fn render_pane_preview_tree(frame: &mut Frame, state: &mut UIState, area: Rect) {
     let title = state
         .get_selected_pane_target()
         .map(|t| format!(" Preview: {} ", t))
@@ -370,21 +370,16 @@ fn render_pane_preview_tree(frame: &mut Frame, state: &UIState, area: Rect) {
 
     let inner = block.inner(area);
     let max_lines = inner.height as usize;
+    state.set_tree_preview_height(max_lines);
 
     // Use cached parsed Text (rebuilt only when pane_content changes).
     let text = if let Some(parsed) = state.pane_content_parsed.as_ref() {
-        if parsed.lines.len() > max_lines {
-            let start = parsed.lines.len().saturating_sub(max_lines);
-            Text::from(parsed.lines[start..].to_vec())
-        } else {
-            parsed.clone()
-        }
+        let range = state.tree_preview_visible_range(parsed.lines.len());
+        Text::from(parsed.lines[range].to_vec())
     } else {
-        let mut raw: Vec<&str> = state.pane_content.lines().collect();
-        if raw.len() > max_lines {
-            raw = raw[raw.len().saturating_sub(max_lines)..].to_vec();
-        }
-        Text::raw(raw.join("\n"))
+        let raw: Vec<&str> = state.pane_content.lines().collect();
+        let range = state.tree_preview_visible_range(raw.len());
+        Text::raw(raw[range].join("\n"))
     };
 
     let paragraph = Paragraph::new(text).block(block);
@@ -400,13 +395,31 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
         )])
     } else {
         let kb = &state.keybindings;
-        // `j/k`, `Tab`, `za` and `Space×2` are fixed (not remappable); the rest
-        // reflect the user's key bindings so the hint bar always stays accurate.
+        // Tree navigation, `Tab`, `za` and `Space×2` are fixed; the rest reflect
+        // the user's key bindings so the hint bar stays accurate after remaps.
         Line::from(vec![
             Span::styled("j/k", Style::default().fg(theme.focus_border)),
             Span::raw(":move "),
             Span::styled("Tab", Style::default().fg(theme.focus_border)),
             Span::raw(":focus "),
+            Span::styled(
+                format!(
+                    "{}/{}",
+                    kb.label(Action::PreviewHalfPageDown),
+                    kb.label(Action::PreviewHalfPageUp)
+                ),
+                Style::default().fg(theme.accent),
+            ),
+            Span::raw(":½page "),
+            Span::styled(
+                format!(
+                    "{}/{}",
+                    kb.label(Action::PreviewLineDown),
+                    kb.label(Action::PreviewLineUp)
+                ),
+                Style::default().fg(theme.accent),
+            ),
+            Span::raw(":scroll "),
             Span::styled(kb.label(Action::Sort), Style::default().fg(theme.focus_border)),
             Span::raw(":sort "),
             Span::styled(kb.label(Action::Group), Style::default().fg(theme.focus_border)),

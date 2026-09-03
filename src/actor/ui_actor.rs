@@ -438,6 +438,18 @@ impl UIActor {
                     self.state.open_kill_session_popup();
                     self.refresh_control.pause();
                 }
+                Action::PreviewHalfPageDown if self.state.view_mode == ViewMode::TreeView => {
+                    self.state.tree_preview_scroll_down_half_page();
+                }
+                Action::PreviewHalfPageUp if self.state.view_mode == ViewMode::TreeView => {
+                    self.state.tree_preview_scroll_up_half_page();
+                }
+                Action::PreviewLineDown if self.state.view_mode == ViewMode::TreeView => {
+                    self.state.tree_preview_scroll_down_line();
+                }
+                Action::PreviewLineUp if self.state.view_mode == ViewMode::TreeView => {
+                    self.state.tree_preview_scroll_up_line();
+                }
                 Action::Enter if self.state.view_mode == ViewMode::Dashboard => {
                     // Attach to the selected background session. The UI loop
                     // consumes `pending_attach` to run `claude attach <id>`.
@@ -461,6 +473,10 @@ impl UIActor {
                     }
                 }
                 Action::Dashboard => self.state.toggle_dashboard(),
+                Action::PreviewHalfPageDown
+                | Action::PreviewHalfPageUp
+                | Action::PreviewLineDown
+                | Action::PreviewLineUp => {}
                 // Context-gated actions whose gate is not satisfied fall through
                 // to navigation so the key is not swallowed.
                 Action::Sort | Action::Group => {

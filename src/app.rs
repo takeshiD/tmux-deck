@@ -477,6 +477,10 @@ pub struct UIState {
     // Shared state
     pub pane_content: String,
     pub pane_content_parsed: Option<Text<'static>>,
+    /// Number of lines the TreeView preview is scrolled back from the live tail.
+    tree_preview_scroll: usize,
+    /// Last rendered height of the TreeView preview's inner viewport.
+    tree_preview_height: usize,
     pub last_error: Option<String>,
     #[allow(dead_code)]
     pub interval: Duration,
@@ -547,6 +551,8 @@ impl UIState {
 
             pane_content: String::new(),
             pane_content_parsed: None,
+            tree_preview_scroll: 0,
+            tree_preview_height: 0,
             last_error: None,
             interval: Duration::from_millis(interval_ms),
 
@@ -618,6 +624,7 @@ impl UIState {
                 self.selected_session = self.multi_session;
                 self.selected_window = self.multi_window;
                 self.selected_pane = 0;
+                self.reset_tree_preview_scroll();
                 self.session_list_state.select(Some(self.selected_session));
                 self.window_list_state.select(Some(self.selected_window));
                 self.pane_list_state.select(Some(0));
@@ -1187,6 +1194,72 @@ impl UIState {
     pub fn update_pane_content(&mut self, content: String) {
         self.pane_content_parsed = content.as_bytes().into_text().ok();
         self.pane_content = content;
+        self.clamp_tree_preview_scroll();
+    }
+
+    /// Record the current preview viewport height so page-wise key actions use
+    /// the dimensions the user actually sees.
+    pub fn set_tree_preview_height(&mut self, height: usize) {
+        self.tree_preview_height = height;
+        self.clamp_tree_preview_scroll();
+    }
+
+    pub fn tree_preview_scroll_up_line(&mut self) {
+        self.scroll_tree_preview_up(1);
+    }
+
+    pub fn tree_preview_scroll_down_line(&mut self) {
+        self.tree_preview_scroll = self.tree_preview_scroll.saturating_sub(1);
+    }
+
+    pub fn tree_preview_scroll_up_half_page(&mut self) {
+        self.scroll_tree_preview_up((self.tree_preview_height / 2).max(1));
+    }
+
+    pub fn tree_preview_scroll_down_half_page(&mut self) {
+        let amount = (self.tree_preview_height / 2).max(1);
+        self.tree_preview_scroll = self.tree_preview_scroll.saturating_sub(amount);
+    }
+
+    /// Line range to render, keeping offset zero anchored to the live tail.
+    pub fn tree_preview_visible_range(&self, line_count: usize) -> std::ops::Range<usize> {
+        let height = self.tree_preview_height;
+        if height == 0 {
+            return line_count..line_count;
+        }
+        let offset = self
+            .tree_preview_scroll
+            .min(line_count.saturating_sub(height));
+        let end = line_count.saturating_sub(offset);
+        end.saturating_sub(height)..end
+    }
+
+    fn scroll_tree_preview_up(&mut self, amount: usize) {
+        let max_scroll = self
+            .tree_preview_line_count()
+            .saturating_sub(self.tree_preview_height);
+        self.tree_preview_scroll = self
+            .tree_preview_scroll
+            .saturating_add(amount)
+            .min(max_scroll);
+    }
+
+    fn clamp_tree_preview_scroll(&mut self) {
+        let max_scroll = self
+            .tree_preview_line_count()
+            .saturating_sub(self.tree_preview_height);
+        self.tree_preview_scroll = self.tree_preview_scroll.min(max_scroll);
+    }
+
+    fn tree_preview_line_count(&self) -> usize {
+        self.pane_content_parsed
+            .as_ref()
+            .map(|text| text.lines.len())
+            .unwrap_or_else(|| self.pane_content.lines().count())
+    }
+
+    fn reset_tree_preview_scroll(&mut self) {
+        self.tree_preview_scroll = 0;
     }
 
     pub fn set_error(&mut self, message: String) {
@@ -1248,6 +1321,7 @@ impl UIState {
     }
 
     pub fn tree_move_up(&mut self) {
+        let previous_target = self.get_selected_pane_target();
         match self.focus {
             Focus::Sessions => {
                 if let Some(prev) = self.prev_cursor_stop(self.selected_session) {
@@ -1274,9 +1348,13 @@ impl UIState {
                 self.pane_list_state.select(Some(self.selected_pane));
             }
         }
+        if self.get_selected_pane_target() != previous_target {
+            self.reset_tree_preview_scroll();
+        }
     }
 
     pub fn tree_move_down(&mut self) {
+        let previous_target = self.get_selected_pane_target();
         match self.focus {
             Focus::Sessions => {
                 if let Some(next) = self.next_cursor_stop(self.selected_session) {
@@ -1307,6 +1385,9 @@ impl UIState {
                 }
                 self.pane_list_state.select(Some(self.selected_pane));
             }
+        }
+        if self.get_selected_pane_target() != previous_target {
+            self.reset_tree_preview_scroll();
         }
     }
 
@@ -1650,5 +1731,53 @@ mod tests {
             state.input_char_limited('あ', SESSION_NAME_MAX_LEN);
         }
         assert_eq!(state.input_buffer.chars().count(), SESSION_NAME_MAX_LEN);
+    }
+
+    #[test]
+    fn tree_preview_scrolls_by_line_and_clamps_at_both_ends() {
+        let mut state = UIState::new(Config::default());
+        state.update_pane_content(
+            (0..10)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        state.set_tree_preview_height(4);
+
+        assert_eq!(state.tree_preview_visible_range(10), 6..10);
+        state.tree_preview_scroll_up_line();
+        assert_eq!(state.tree_preview_scroll, 1);
+        assert_eq!(state.tree_preview_visible_range(10), 5..9);
+
+        for _ in 0..20 {
+            state.tree_preview_scroll_up_line();
+        }
+        assert_eq!(state.tree_preview_scroll, 6);
+        assert_eq!(state.tree_preview_visible_range(10), 0..4);
+
+        for _ in 0..20 {
+            state.tree_preview_scroll_down_line();
+        }
+        assert_eq!(state.tree_preview_scroll, 0);
+        assert_eq!(state.tree_preview_visible_range(10), 6..10);
+    }
+
+    #[test]
+    fn tree_preview_half_page_uses_rendered_viewport_height() {
+        let mut state = UIState::new(Config::default());
+        state.update_pane_content(
+            (0..20)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        state.set_tree_preview_height(7);
+
+        state.tree_preview_scroll_up_half_page();
+        assert_eq!(state.tree_preview_scroll, 3);
+        state.tree_preview_scroll_up_half_page();
+        assert_eq!(state.tree_preview_scroll, 6);
+        state.tree_preview_scroll_down_half_page();
+        assert_eq!(state.tree_preview_scroll, 3);
     }
 }

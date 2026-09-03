@@ -575,7 +575,7 @@ impl<'de> Deserialize<'de> for Marker {
 // [keybindings]
 // =============================================================================
 
-/// A remappable user action. Navigation (j/k/h/l/arrows/Tab) and chords
+/// A remappable user action. Tree navigation (j/k/h/l/arrows/Tab) and chords
 /// (`za` fold, double-Space) are intentionally not remappable yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -590,6 +590,14 @@ pub enum Action {
     KillSession,
     /// Toggle the fleet dashboard (all Claude panes, sorted by attention).
     Dashboard,
+    /// Scroll the TreeView pane preview down by half a page.
+    PreviewHalfPageDown,
+    /// Scroll the TreeView pane preview up by half a page.
+    PreviewHalfPageUp,
+    /// Scroll the TreeView pane preview down by one line.
+    PreviewLineDown,
+    /// Scroll the TreeView pane preview up by one line.
+    PreviewLineUp,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -615,6 +623,14 @@ pub struct KeyBindings {
     pub kill_session: Vec<KeySpec>,
     #[serde(deserialize_with = "de_keys")]
     pub dashboard: Vec<KeySpec>,
+    #[serde(deserialize_with = "de_keys")]
+    pub preview_half_page_down: Vec<KeySpec>,
+    #[serde(deserialize_with = "de_keys")]
+    pub preview_half_page_up: Vec<KeySpec>,
+    #[serde(deserialize_with = "de_keys")]
+    pub preview_line_down: Vec<KeySpec>,
+    #[serde(deserialize_with = "de_keys")]
+    pub preview_line_up: Vec<KeySpec>,
 }
 
 impl Default for KeyBindings {
@@ -631,6 +647,10 @@ impl Default for KeyBindings {
             rename_session: vec![ctrl('r')],
             kill_session: vec![ctrl('x')],
             dashboard: vec![key('d')],
+            preview_half_page_down: vec![ctrl('d')],
+            preview_half_page_up: vec![ctrl('u')],
+            preview_line_down: vec![ctrl('j')],
+            preview_line_up: vec![ctrl('k')],
         }
     }
 }
@@ -638,8 +658,12 @@ impl Default for KeyBindings {
 impl KeyBindings {
     /// Pairs of (action, bindings) in match priority order. Modifier-bearing
     /// bindings (e.g. `C-r`) are listed so they win over the plain `r` refresh.
-    fn entries(&self) -> [(Action, &Vec<KeySpec>); 10] {
+    fn entries(&self) -> [(Action, &Vec<KeySpec>); 14] {
         [
+            (Action::PreviewHalfPageDown, &self.preview_half_page_down),
+            (Action::PreviewHalfPageUp, &self.preview_half_page_up),
+            (Action::PreviewLineDown, &self.preview_line_down),
+            (Action::PreviewLineUp, &self.preview_line_up),
             (Action::NewSession, &self.new_session),
             (Action::RenameSession, &self.rename_session),
             (Action::KillSession, &self.kill_session),
@@ -950,6 +974,35 @@ mod tests {
         assert_eq!(kb.action_for(&ctrl_r), Some(Action::RenameSession));
         let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(kb.action_for(&j), None);
+        let ctrl_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(kb.action_for(&ctrl_j), Some(Action::PreviewLineDown));
+    }
+
+    #[test]
+    fn preview_scroll_bindings_are_remappable() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [keybindings]
+            preview_half_page_down = "A-d"
+            preview_half_page_up = "A-u"
+            preview_line_down = ["Down", "C-e"]
+            preview_line_up = "Up"
+        "#,
+        )
+        .unwrap();
+
+        let alt_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            cfg.keybindings.action_for(&alt_d),
+            Some(Action::PreviewHalfPageDown)
+        );
+        assert_eq!(
+            cfg.keybindings.action_for(&down),
+            Some(Action::PreviewLineDown)
+        );
+        assert_eq!(cfg.keybindings.action_for(&up), Some(Action::PreviewLineUp));
     }
 
     #[test]
