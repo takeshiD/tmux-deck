@@ -438,6 +438,18 @@ impl UIActor {
                     self.state.open_kill_session_popup();
                     self.refresh_control.pause();
                 }
+                Action::PreviewHalfPageDown if self.state.view_mode == ViewMode::TreeView => {
+                    self.state.tree_preview_scroll_down_half_page();
+                }
+                Action::PreviewHalfPageUp if self.state.view_mode == ViewMode::TreeView => {
+                    self.state.tree_preview_scroll_up_half_page();
+                }
+                Action::PreviewLineDown if self.state.view_mode == ViewMode::TreeView => {
+                    self.state.tree_preview_scroll_down_line();
+                }
+                Action::PreviewLineUp if self.state.view_mode == ViewMode::TreeView => {
+                    self.state.tree_preview_scroll_up_line();
+                }
                 Action::Enter if self.state.view_mode == ViewMode::Dashboard => {
                     // Attach to the selected background session. The UI loop
                     // consumes `pending_attach` to run `claude attach <id>`.
@@ -461,6 +473,17 @@ impl UIActor {
                     }
                 }
                 Action::Dashboard => self.state.toggle_dashboard(),
+                Action::PreviewHalfPageDown
+                | Action::PreviewHalfPageUp
+                | Action::PreviewLineDown
+                | Action::PreviewLineUp => {
+                    // A preview binding remapped to a plain navigation key
+                    // remains usable in views where preview scrolling is not
+                    // available.
+                    if !is_ctrl {
+                        self.handle_navigation_key(key.code);
+                    }
+                }
                 // Context-gated actions whose gate is not satisfied fall through
                 // to navigation so the key is not swallowed.
                 Action::Sort | Action::Group => {
@@ -646,8 +669,8 @@ impl UIActor {
             TmuxResponse::SessionsRefreshed { sessions } => {
                 self.state.update_sessions(sessions);
             }
-            TmuxResponse::PaneCaptured { target: _, content } => {
-                self.state.update_pane_content(content);
+            TmuxResponse::PaneCaptured { target, content } => {
+                self.state.update_tree_preview_content(&target, content);
             }
             TmuxResponse::SessionCreated {
                 name,

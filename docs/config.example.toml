@@ -61,8 +61,8 @@ preset = "default"
 #               Backspace Delete
 # Examples: "q", "C-n", "S-Tab", "Space".
 #
-# Note: navigation (j/k/h/l, arrows, Tab) and the `za` fold / double-Space
-# chords are fixed and not (yet) remappable.
+# Note: tree navigation (j/k/h/l, arrows, Tab) and the `za` fold /
+# double-Space chords are fixed and not (yet) remappable.
 quit           = ["q", "Esc"]
 refresh        = "r"
 sort           = "s"            # TreeView + Sessions focus only
@@ -73,6 +73,10 @@ new_session    = "C-n"
 rename_session = "C-r"
 kill_session   = "C-x"
 dashboard      = "d"            # toggle the Claude fleet dashboard
+preview_half_page_down = "C-d"  # TreeView preview: half a page toward the bottom
+preview_half_page_up   = "C-u"  # TreeView preview: half a page toward the top
+preview_line_down      = "C-j"  # TreeView preview: one line toward the bottom
+preview_line_up        = "C-k"  # TreeView preview: one line toward the top
 
 # -----------------------------------------------------------------------------
 # Markers shown for hook-driven agent states. Each marker has a `glyph` and a
