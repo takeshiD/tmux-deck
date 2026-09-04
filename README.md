@@ -76,6 +76,10 @@ The status bar always reflects your configured bindings.
 | `Ctrl+n` | New session | `Ctrl+r` | Rename session |
 | `Ctrl+x` | Kill session | `q` / `Esc` | Quit |
 | `d` | Toggle Background Agents | `r` | Refresh |
+| `Ctrl+d` / `Ctrl+u` | Scroll preview half-page down/up | `Ctrl+j` / `Ctrl+k` | Scroll preview one line down/up |
+
+Preview scrolling applies to TreeView. Moving to another pane returns its
+preview to the live tail; all four bindings can be changed in the configuration.
 
 ## Configuration
 
@@ -112,6 +116,10 @@ exit_on_switch = true
 quit = ["q", "Esc"]
 new_session = "C-n"
 agent_monitor = "m"
+preview_half_page_down = "C-d"
+preview_half_page_up = "C-u"
+preview_line_down = "C-j"
+preview_line_up = "C-k"
 ```
 
 See the fully commented [configuration reference](docs/config.example.toml)

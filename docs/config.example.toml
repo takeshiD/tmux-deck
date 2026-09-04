@@ -78,6 +78,10 @@ rename_session = "C-r"
 kill_session   = "C-x"
 agent_monitor  = "m"            # toggle Sessions / Agent Monitor
 dashboard      = "d"            # toggle Background Agents
+preview_half_page_down = "C-d"  # TreeView preview: half a page toward the bottom
+preview_half_page_up   = "C-u"  # TreeView preview: half a page toward the top
+preview_line_down      = "C-j"  # TreeView preview: one line toward the bottom
+preview_line_up        = "C-k"  # TreeView preview: one line toward the top
 
 # -----------------------------------------------------------------------------
 # Markers shown for hook-driven agent states. Each marker has a `glyph` and a

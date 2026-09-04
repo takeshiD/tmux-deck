@@ -399,7 +399,7 @@ fn render_panes_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state.pane_list_state);
 }
 
-fn render_pane_preview_tree(frame: &mut Frame, state: &UIState, area: Rect) {
+fn render_pane_preview_tree(frame: &mut Frame, state: &mut UIState, area: Rect) {
     let title = state
         .get_selected_pane_target()
         .map(|t| format!(" Preview: {} ", t))
@@ -412,21 +412,16 @@ fn render_pane_preview_tree(frame: &mut Frame, state: &UIState, area: Rect) {
 
     let inner = block.inner(area);
     let max_lines = inner.height as usize;
+    state.set_tree_preview_height(max_lines);
 
     // Use cached parsed Text (rebuilt only when pane_content changes).
     let text = if let Some(parsed) = state.pane_content_parsed.as_ref() {
-        if parsed.lines.len() > max_lines {
-            let start = parsed.lines.len().saturating_sub(max_lines);
-            Text::from(parsed.lines[start..].to_vec())
-        } else {
-            parsed.clone()
-        }
+        let range = state.tree_preview_visible_range(parsed.lines.len());
+        Text::from(parsed.lines[range].to_vec())
     } else {
-        let mut raw: Vec<&str> = state.pane_content.lines().collect();
-        if raw.len() > max_lines {
-            raw = raw[raw.len().saturating_sub(max_lines)..].to_vec();
-        }
-        Text::raw(raw.join("\n"))
+        let raw: Vec<&str> = state.pane_content.lines().collect();
+        let range = state.tree_preview_visible_range(raw.len());
+        Text::raw(raw[range].join("\n"))
     };
 
     let paragraph = Paragraph::new(text).block(block);
@@ -443,12 +438,29 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
     } else {
         let kb = &state.keybindings;
         // Navigation and `za` are fixed; action hints use configured bindings.
-        // reflect the user's key bindings so the hint bar always stays accurate.
         Line::from(vec![
             Span::styled("j/k", Style::default().fg(theme.focus_border)),
             Span::raw(":move "),
             Span::styled("Tab", Style::default().fg(theme.focus_border)),
             Span::raw(":focus "),
+            Span::styled(
+                format!(
+                    "{}/{}",
+                    kb.label(Action::PreviewHalfPageDown),
+                    kb.label(Action::PreviewHalfPageUp)
+                ),
+                Style::default().fg(theme.accent),
+            ),
+            Span::raw(":½page "),
+            Span::styled(
+                format!(
+                    "{}/{}",
+                    kb.label(Action::PreviewLineDown),
+                    kb.label(Action::PreviewLineUp)
+                ),
+                Style::default().fg(theme.accent),
+            ),
+            Span::raw(":scroll "),
             Span::styled(kb.label(Action::Sort), Style::default().fg(theme.focus_border)),
             Span::raw(":sort "),
             Span::styled(kb.label(Action::Group), Style::default().fg(theme.focus_border)),
@@ -1738,5 +1750,63 @@ mod cursor_alignment_tests {
         state.agent_summary_open = true;
         state.set_summary_pending("a1".to_string());
         term.draw(|f| render_ui(f, &mut state)).unwrap();
+    }
+
+    #[test]
+    fn tree_preview_scroll_renders_wide_unicode_lines() {
+        let mut state = UIState::new(crate::config::Config::default());
+        state.update_pane_content(
+            (0..7)
+                .map(|n| format!("line {n} 日本🙂"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let mut term = Terminal::new(TestBackend::new(24, 6)).unwrap();
+        term.draw(|frame| {
+            let area = frame.area();
+            render_pane_preview_tree(frame, &mut state, area);
+        })
+        .unwrap();
+        state.tree_preview_scroll_up_line();
+        term.draw(|frame| {
+            let area = frame.area();
+            render_pane_preview_tree(frame, &mut state, area);
+        })
+        .unwrap();
+
+        let symbols: Vec<&str> = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let rendered = symbols.concat();
+        assert!(rendered.contains("line 2"));
+        assert!(!rendered.contains("line 6"));
+        assert!(symbols.contains(&"日"));
+        assert!(symbols.contains(&"本"));
+        assert!(symbols.contains(&"🙂"));
+    }
+
+    #[test]
+    fn tree_view_handles_narrow_terminals_and_wide_key_labels() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+            [keybindings]
+            preview_half_page_down = "界"
+            preview_half_page_up = "🙂"
+            preview_line_down = "C-j"
+            preview_line_up = "C-k"
+            "#,
+        )
+        .unwrap();
+        let mut state = UIState::new(config);
+        state.update_pane_content("日本語🙂\ncombining: e\u{301}".to_string());
+
+        for (width, height) in [(1, 1), (10, 3), (40, 10)] {
+            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+            term.draw(|frame| render_ui(frame, &mut state)).unwrap();
+        }
     }
 }
