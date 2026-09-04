@@ -70,6 +70,23 @@ does not represent interactive coding agents running in tmux panes.
   Overview and does not enter the Attention queue.
 - When repository or worktree identity cannot be resolved, display the stable
   tmux `session:window.pane` identity.
+- Within the same actionable state, Attention shows the agent that has waited
+  longest first.
+- A newly discovered agent is appended to its repository/worktree group in
+  Overview; existing cards do not move.
+- If the selected agent disappears, select the next agent in the same worktree,
+  then the nearest adjacent group. Close focused preview and show a transient
+  status message when its target disappears.
+- `/` supports free-text matching across identity and activity plus structured
+  `state:`, `agent:`, and `repo:` filters.
+- Prefer `repository / worktree-or-branch` for display identity. Add a parent
+  path only to disambiguate duplicate repository names.
+- User-facing view names are **Sessions**, **Agent Monitor**, and
+  **Background Agents**. Rename the internal `MultiPreview` variant to
+  `AgentMonitor`; continue accepting the existing `multi` configuration value
+  as a compatibility alias.
+- A configurable `m` action opens Agent Monitor and replaces the double-Space
+  gesture. Do not retain double-Space as a second binding.
 - The existing background-agent Dashboard remains for now. MultiView and the
   Dashboard should move toward a common agent model so they can be unified
   later without rewriting their state semantics.
@@ -154,6 +171,8 @@ response to changing agent state.
 
 ## Interaction contract
 
+- `m`: enter or leave Agent Monitor. This is a normal configurable action and
+  replaces the fixed double-Space gesture.
 - `Tab`: switch Attention / Overview and persist the choice.
 - `h/j/k/l` and arrow keys: move through agents using visual grid order.
 - `PageUp/PageDown` and `Home/End`: navigate Summary List by viewport or
@@ -162,6 +181,8 @@ response to changing agent state.
   existing exit-on-switch behavior.
 - `f`: enter or leave a temporary focused live preview without changing the
   stored Presentation Mode.
+- `/`: filter by free text or `state:`, `agent:`, and `repo:` tokens. Filtering
+  changes the visible set, not the underlying stable Overview order.
 - State transitions may reorder the Attention queue, but must not steal
   selection from the user. Overview never reorders solely because state
   changed.
@@ -231,15 +252,30 @@ response to changing agent state.
 : A non-pane Claude session discovered from Claude's jobs data and currently
   shown by the Dashboard. It is outside the first MultiView scope.
 
+## Implementation sequence
+
+1. Complete and merge the existing `codex-hooks` work as an independent change.
+   It establishes shared Claude/Codex state, activity, and working-directory
+   data without coupling that protocol work to the new layout.
+2. Rebase Agent Monitor implementation on the resulting main branch.
+3. Introduce the shared pane-agent projection and state tests before replacing
+   the current MultiPreview renderer and navigation.
+4. Implement Attention, then Overview density levels, then persistence and
+   filtering. Verify each layer at fixed terminal sizes before adding the next.
+5. Keep Background Agents separate, but adapt it to the common state vocabulary
+   only where that does not expand the first release.
+
 ## Open questions
 
-- Within the same Attention state, are older or newer transitions shown first?
-- When a new Agent Pane appears, where is it inserted without disrupting
-  Overview spatial memory?
-- What happens to selection and focused preview when an Agent Pane disappears?
-- Which repository and worktree labels are shown when space permits, and how
-  are duplicate names disambiguated?
-- Does `/` filter by free text only, or also expose state, agent kind, and
-  repository filters?
+- What layout and content does Attention show when no agent is actionable?
+- Does `m` always return to Sessions when pressed inside Agent Monitor, and how
+  does it behave when pressed inside Background Agents?
+- Is thirty a tested design target or a hard visibility cap? Hiding additional
+  detected agents would weaken the monitoring contract.
+- Which state colors and symbols are the semantic defaults?
+- Does `Esc` also leave focused preview, or only `f`?
+- What split ratio should Attention use at wide and narrow sizes?
+- Which configuration section owns completion retention and any future Agent
+  Monitor settings?
 - Should an empty MultiView explain hook installation, or only report that no
   coding agents are detected?
