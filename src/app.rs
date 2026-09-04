@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::time::Duration;
 
 use ansi_to_tui::IntoText;
 use ratatui::text::Text;
@@ -7,7 +8,8 @@ use ratatui::widgets::ListState;
 
 use crate::agents::{self, AgentSession};
 use crate::config::{
-    AgentsConfig, BehaviorConfig, Config, HooksConfig, KeyBindings, LayoutConfig, Theme,
+    AgentMonitorConfig, AgentsConfig, BehaviorConfig, Config, HooksConfig, KeyBindings,
+    LayoutConfig, Theme,
 };
 use crate::group::GroupStore;
 
@@ -139,6 +141,161 @@ impl HookState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentKind {
+    Claude,
+    Codex,
+}
+
+impl AgentKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObservedState {
+    Waiting,
+    Error,
+    Working,
+    Done,
+    Running,
+}
+
+impl ObservedState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Waiting => "WAIT",
+            Self::Error => "ERROR",
+            Self::Working => "WORK",
+            Self::Done => "DONE",
+            Self::Running => "RUN",
+        }
+    }
+
+    fn attention_priority(self) -> u8 {
+        match self {
+            Self::Waiting => 0,
+            Self::Error => 1,
+            Self::Working => 2,
+            Self::Done => 3,
+            Self::Running => 4,
+        }
+    }
+
+    pub fn actionable(self) -> bool {
+        matches!(self, Self::Waiting | Self::Error)
+    }
+}
+
+impl From<HookState> for ObservedState {
+    fn from(value: HookState) -> Self {
+        match value {
+            HookState::Working => Self::Working,
+            HookState::Waiting => Self::Waiting,
+            HookState::Done => Self::Done,
+            HookState::Error => Self::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPane {
+    pub pane_id: String,
+    pub target: String,
+    pub tmux_identity: String,
+    pub session_name: String,
+    pub window_index: u32,
+    pub pane_index: u32,
+    pub pane_height: u32,
+    pub kind: AgentKind,
+    pub state: ObservedState,
+    pub activity: String,
+    pub state_since: Option<i64>,
+    pub repository: Option<String>,
+    pub worktree: Option<String>,
+    pub parent: Option<String>,
+}
+
+impl AgentPane {
+    pub fn group_key(&self) -> (String, String) {
+        (
+            self.repository.clone().unwrap_or_default(),
+            self.worktree.clone().unwrap_or_default(),
+        )
+    }
+
+    pub fn identity(&self, duplicate_repository: bool) -> String {
+        match &self.repository {
+            Some(repository) => {
+                let display_repository = if duplicate_repository {
+                    self.parent
+                        .as_ref()
+                        .map(|parent| format!("{parent}/{repository}"))
+                        .unwrap_or_else(|| repository.clone())
+                } else {
+                    repository.clone()
+                };
+                match &self.worktree {
+                    Some(worktree) if worktree != repository => {
+                        format!("{display_repository}/{worktree}")
+                    }
+                    _ => display_repository,
+                }
+            }
+            None => self.tmux_identity.clone(),
+        }
+    }
+
+    pub fn elapsed_secs(&self, now: i64) -> Option<i64> {
+        self.state_since.map(|since| now.saturating_sub(since).max(0))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PresentationMode {
+    #[default]
+    Attention,
+    Overview,
+}
+
+impl PresentationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attention => "attention",
+            Self::Overview => "overview",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverviewDensity {
+    LiveGrid,
+    Hybrid,
+    SummaryList,
+}
+
+pub fn overview_density(width: u16, height: u16, count: usize) -> OverviewDensity {
+    if count == 0 {
+        return OverviewDensity::SummaryList;
+    }
+    let columns = (count as f64).sqrt().ceil() as u16;
+    let rows = u16::try_from(count.div_ceil(usize::from(columns))).unwrap_or(u16::MAX);
+    let content_height = height.saturating_sub(2);
+    if width / columns.max(1) >= 44 && content_height / rows.max(1) >= 10 {
+        return OverviewDensity::LiveGrid;
+    }
+    let hybrid_capacity = usize::from(content_height / 3);
+    if width >= 60 && content_height >= 12 && count <= hybrid_capacity {
+        OverviewDensity::Hybrid
+    } else {
+        OverviewDensity::SummaryList
+    }
+}
+
 /// Represents a tmux pane
 #[derive(Debug, Clone)]
 pub struct TmuxPane {
@@ -148,8 +305,11 @@ pub struct TmuxPane {
     pub width: u32,
     #[allow(dead_code)]
     pub height: u32,
+    #[allow(dead_code)]
     pub active: bool,
     pub current_command: String,
+    /// Current pane directory reported by tmux; used as a hookless metadata fallback.
+    pub current_path: String,
     pub pid: u32,
     /// True if a claude process is running in this pane (detected via descendant process scan).
     pub has_claude: bool,
@@ -180,6 +340,10 @@ pub struct TmuxPane {
     /// Working directory Codex reported for this pane.
     #[allow(dead_code)]
     pub codex_cwd: Option<String>,
+    /// Git identity resolved asynchronously by TmuxActor and cached by pane id.
+    pub agent_repository: Option<String>,
+    pub agent_worktree: Option<String>,
+    pub agent_repository_parent: Option<String>,
 }
 
 impl TmuxPane {
@@ -195,6 +359,112 @@ impl TmuxPane {
         self.codex_state_since
             .map(|since| crate::hook::now_secs().saturating_sub(since).max(0))
     }
+}
+
+fn repository_identity(cwd: Option<&str>) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) else {
+        return (None, None, None);
+    };
+    let path = Path::new(cwd);
+    let components: Vec<String> = path
+        .components()
+        .filter_map(|part| part.as_os_str().to_str().map(ToOwned::to_owned))
+        .collect();
+    if let Some(marker) = components.iter().position(|part| part == ".worktrees")
+        && marker > 0
+        && marker + 1 < components.len()
+    {
+        let repository = components[marker - 1].clone();
+        let parent = marker
+            .checked_sub(2)
+            .and_then(|index| components.get(index).cloned());
+        return (
+            Some(repository),
+            Some(components[marker + 1].clone()),
+            parent,
+        );
+    }
+    (None, None, None)
+}
+
+fn project_agent_panes(sessions: &[TmuxSession], now: i64, retention_secs: u64) -> Vec<AgentPane> {
+    let mut agents = Vec::new();
+    for session in sessions {
+        for window in &session.windows {
+            for pane in &window.panes {
+                let mut candidates = Vec::new();
+                if pane.has_claude {
+                    candidates.push((
+                        AgentKind::Claude,
+                        pane.claude_state,
+                        pane.claude_activity.as_deref(),
+                        pane.claude_state_since,
+                        pane.claude_cwd.as_deref(),
+                    ));
+                }
+                if pane.has_codex {
+                    candidates.push((
+                        AgentKind::Codex,
+                        pane.codex_state,
+                        pane.codex_activity.as_deref(),
+                        pane.codex_state_since,
+                        pane.codex_cwd.as_deref(),
+                    ));
+                }
+                let Some((kind, hook_state, activity, state_since, cwd)) = candidates
+                    .into_iter()
+                    .max_by_key(|(kind, state, _, since, _)| {
+                        (
+                            state.map(HookState::priority).unwrap_or(0),
+                            since.unwrap_or(0),
+                            matches!(kind, AgentKind::Codex),
+                        )
+                    })
+                else {
+                    continue;
+                };
+                let state = hook_state.map(Into::into).unwrap_or(ObservedState::Running);
+                if state == ObservedState::Done
+                    && state_since.is_some_and(|since| {
+                        now.saturating_sub(since) > i64::try_from(retention_secs).unwrap_or(i64::MAX)
+                    })
+                {
+                    continue;
+                }
+                let (fallback_repository, fallback_worktree, fallback_parent) =
+                    repository_identity(cwd.or(Some(pane.current_path.as_str())));
+                agents.push(AgentPane {
+                    pane_id: pane.id.clone(),
+                    target: pane.id.clone(),
+                    tmux_identity: format!("{}:{}.{}", session.name, window.index, pane.id),
+                    session_name: session.name.clone(),
+                    window_index: window.index,
+                    pane_index: pane.index,
+                    pane_height: pane.height,
+                    kind,
+                    state,
+                    activity: if hook_state.is_some() {
+                        activity.unwrap_or("activity unavailable").to_string()
+                    } else {
+                        "state unavailable".to_string()
+                    },
+                    state_since,
+                    repository: pane.agent_repository.clone().or(fallback_repository),
+                    worktree: pane.agent_worktree.clone().or(fallback_worktree),
+                    parent: pane.agent_repository_parent.clone().or(fallback_parent),
+                });
+            }
+        }
+    }
+    agents.sort_by(|a, b| {
+        a.group_key()
+            .cmp(&b.group_key())
+            .then_with(|| a.session_name.cmp(&b.session_name))
+            .then_with(|| a.window_index.cmp(&b.window_index))
+            .then_with(|| a.pane_index.cmp(&b.pane_index))
+            .then_with(|| a.pane_id.cmp(&b.pane_id))
+    });
+    agents
 }
 
 /// Represents a tmux window with captured content
@@ -214,6 +484,7 @@ pub struct TmuxWindow {
 }
 
 impl TmuxWindow {
+    #[allow(dead_code)]
     pub fn get_active_pane(&self) -> Option<&TmuxPane> {
         self.panes.iter().find(|p| p.active).or(self.panes.first())
     }
@@ -250,7 +521,7 @@ pub struct TmuxSession {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ViewMode {
     TreeView,
-    MultiPreview,
+    AgentMonitor,
     /// Full-screen fleet view of Claude Code background sessions (the
     /// `claude agents` agent view), grouped by working directory.
     Dashboard,
@@ -454,9 +725,6 @@ pub struct UIState {
     // View mode
     pub view_mode: ViewMode,
 
-    // Space key tracking for double-press
-    pub last_space_press: Option<Instant>,
-
     // TreeView state
     pub sessions: Vec<TmuxSession>,
     pub selected_session: usize,
@@ -477,9 +745,19 @@ pub struct UIState {
     /// True after `z` is pressed, awaiting the `a` of the `za` fold chord.
     pub pending_z: bool,
 
-    // MultiPreview state (session_idx, window_idx)
-    pub multi_session: usize,
-    pub multi_window: usize,
+    // Agent Monitor state. Pane ids are stable across refreshes and are the
+    // selection/order key; the projected records contain no borrowed tmux data.
+    pub agent_panes: Vec<AgentPane>,
+    pub agent_order: Vec<String>,
+    pub agent_pane_selected: Option<String>,
+    pub agent_monitor_mode: PresentationMode,
+    pub agent_monitor_focused: bool,
+    pub agent_monitor_filter_editing: bool,
+    pub agent_monitor_filter: String,
+    pub agent_monitor_scroll: usize,
+    pub agent_monitor_message: Option<(String, i64)>,
+    pub agent_pane_contents: HashMap<String, Text<'static>>,
+    pub agent_monitor_config: AgentMonitorConfig,
 
     /// Claude Code background sessions shown in the agent view, refreshed from
     /// `~/.claude/jobs` while the dashboard is open. Order matches the rendered
@@ -520,7 +798,7 @@ pub struct UIState {
     pub keybindings: KeyBindings,
     /// Panel layout ratios.
     pub layout: LayoutConfig,
-    /// Behavioural toggles (double-space window, exit-on-switch, …).
+    /// Behavioural toggles (startup view, exit-on-switch, …).
     pub behavior: BehaviorConfig,
 
     pub input_mode: InputMode,
@@ -544,9 +822,9 @@ impl UIState {
         let theme = config.theme.resolve();
         let view_mode = config.behavior.view_mode();
         let session_sort = config.behavior.session_sort();
+        let agent_monitor_mode = crate::ui_state::load_agent_monitor_mode();
         let mut state = Self {
             view_mode,
-            last_space_press: None,
 
             sessions: Vec::new(),
             selected_session: 0,
@@ -562,8 +840,17 @@ impl UIState {
             collapsed_groups: HashSet::new(),
             pending_z: false,
 
-            multi_session: 0,
-            multi_window: 0,
+            agent_panes: Vec::new(),
+            agent_order: Vec::new(),
+            agent_pane_selected: None,
+            agent_monitor_mode,
+            agent_monitor_focused: false,
+            agent_monitor_filter_editing: false,
+            agent_monitor_filter: String::new(),
+            agent_monitor_scroll: 0,
+            agent_monitor_message: None,
+            agent_pane_contents: HashMap::new(),
+            agent_monitor_config: config.agent_monitor,
 
             agent_sessions: Vec::new(),
             agent_selected: 0,
@@ -611,52 +898,437 @@ impl UIState {
     /// state directories. This keeps markers live without a full tmux refresh.
     pub fn refresh_agent_states(&mut self) {
         crate::hook::apply_states(&mut self.sessions);
+        let now = crate::hook::now_secs();
+        self.rebuild_agent_panes(now);
+        if self
+            .agent_monitor_message
+            .as_ref()
+            .is_some_and(|(_, shown_at)| now.saturating_sub(*shown_at) >= 3)
+        {
+            self.agent_monitor_message = None;
+        }
     }
 
     /// True if any session currently has a `Working` agent marker, used to
     /// decide whether the spinner animation needs frequent redraws.
-    pub fn has_working_agent(&self) -> bool {
-        self.sessions.iter().any(|s| {
-            s.claude_state == Some(HookState::Working) || s.codex_state == Some(HookState::Working)
+    pub fn has_visible_working_agent(&self, width: u16, height: u16) -> bool {
+        if self.view_mode != ViewMode::AgentMonitor {
+            return self.sessions.iter().any(|session| {
+                session.claude_state == Some(HookState::Working)
+                    || session.codex_state == Some(HookState::Working)
+            });
+        }
+        if self.agent_monitor_focused {
+            return self
+                .selected_agent_pane()
+                .is_some_and(|agent| agent.state == ObservedState::Working);
+        }
+        let visible = self.visible_agent_panes();
+        if self.agent_monitor_mode == PresentationMode::Overview
+            && overview_density(width, height, visible.len()) == OverviewDensity::SummaryList
+        {
+            return visible
+                .iter()
+                .skip(self.agent_monitor_scroll)
+                .take(usize::from(height.saturating_sub(2)))
+                .any(|agent| agent.state == ObservedState::Working);
+        }
+        visible
+            .iter()
+            .any(|agent| agent.state == ObservedState::Working)
+    }
+
+    pub fn toggle_agent_monitor(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::TreeView | ViewMode::Dashboard => ViewMode::AgentMonitor,
+            ViewMode::AgentMonitor => ViewMode::TreeView,
+        };
+        self.agent_monitor_focused = false;
+        self.agent_monitor_filter_editing = false;
+    }
+
+    pub fn cycle_agent_monitor_mode(&mut self) {
+        self.agent_monitor_mode = match self.agent_monitor_mode {
+            PresentationMode::Attention => PresentationMode::Overview,
+            PresentationMode::Overview => PresentationMode::Attention,
+        };
+        self.agent_monitor_scroll = 0;
+        self.agent_monitor_focused = false;
+        self.ensure_agent_selection_visible();
+    }
+
+    fn rebuild_agent_panes(&mut self, now: i64) {
+        let projected = project_agent_panes(
+            &self.sessions,
+            now,
+            self.agent_monitor_config.completed_retention_secs,
+        );
+        let previous_order = self.agent_order.clone();
+        let previous_selected = self.agent_pane_selected.clone();
+        let previous_group = previous_selected.as_ref().and_then(|id| {
+            self.agent_panes
+                .iter()
+                .find(|agent| &agent.pane_id == id)
+                .map(AgentPane::group_key)
+        });
+        let ids: HashSet<String> = projected
+            .iter()
+            .map(|agent| agent.pane_id.clone())
+            .collect();
+        self.agent_order.retain(|id| ids.contains(id));
+
+        for agent in &projected {
+            if self.agent_order.contains(&agent.pane_id) {
+                continue;
+            }
+            let group = agent.group_key();
+            let insert_at = self
+                .agent_order
+                .iter()
+                .enumerate()
+                .filter_map(|(index, id)| {
+                    projected
+                        .iter()
+                        .find(|existing| &existing.pane_id == id)
+                        .filter(|existing| existing.group_key() == group)
+                        .map(|_| index + 1)
+                })
+                .next_back()
+                .unwrap_or(self.agent_order.len());
+            self.agent_order.insert(insert_at, agent.pane_id.clone());
+        }
+
+        let by_id: HashMap<String, AgentPane> = projected
+            .into_iter()
+            .map(|agent| (agent.pane_id.clone(), agent))
+            .collect();
+        self.agent_panes = self
+            .agent_order
+            .iter()
+            .filter_map(|id| by_id.get(id).cloned())
+            .collect();
+        let active_targets: HashSet<&str> = self
+            .agent_panes
+            .iter()
+            .map(|agent| agent.target.as_str())
+            .collect();
+        self.agent_pane_contents
+            .retain(|target, _| active_targets.contains(target.as_str()));
+
+        if previous_selected
+            .as_ref()
+            .is_some_and(|id| !ids.contains(id))
+        {
+            let old_index = previous_selected
+                .as_ref()
+                .and_then(|id| previous_order.iter().position(|old| old == id))
+                .unwrap_or(0);
+            let adjacent_ids = || {
+                previous_order[old_index.saturating_add(1).min(previous_order.len())..]
+                    .iter()
+                    .chain(previous_order[..old_index.min(previous_order.len())].iter().rev())
+            };
+            let replacement = previous_group
+                .and_then(|group| {
+                    adjacent_ids().find_map(|id| {
+                        self.agent_panes
+                            .iter()
+                            .find(|agent| &agent.pane_id == id && agent.group_key() == group)
+                    })
+                })
+                .or_else(|| {
+                    adjacent_ids()
+                        .find_map(|id| self.agent_panes.iter().find(|agent| &agent.pane_id == id))
+                })
+                .or_else(|| self.agent_panes.first());
+            self.agent_pane_selected = replacement.map(|agent| agent.pane_id.clone());
+            if self.agent_monitor_focused {
+                self.agent_monitor_focused = false;
+                self.agent_monitor_message = Some((
+                    "Focused agent disappeared".to_string(),
+                    crate::hook::now_secs(),
+                ));
+            }
+        } else if self.agent_pane_selected.is_none() {
+            self.agent_pane_selected = self.agent_panes.first().map(|agent| agent.pane_id.clone());
+        }
+        self.ensure_agent_selection_visible();
+    }
+
+    pub fn visible_agent_panes(&self) -> Vec<&AgentPane> {
+        let mut agents: Vec<&AgentPane> = self
+            .agent_panes
+            .iter()
+            .filter(|agent| self.agent_matches_filter(agent))
+            .filter(|agent| {
+                self.agent_monitor_mode == PresentationMode::Overview
+                    || agent.state != ObservedState::Running
+            })
+            .collect();
+        if self.agent_monitor_mode == PresentationMode::Attention {
+            let stable_position: HashMap<&str, usize> = self
+                .agent_order
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (id.as_str(), index))
+                .collect();
+            agents.sort_by_key(|agent| {
+                (
+                    agent.state.attention_priority(),
+                    agent.state_since.unwrap_or(i64::MAX),
+                    stable_position
+                        .get(agent.pane_id.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                )
+            });
+        }
+        agents
+    }
+
+    fn agent_matches_filter(&self, agent: &AgentPane) -> bool {
+        let query = self.agent_monitor_filter.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            return true;
+        }
+        let identity = self.agent_identity(agent).to_ascii_lowercase();
+        query.split_whitespace().all(|token| {
+            if let Some(value) = token.strip_prefix("state:") {
+                let aliases: &[&str] = match agent.state {
+                    ObservedState::Waiting => &["wait", "waiting", "blocked"],
+                    ObservedState::Error => &["error", "failed"],
+                    ObservedState::Working => &["work", "working"],
+                    ObservedState::Done => &["done", "completed"],
+                    ObservedState::Running => &["run", "running"],
+                };
+                return aliases.iter().any(|alias| alias.contains(value));
+            }
+            if let Some(value) = token.strip_prefix("agent:") {
+                return agent.kind.label().to_ascii_lowercase().contains(value);
+            }
+            if let Some(value) = token.strip_prefix("repo:") {
+                return identity.contains(value);
+            }
+            identity.contains(token)
+                || agent.activity.to_ascii_lowercase().contains(token)
+                || agent.target.to_ascii_lowercase().contains(token)
+                || agent.kind.label().to_ascii_lowercase().contains(token)
+                || agent.state.label().to_ascii_lowercase().contains(token)
         })
     }
 
-    pub fn handle_space_press(&mut self) -> bool {
-        let now = Instant::now();
-        if let Some(last) = self.last_space_press
-            && now.duration_since(last) < Duration::from_millis(self.behavior.double_space_ms)
-        {
-            // Double space detected
-            self.toggle_view_mode();
-            self.last_space_press = None;
-            return true;
-        }
-        self.last_space_press = Some(now);
-        false
+    pub fn agent_identity(&self, agent: &AgentPane) -> String {
+        let duplicate = agent.repository.as_ref().is_some_and(|repository| {
+            self.agent_panes.iter().any(|other| {
+                other.pane_id != agent.pane_id
+                    && other.repository.as_ref() == Some(repository)
+                    && other.parent != agent.parent
+            })
+        });
+        agent.identity(duplicate)
     }
 
-    pub fn toggle_view_mode(&mut self) {
-        self.view_mode = match self.view_mode {
-            ViewMode::TreeView => {
-                // Sync multi selection with tree selection
-                self.multi_session = self.selected_session;
-                self.multi_window = self.selected_window;
-                ViewMode::MultiPreview
-            }
-            ViewMode::MultiPreview => {
-                // Sync tree selection with multi selection
-                self.selected_session = self.multi_session;
-                self.selected_window = self.multi_window;
-                self.selected_pane = 0;
-                self.session_list_state.select(Some(self.selected_session));
-                self.window_list_state.select(Some(self.selected_window));
-                self.pane_list_state.select(Some(0));
-                ViewMode::TreeView
-            }
-            // Double-space cycles only Tree <-> Multi; leaving the dashboard
-            // returns to the tree.
-            ViewMode::Dashboard => ViewMode::TreeView,
+    pub fn selected_agent_pane(&self) -> Option<&AgentPane> {
+        let selected = self.agent_pane_selected.as_ref()?;
+        self.visible_agent_panes()
+            .into_iter()
+            .find(|agent| &agent.pane_id == selected)
+    }
+
+    fn ensure_agent_selection_visible(&mut self) {
+        let visible_ids: Vec<String> = self
+            .visible_agent_panes()
+            .iter()
+            .map(|agent| agent.pane_id.clone())
+            .collect();
+        if !self
+            .agent_pane_selected
+            .as_ref()
+            .is_some_and(|selected| visible_ids.contains(selected))
+        {
+            self.agent_pane_selected = visible_ids.first().cloned();
+        }
+        self.agent_monitor_scroll = self
+            .agent_monitor_scroll
+            .min(visible_ids.len().saturating_sub(1));
+    }
+
+    pub fn agent_move_by(&mut self, amount: isize) {
+        let ids: Vec<String> = self
+            .visible_agent_panes()
+            .iter()
+            .map(|agent| agent.pane_id.clone())
+            .collect();
+        let current = self
+            .agent_pane_selected
+            .as_ref()
+            .and_then(|selected| ids.iter().position(|id| id == selected))
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(amount)
+            .min(ids.len().saturating_sub(1));
+        self.agent_pane_selected = ids.get(next).cloned();
+    }
+
+    pub fn agent_move_visual(
+        &mut self,
+        horizontal: isize,
+        vertical: isize,
+        width: u16,
+        height: u16,
+    ) {
+        let count = self.visible_agent_panes().len();
+        let columns = if self.agent_monitor_mode == PresentationMode::Overview
+            && overview_density(width, height, count) == OverviewDensity::LiveGrid
+        {
+            (count as f64).sqrt().ceil().max(1.0) as isize
+        } else {
+            1
         };
+        if columns > 1 && horizontal != 0 {
+            let ids: Vec<String> = self
+                .visible_agent_panes()
+                .iter()
+                .map(|agent| agent.pane_id.clone())
+                .collect();
+            let current = self
+                .agent_pane_selected
+                .as_ref()
+                .and_then(|selected| ids.iter().position(|id| id == selected))
+                .unwrap_or(0);
+            let column = isize::try_from(current).unwrap_or(isize::MAX) % columns;
+            let can_move = (horizontal < 0 && column > 0)
+                || (horizontal > 0
+                    && column + 1 < columns
+                    && current + 1 < ids.len());
+            if can_move {
+                self.agent_pane_selected = ids
+                    .get(current.saturating_add_signed(horizontal))
+                    .cloned();
+            }
+            return;
+        }
+        let amount = if horizontal != 0 {
+            horizontal
+        } else {
+            vertical.saturating_mul(
+                columns.min(isize::try_from(width.max(1)).unwrap_or(isize::MAX)),
+            )
+        };
+        self.agent_move_by(amount);
+    }
+
+    pub fn agent_move_home(&mut self) {
+        self.agent_pane_selected = self
+            .visible_agent_panes()
+            .first()
+            .map(|agent| agent.pane_id.clone());
+    }
+
+    pub fn agent_move_end(&mut self) {
+        self.agent_pane_selected = self
+            .visible_agent_panes()
+            .last()
+            .map(|agent| agent.pane_id.clone());
+    }
+
+    pub fn agent_move_page(&mut self, viewport: usize, down: bool) {
+        let amount = isize::try_from(viewport.max(1)).unwrap_or(isize::MAX);
+        self.agent_move_by(if down { amount } else { -amount });
+    }
+
+    pub fn toggle_agent_focus(&mut self) {
+        if self.selected_agent_pane().is_some() {
+            self.agent_monitor_focused = !self.agent_monitor_focused;
+        }
+    }
+
+    pub fn begin_agent_filter(&mut self) {
+        self.agent_monitor_filter_editing = true;
+    }
+
+    pub fn clear_agent_filter(&mut self) {
+        self.agent_monitor_filter_editing = false;
+        self.agent_monitor_filter.clear();
+        self.ensure_agent_selection_visible();
+    }
+
+    pub fn agent_filter_char(&mut self, character: char) {
+        self.agent_monitor_filter.push(character);
+        self.ensure_agent_selection_visible();
+    }
+
+    pub fn agent_filter_backspace(&mut self) {
+        self.agent_monitor_filter.pop();
+        self.ensure_agent_selection_visible();
+    }
+
+    pub fn agent_counts(&self) -> (usize, usize, usize) {
+        let actionable = self
+            .agent_panes
+            .iter()
+            .filter(|agent| agent.state.actionable())
+            .count();
+        let working = self
+            .agent_panes
+            .iter()
+            .filter(|agent| agent.state == ObservedState::Working)
+            .count();
+        let done = self
+            .agent_panes
+            .iter()
+            .filter(|agent| agent.state == ObservedState::Done)
+            .count();
+        (actionable, working, done)
+    }
+
+    pub fn agent_capture_targets(&self, width: u16, height: u16) -> Vec<(String, i32, i32)> {
+        let selected = || {
+            self.selected_agent_pane().map(|agent| {
+                (
+                    agent.target.clone(),
+                    0,
+                    i32::try_from(agent.pane_height).unwrap_or(i32::MAX),
+                )
+            })
+        };
+        if self.agent_monitor_focused {
+            return selected().into_iter().collect();
+        }
+        match self.agent_monitor_mode {
+            PresentationMode::Attention => {
+                if width >= 60 {
+                    selected().into_iter().collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            PresentationMode::Overview => match overview_density(
+                width,
+                height,
+                self.visible_agent_panes().len(),
+            ) {
+                OverviewDensity::LiveGrid => self
+                    .visible_agent_panes()
+                    .into_iter()
+                    .map(|agent| {
+                        (
+                            agent.target.clone(),
+                            0,
+                            i32::try_from(agent.pane_height).unwrap_or(i32::MAX),
+                        )
+                    })
+                    .collect(),
+                OverviewDensity::Hybrid => selected().into_iter().collect(),
+                OverviewDensity::SummaryList => Vec::new(),
+            },
+        }
+    }
+
+    pub fn update_agent_pane_content(&mut self, target: &str, content: String) {
+        if let Ok(parsed) = content.as_bytes().into_text() {
+            self.agent_pane_contents.insert(target.to_string(), parsed);
+        }
     }
 
     // =========================================================================
@@ -794,7 +1466,7 @@ impl UIState {
     pub fn get_current_target(&self) -> Option<String> {
         match self.view_mode {
             ViewMode::TreeView => self.get_selected_pane_target(),
-            ViewMode::MultiPreview => self.get_multi_selected_target(),
+            ViewMode::AgentMonitor => None,
             // Agent-view sessions are not tmux panes; they have no send-keys target.
             ViewMode::Dashboard => None,
         }
@@ -814,7 +1486,9 @@ impl UIState {
                 }
                 Focus::Panes => self.get_selected_pane_target(),
             },
-            ViewMode::MultiPreview => self.get_multi_selected_target(),
+            ViewMode::AgentMonitor => self
+                .selected_agent_pane()
+                .map(|agent| agent.target.clone()),
             // The agent view attaches via `claude attach`, not a tmux target.
             ViewMode::Dashboard => None,
         }
@@ -1033,6 +1707,7 @@ impl UIState {
         self.sessions = sessions;
         self.apply_group_labels();
         self.order_sessions();
+        self.rebuild_agent_panes(crate::hook::now_secs());
 
         if let Some(name) = current_name
             && let Some(idx) = self.sessions.iter().position(|s| s.name == name)
@@ -1209,7 +1884,6 @@ impl UIState {
             && let Some(idx) = self.sessions.iter().position(|s| s.name == name)
         {
             self.selected_session = idx;
-            self.multi_session = self.multi_session.min(self.sessions.len().saturating_sub(1));
             self.session_list_state.select(Some(idx));
         }
     }
@@ -1226,8 +1900,6 @@ impl UIState {
     pub fn validate_selections(&mut self) {
         if !self.sessions.is_empty() {
             self.selected_session = self.selected_session.min(self.sessions.len() - 1);
-            self.multi_session = self.multi_session.min(self.sessions.len() - 1);
-
             if let Some(session) = self.sessions.get(self.selected_session)
                 && !session.windows.is_empty()
             {
@@ -1237,12 +1909,6 @@ impl UIState {
                 {
                     self.selected_pane = self.selected_pane.min(window.panes.len() - 1);
                 }
-            }
-
-            if let Some(session) = self.sessions.get(self.multi_session)
-                && !session.windows.is_empty()
-            {
-                self.multi_window = self.multi_window.min(session.windows.len() - 1);
             }
 
             self.session_list_state.select(Some(self.selected_session));
@@ -1356,46 +2022,6 @@ impl UIState {
         };
     }
 
-    // =========================================================================
-    // MultiPreview Navigation
-    // =========================================================================
-
-    pub fn get_multi_selected_target(&self) -> Option<String> {
-        let session = self.sessions.get(self.multi_session)?;
-        let window = session.windows.get(self.multi_window)?;
-        // Use window-level target (tmux will switch to the active pane)
-        Some(format!("{}:{}", session.name, window.index))
-    }
-
-    pub fn multi_move_left(&mut self) {
-        if self.multi_session > 0 {
-            self.multi_session -= 1;
-            // Reset window selection for new session
-            self.multi_window = 0;
-        }
-    }
-
-    pub fn multi_move_right(&mut self) {
-        if self.multi_session < self.sessions.len().saturating_sub(1) {
-            self.multi_session += 1;
-            // Reset window selection for new session
-            self.multi_window = 0;
-        }
-    }
-
-    pub fn multi_move_up(&mut self) {
-        if self.multi_window > 0 {
-            self.multi_window -= 1;
-        }
-    }
-
-    pub fn multi_move_down(&mut self) {
-        if let Some(session) = self.sessions.get(self.multi_session)
-            && self.multi_window < session.windows.len().saturating_sub(1)
-        {
-            self.multi_window += 1;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1426,6 +2052,302 @@ mod tests {
         }
         state.update_sessions(names.iter().map(|n| session(n)).collect());
         state
+    }
+
+    fn agent_pane(
+        id: &str,
+        index: u32,
+        kind: AgentKind,
+        state: Option<HookState>,
+        since: Option<i64>,
+        cwd: Option<&str>,
+    ) -> TmuxPane {
+        TmuxPane {
+            id: id.to_string(),
+            index,
+            width: 120,
+            height: 40,
+            active: index == 0,
+            current_command: kind.label().to_ascii_lowercase(),
+            current_path: cwd.unwrap_or("/tmp").to_string(),
+            pid: index + 100,
+            has_claude: kind == AgentKind::Claude,
+            claude_state: (kind == AgentKind::Claude).then_some(state).flatten(),
+            claude_activity: (kind == AgentKind::Claude).then(|| "editing ui.rs".to_string()),
+            claude_state_since: (kind == AgentKind::Claude).then_some(since).flatten(),
+            claude_cwd: (kind == AgentKind::Claude)
+                .then(|| cwd.map(ToOwned::to_owned))
+                .flatten(),
+            has_codex: kind == AgentKind::Codex,
+            codex_state: (kind == AgentKind::Codex).then_some(state).flatten(),
+            codex_activity: (kind == AgentKind::Codex).then(|| "running tests".to_string()),
+            codex_state_since: (kind == AgentKind::Codex).then_some(since).flatten(),
+            codex_cwd: (kind == AgentKind::Codex)
+                .then(|| cwd.map(ToOwned::to_owned))
+                .flatten(),
+            agent_repository: None,
+            agent_worktree: None,
+            agent_repository_parent: None,
+        }
+    }
+
+    fn monitored_session(name: &str, panes: Vec<TmuxPane>) -> TmuxSession {
+        TmuxSession {
+            name: name.to_string(),
+            windows: vec![TmuxWindow {
+                index: 1,
+                name: "main".to_string(),
+                panes,
+                has_claude: false,
+                claude_state: None,
+                has_codex: false,
+                codex_state: None,
+            }],
+            has_claude: false,
+            claude_state: None,
+            has_codex: false,
+            codex_state: None,
+            last_attached: 0,
+            activity: 0,
+            group: None,
+        }
+    }
+
+    fn monitor_state() -> UIState {
+        let mut state = UIState::new(Config::default());
+        state.groups = GroupStore::default();
+        state.agent_monitor_mode = PresentationMode::Overview;
+        state
+    }
+
+    #[test]
+    fn pane_projection_keeps_each_supported_pane_and_hookless_fallback() {
+        let sessions = vec![monitored_session(
+            "dev",
+            vec![
+                agent_pane(
+                    "%1",
+                    0,
+                    AgentKind::Claude,
+                    Some(HookState::Waiting),
+                    Some(90),
+                    Some("/src/tmux-deck/.worktrees/feature-x"),
+                ),
+                agent_pane("%2", 1, AgentKind::Codex, None, None, None),
+            ],
+        )];
+        let agents = project_agent_panes(&sessions, 100, 600);
+        assert_eq!(agents.len(), 2);
+        let hooked = agents.iter().find(|agent| agent.pane_id == "%1").unwrap();
+        let hookless = agents.iter().find(|agent| agent.pane_id == "%2").unwrap();
+        assert_eq!(hooked.state, ObservedState::Waiting);
+        assert_eq!(hooked.repository.as_deref(), Some("tmux-deck"));
+        assert_eq!(hooked.worktree.as_deref(), Some("feature-x"));
+        assert_eq!(hookless.state, ObservedState::Running);
+        assert_eq!(hookless.activity, "state unavailable");
+    }
+
+    #[test]
+    fn attention_order_is_state_then_longest_wait() {
+        let mut state = monitor_state();
+        state.sessions = vec![monitored_session(
+            "dev",
+            vec![
+                agent_pane("%work", 3, AgentKind::Codex, Some(HookState::Working), Some(1), None),
+                agent_pane("%new", 2, AgentKind::Codex, Some(HookState::Waiting), Some(200), None),
+                agent_pane("%old", 1, AgentKind::Claude, Some(HookState::Waiting), Some(100), None),
+                agent_pane("%err", 0, AgentKind::Claude, Some(HookState::Error), Some(50), None),
+            ],
+        )];
+        state.rebuild_agent_panes(300);
+        state.agent_monitor_mode = PresentationMode::Attention;
+        let ids: Vec<&str> = state
+            .visible_agent_panes()
+            .iter()
+            .map(|agent| agent.pane_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["%old", "%new", "%err", "%work"]);
+    }
+
+    #[test]
+    fn stable_insertion_and_selection_fallback_stay_in_worktree() {
+        let mut state = monitor_state();
+        state.sessions = vec![monitored_session(
+            "dev",
+            vec![
+                agent_pane("%1", 0, AgentKind::Codex, Some(HookState::Working), Some(1), Some("/src/repo/.worktrees/a")),
+                agent_pane("%3", 2, AgentKind::Claude, Some(HookState::Working), Some(1), Some("/src/repo/.worktrees/a")),
+            ],
+        )];
+        state.rebuild_agent_panes(10);
+        state.agent_pane_selected = Some("%1".to_string());
+        state.agent_monitor_focused = true;
+        state.sessions[0].windows[0].panes = vec![
+            agent_pane("%2", 1, AgentKind::Codex, Some(HookState::Working), Some(1), Some("/src/repo/.worktrees/a")),
+            agent_pane("%3", 2, AgentKind::Claude, Some(HookState::Working), Some(1), Some("/src/repo/.worktrees/a")),
+        ];
+        state.rebuild_agent_panes(11);
+        assert_eq!(state.agent_order, vec!["%3", "%2"]);
+        assert_eq!(state.agent_pane_selected.as_deref(), Some("%3"));
+        assert!(!state.agent_monitor_focused);
+        assert!(state.agent_monitor_message.is_some());
+
+        state.sessions[0].windows[0].panes.push(agent_pane(
+            "%0",
+            3,
+            AgentKind::Codex,
+            Some(HookState::Working),
+            Some(1),
+            Some("/src/aaa/.worktrees/x"),
+        ));
+        state.rebuild_agent_panes(12);
+        assert_eq!(state.agent_order, vec!["%3", "%2", "%0"]);
+    }
+
+    #[test]
+    fn retention_filter_and_new_work_transition() {
+        let mut state = monitor_state();
+        state.agent_monitor_config.completed_retention_secs = 600;
+        state.sessions = vec![monitored_session(
+            "dev",
+            vec![agent_pane(
+                "%1",
+                0,
+                AgentKind::Codex,
+                Some(HookState::Done),
+                Some(100),
+                Some("/src/repo"),
+            )],
+        )];
+        state.rebuild_agent_panes(700);
+        assert_eq!(state.agent_panes.len(), 1);
+        state.rebuild_agent_panes(701);
+        assert!(state.agent_panes.is_empty());
+        state.sessions[0].windows[0].panes[0].codex_state = Some(HookState::Working);
+        state.sessions[0].windows[0].panes[0].codex_state_since = Some(702);
+        state.rebuild_agent_panes(702);
+        assert_eq!(state.agent_panes[0].state, ObservedState::Working);
+    }
+
+    #[test]
+    fn structured_and_free_text_filters_compose() {
+        let mut state = monitor_state();
+        state.sessions = vec![monitored_session(
+            "dev",
+            vec![
+                agent_pane("%1", 0, AgentKind::Codex, Some(HookState::Working), Some(1), Some("/src/repo-a/.worktrees/main")),
+                agent_pane("%2", 1, AgentKind::Claude, Some(HookState::Waiting), Some(1), Some("/src/repo-b/.worktrees/main")),
+            ],
+        )];
+        state.rebuild_agent_panes(10);
+        state.agent_monitor_filter = "state:work agent:codex tests".to_string();
+        assert_eq!(state.visible_agent_panes().len(), 1);
+        assert_eq!(state.visible_agent_panes()[0].pane_id, "%1");
+        state.agent_monitor_filter = "repo:repo-b".to_string();
+        assert_eq!(state.visible_agent_panes()[0].pane_id, "%2");
+    }
+
+    #[test]
+    fn duplicate_repository_names_disambiguate_and_missing_git_uses_tmux_target() {
+        let mut state = monitor_state();
+        let mut first = agent_pane("%1", 0, AgentKind::Codex, None, None, None);
+        first.agent_repository = Some("repo".to_string());
+        first.agent_repository_parent = Some("alice".to_string());
+        let mut second = agent_pane("%2", 1, AgentKind::Claude, None, None, None);
+        second.agent_repository = Some("repo".to_string());
+        second.agent_repository_parent = Some("bob".to_string());
+        let missing = agent_pane("%3", 2, AgentKind::Codex, None, None, None);
+        state.sessions = vec![monitored_session("dev", vec![first, second, missing])];
+        state.rebuild_agent_panes(10);
+        let identities: Vec<String> = state
+            .agent_panes
+            .iter()
+            .map(|agent| state.agent_identity(agent))
+            .collect();
+        assert!(identities.contains(&"alice/repo".to_string()));
+        assert!(identities.contains(&"bob/repo".to_string()));
+        assert!(identities.contains(&"dev:1.%3".to_string()));
+
+        state.agent_monitor_mode = PresentationMode::Attention;
+        assert!(state.visible_agent_panes().is_empty());
+    }
+
+    #[test]
+    fn density_targets_and_capture_budget_follow_design() {
+        for count in [1, 4] {
+            assert_eq!(overview_density(120, 40, count), OverviewDensity::LiveGrid);
+        }
+        for count in [5, 12] {
+            assert_eq!(overview_density(120, 40, count), OverviewDensity::Hybrid);
+        }
+        for count in [13, 30, 31] {
+            assert_eq!(overview_density(120, 40, count), OverviewDensity::SummaryList);
+        }
+
+        let mut state = monitor_state();
+        state.sessions = vec![monitored_session(
+            "dev",
+            (0..5)
+                .map(|index| agent_pane(&format!("%{index}"), index, AgentKind::Codex, Some(HookState::Working), Some(1), None))
+                .collect(),
+        )];
+        state.rebuild_agent_panes(10);
+        assert_eq!(state.agent_capture_targets(120, 40).len(), 1);
+        assert!(state.agent_capture_targets(50, 20).is_empty());
+        state.agent_monitor_focused = true;
+        assert_eq!(state.agent_capture_targets(50, 20).len(), 1);
+
+        state.agent_monitor_focused = false;
+        state.sessions[0].windows[0].panes.truncate(4);
+        state.rebuild_agent_panes(11);
+        assert_eq!(state.agent_capture_targets(120, 40).len(), 4);
+        state.agent_monitor_mode = PresentationMode::Attention;
+        assert_eq!(state.agent_capture_targets(120, 40).len(), 1);
+        assert!(state.agent_capture_targets(59, 40).is_empty());
+    }
+
+    #[test]
+    fn monitor_view_transitions_and_large_list_navigation_are_unbounded() {
+        let mut state = monitor_state();
+        state.view_mode = ViewMode::TreeView;
+        state.toggle_agent_monitor();
+        assert_eq!(state.view_mode, ViewMode::AgentMonitor);
+        state.toggle_agent_monitor();
+        assert_eq!(state.view_mode, ViewMode::TreeView);
+        state.view_mode = ViewMode::Dashboard;
+        state.toggle_agent_monitor();
+        assert_eq!(state.view_mode, ViewMode::AgentMonitor);
+
+        state.agent_panes = (0..31)
+            .map(|index| AgentPane {
+                pane_id: format!("%{index}"),
+                target: format!("dev:1.{index}"),
+                tmux_identity: format!("dev:1.%{index}"),
+                session_name: "dev".to_string(),
+                window_index: 1,
+                pane_index: index,
+                pane_height: 24,
+                kind: AgentKind::Codex,
+                state: ObservedState::Working,
+                activity: "working".to_string(),
+                state_since: Some(1),
+                repository: None,
+                worktree: None,
+                parent: None,
+            })
+            .collect();
+        state.agent_order = state
+            .agent_panes
+            .iter()
+            .map(|agent| agent.pane_id.clone())
+            .collect();
+        state.agent_pane_selected = state.agent_order.first().cloned();
+        state.agent_move_end();
+        assert_eq!(state.agent_pane_selected.as_deref(), Some("%30"));
+        state.agent_move_page(10, false);
+        assert_eq!(state.agent_pane_selected.as_deref(), Some("%20"));
+        state.agent_move_home();
+        assert_eq!(state.agent_pane_selected.as_deref(), Some("%0"));
     }
 
     /// Build a session with a single window holding the given panes, each

@@ -802,6 +802,7 @@ mod tests {
             height: 24,
             active: true,
             current_command: "codex".into(),
+            current_path: "/tmp".into(),
             pid: 1,
             has_claude: false,
             claude_state: Some(HookState::Error),
@@ -813,6 +814,9 @@ mod tests {
             codex_activity: None,
             codex_state_since: None,
             codex_cwd: None,
+            agent_repository: None,
+            agent_worktree: None,
+            agent_repository_parent: None,
         };
         let mut sessions = vec![TmuxSession {
             name: "work".into(),

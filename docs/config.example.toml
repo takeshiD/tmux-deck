@@ -27,6 +27,11 @@ summary_model = "haiku"
 preview_mode = "transcript"
 
 # -----------------------------------------------------------------------------
+[agent_monitor]
+# Keep completed turns visible long enough to notice them.
+completed_retention_secs = 600
+
+# -----------------------------------------------------------------------------
 [theme]
 # A named colour preset. One of:
 #   default       monochrome   dracula     nord        gruvbox
@@ -61,8 +66,7 @@ preset = "default"
 #               Backspace Delete
 # Examples: "q", "C-n", "S-Tab", "Space".
 #
-# Note: navigation (j/k/h/l, arrows, Tab) and the `za` fold / double-Space
-# chords are fixed and not (yet) remappable.
+# Note: navigation (j/k/h/l, arrows, Tab) and the `za` fold chord are fixed.
 quit           = ["q", "Esc"]
 refresh        = "r"
 sort           = "s"            # TreeView + Sessions focus only
@@ -72,7 +76,8 @@ enter          = "Enter"
 new_session    = "C-n"
 rename_session = "C-r"
 kill_session   = "C-x"
-dashboard      = "d"            # toggle the Claude fleet dashboard
+agent_monitor  = "m"            # toggle Sessions / Agent Monitor
+dashboard      = "d"            # toggle Background Agents
 
 # -----------------------------------------------------------------------------
 # Markers shown for hook-driven agent states. Each marker has a `glyph` and a
@@ -98,13 +103,12 @@ running = { glyph = "●", color = "#5fafff" }        # process detected, no hoo
 session_panel_width = 30
 # Vertical split of the left panel: Sessions / Windows / Panes (percentages).
 tree_split = [30, 35, 35]
-# In MultiPreview, the width percentage of the selected session; the others
-# share what remains.
+# Legacy setting retained for compatibility with pre-Agent-Monitor configs.
 multi_selected_ratio = 70
 
 # -----------------------------------------------------------------------------
 [behavior]
-default_view    = "tree"   # startup view: "tree" or "multi"
+default_view    = "tree"   # "tree" or "agent_monitor"; legacy "multi" is accepted
 default_sort    = "recent" # "recent", "recent_asc", "abc", "abc_asc"
-double_space_ms = 300      # window for a double-Space to toggle the view
+double_space_ms = 300      # legacy compatibility setting; no longer used
 exit_on_switch  = true     # exit tmux-deck after switching to a session (Enter)

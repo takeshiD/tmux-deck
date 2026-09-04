@@ -1,5 +1,7 @@
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::Path;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -29,6 +31,16 @@ pub struct TmuxActor {
     capture_rx: mpsc::Receiver<TmuxCommand>,
     response_tx: mpsc::Sender<TmuxResponse>,
     ctrl: Option<ControlMode>,
+    agent_metadata: HashMap<String, CachedAgentMetadata>,
+    agent_metadata_misses: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedAgentMetadata {
+    cwd: String,
+    repository: String,
+    worktree: Option<String>,
+    parent: Option<String>,
 }
 
 struct ControlMode {
@@ -70,6 +82,8 @@ impl TmuxActor {
             capture_rx,
             response_tx,
             ctrl: None,
+            agent_metadata: HashMap::new(),
+            agent_metadata_misses: HashMap::new(),
         }
     }
 
@@ -183,7 +197,7 @@ impl TmuxActor {
             "list-panes",
             "-a",
             "-F",
-            "PANE\t#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_index}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_last}\t#{pane_current_command}\t#{pane_pid}",
+            "PANE\t#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_index}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_last}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}",
         ];
 
         // If control mode is up, send 3 commands as 3 blocks; otherwise one
@@ -221,7 +235,59 @@ impl TmuxActor {
         let mut sessions = build_sessions(&stdout);
         annotate_agent_panes(&mut sessions).await;
         crate::hook::apply_states(&mut sessions);
+        self.annotate_agent_metadata(&mut sessions).await;
         TmuxResponse::SessionsRefreshed { sessions }
+    }
+
+    async fn annotate_agent_metadata(&mut self, sessions: &mut [TmuxSession]) {
+        let current_ids: HashSet<String> = sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.panes)
+            .map(|pane| pane.id.clone())
+            .collect();
+        self.agent_metadata.retain(|id, _| current_ids.contains(id));
+        self.agent_metadata_misses
+            .retain(|id, _| current_ids.contains(id));
+
+        for pane in sessions
+            .iter_mut()
+            .flat_map(|session| &mut session.windows)
+            .flat_map(|window| &mut window.panes)
+            .filter(|pane| pane.has_claude || pane.has_codex)
+        {
+            let cwd = pane
+                .codex_cwd
+                .as_deref()
+                .or(pane.claude_cwd.as_deref())
+                .filter(|path| !path.is_empty())
+                .unwrap_or(&pane.current_path)
+                .to_string();
+            let cached = self
+                .agent_metadata
+                .get(&pane.id)
+                .filter(|metadata| metadata.cwd == cwd)
+                .cloned();
+            let cached_miss = self
+                .agent_metadata_misses
+                .get(&pane.id)
+                .is_some_and(|missing_cwd| missing_cwd == &cwd);
+            let metadata = match cached {
+                Some(metadata) => Some(metadata),
+                None if cached_miss => None,
+                None => resolve_git_metadata(&cwd).await,
+            };
+            if let Some(metadata) = metadata {
+                pane.agent_repository = Some(metadata.repository.clone());
+                pane.agent_worktree = metadata.worktree.clone();
+                pane.agent_repository_parent = metadata.parent.clone();
+                self.agent_metadata.insert(pane.id.clone(), metadata);
+                self.agent_metadata_misses.remove(&pane.id);
+            } else {
+                self.agent_metadata.remove(&pane.id);
+                self.agent_metadata_misses.insert(pane.id.clone(), cwd);
+            }
+        }
     }
 
     // =========================================================================
@@ -747,6 +813,7 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                 let active = it.next() == Some("1");
                 let last = it.next() == Some("1");
                 let current_command = it.next().unwrap_or("").to_string();
+                let current_path = it.next().unwrap_or("").to_string();
                 let pid: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
                 if let Some(s) = sessions.get_mut(session)
@@ -763,6 +830,7 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                             height,
                             active,
                             current_command,
+                            current_path,
                             pid,
                             has_claude: false,
                             claude_state: None,
@@ -774,6 +842,9 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                             codex_activity: None,
                             codex_state_since: None,
                             codex_cwd: None,
+                            agent_repository: None,
+                            agent_worktree: None,
+                            agent_repository_parent: None,
                         },
                     ));
                 }
@@ -847,6 +918,55 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
 // Coding-agent process detection
 // =============================================================================
 //
+async fn resolve_git_metadata(cwd: &str) -> Option<CachedAgentMetadata> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--show-toplevel",
+            "--abbrev-ref",
+            "HEAD",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    metadata_from_rev_parse(cwd, &stdout)
+}
+
+fn metadata_from_rev_parse(cwd: &str, stdout: &str) -> Option<CachedAgentMetadata> {
+    let mut lines = stdout.lines();
+    let common_dir = Path::new(lines.next()?);
+    let worktree_root = Path::new(lines.next()?);
+    let branch = lines.next().filter(|branch| *branch != "HEAD");
+    let repository_root = if common_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
+        common_dir.parent()?
+    } else {
+        common_dir
+    };
+    let repository = repository_root.file_name()?.to_str()?.to_string();
+    let parent = repository_root
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned);
+    let worktree = branch
+        .map(ToOwned::to_owned)
+        .or_else(|| worktree_root.file_name()?.to_str().map(ToOwned::to_owned));
+    Some(CachedAgentMetadata {
+        cwd: cwd.to_string(),
+        repository,
+        worktree,
+        parent,
+    })
+}
+
 // For each pane we already know the shell pid. A Claude or Codex process in
 // that pane shows up as a descendant under the shell. We snapshot the full
 // process table once per refresh and mark any pane whose descendant tree
@@ -1011,5 +1131,17 @@ mod coding_agent_detection_tests {
         let agents = HashSet::from([12]);
         assert!(pane_has_agent(10, &children, &agents));
         assert!(!pane_has_agent(20, &children, &agents));
+    }
+
+    #[test]
+    fn git_metadata_groups_worktrees_under_the_common_repository() {
+        let metadata = metadata_from_rev_parse(
+            "/src/tmux-deck/.worktrees/feature-x",
+            "/src/tmux-deck/.git\n/src/tmux-deck/.worktrees/feature-x\nfeature/x\n",
+        )
+        .unwrap();
+        assert_eq!(metadata.repository, "tmux-deck");
+        assert_eq!(metadata.worktree.as_deref(), Some("feature/x"));
+        assert_eq!(metadata.parent.as_deref(), Some("src"));
     }
 }

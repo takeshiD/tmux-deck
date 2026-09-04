@@ -7,6 +7,7 @@ mod group;
 mod hook;
 mod termscreen;
 mod ui;
+mod ui_state;
 
 use std::io;
 use std::time::Duration;
@@ -28,6 +29,40 @@ use config::Config;
 
 /// Fallback preview interval (ms) when neither the CLI flag nor the config sets one.
 const DEFAULT_INTERVAL_MS: u64 = 300;
+
+struct TerminalRestoreGuard {
+    alternate_screen: bool,
+    active: bool,
+}
+
+impl TerminalRestoreGuard {
+    fn new() -> Self {
+        Self {
+            alternate_screen: false,
+            active: true,
+        }
+    }
+
+    fn restore(mut self) -> Result<()> {
+        disable_raw_mode()?;
+        if self.alternate_screen {
+            io::stdout().execute(LeaveAlternateScreen)?;
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = disable_raw_mode();
+            if self.alternate_screen {
+                let _ = io::stdout().execute(LeaveAlternateScreen);
+            }
+        }
+    }
+}
 
 // =============================================================================
 // Main
@@ -79,14 +114,13 @@ async fn main() -> Result<()> {
         .init();
 
     enable_raw_mode()?;
+    let mut terminal_guard = TerminalRestoreGuard::new();
     io::stdout().execute(EnterAlternateScreen)?;
+    terminal_guard.alternate_screen = true;
     let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let result = run_app(terminal, config, interval_ms).await;
-
-    disable_raw_mode()?;
-    io::stdout().execute(LeaveAlternateScreen)?;
-
+    terminal_guard.restore()?;
     result
 }
 

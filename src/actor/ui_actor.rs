@@ -62,6 +62,9 @@ pub struct UIActor {
     /// last fetched (to throttle refresh).
     logs_inflight: std::collections::HashSet<String>,
     logs_fetched_at: std::collections::HashMap<String, std::time::Instant>,
+    /// Slow agent-process discovery cadence; pane captures continue at the
+    /// normal preview interval on the low-priority channel.
+    agent_discovered_at: std::time::Instant,
 }
 
 impl UIActor {
@@ -96,6 +99,7 @@ impl UIActor {
             agent_logs_rx,
             logs_inflight: std::collections::HashSet::new(),
             logs_fetched_at: std::collections::HashMap::new(),
+            agent_discovered_at: std::time::Instant::now(),
         }
     }
 
@@ -174,7 +178,23 @@ impl UIActor {
                                     self.state.refresh_agents();
                                     self.maybe_fetch_logs();
                                 }
-                                ViewMode::MultiPreview => {}
+                                ViewMode::AgentMonitor => {
+                                    if self.agent_discovered_at.elapsed() >= Duration::from_secs(2) {
+                                        let _ = self
+                                            .tmux_capture_tx
+                                            .try_send(TmuxCommand::RefreshAll);
+                                        self.agent_discovered_at = std::time::Instant::now();
+                                    }
+                                    let area = self.terminal.size().unwrap_or_default();
+                                    for (target, start, end) in self
+                                        .state
+                                        .agent_capture_targets(area.width, area.height)
+                                    {
+                                        let _ = self.tmux_capture_tx.try_send(
+                                            TmuxCommand::CapturePane { target, start, end },
+                                        );
+                                    }
+                                }
                             }
                         }
                         UIEvent::Shutdown => {
@@ -186,7 +206,10 @@ impl UIActor {
 
                 // Spinner animation tick: only redraw if a spinner is active.
                 _ = anim.tick() => {
-                    redraw = self.state.has_working_agent();
+                    let area = self.terminal.size().unwrap_or_default();
+                    redraw = self
+                        .state
+                        .has_visible_working_agent(area.width, area.height);
                 }
             }
 
@@ -371,16 +394,50 @@ impl UIActor {
             }
         }
 
-        // Fixed (non-remappable) chords handled before config bindings:
-        // `z` begins the `za` fold chord, double-`Space` toggles the view.
+        if self.state.view_mode == ViewMode::AgentMonitor
+            && self.state.agent_monitor_filter_editing
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    self.state.clear_agent_filter();
+                }
+                KeyCode::Enter => {
+                    self.state.agent_monitor_filter_editing = false;
+                }
+                KeyCode::Backspace => self.state.agent_filter_backspace(),
+                KeyCode::Char(character) if !is_ctrl => self.state.agent_filter_char(character),
+                _ => {}
+            }
+            return Ok(false);
+        }
+
+        // Fixed (non-remappable) context keys handled before config bindings.
         if !is_ctrl {
             match key.code {
                 KeyCode::Char('z') if in_sessions => {
                     self.state.pending_z = true;
                     return Ok(false);
                 }
-                KeyCode::Char(' ') if self.state.view_mode != ViewMode::Dashboard => {
-                    self.state.handle_space_press();
+                KeyCode::Tab if self.state.view_mode == ViewMode::AgentMonitor => {
+                    self.state.cycle_agent_monitor_mode();
+                    let mode = self.state.agent_monitor_mode;
+                    crate::ui_state::save_agent_monitor_mode_later(mode);
+                    return Ok(false);
+                }
+                KeyCode::Char('f') if self.state.view_mode == ViewMode::AgentMonitor => {
+                    self.state.toggle_agent_focus();
+                    return Ok(false);
+                }
+                KeyCode::Char('/') if self.state.view_mode == ViewMode::AgentMonitor => {
+                    self.state.begin_agent_filter();
+                    return Ok(false);
+                }
+                KeyCode::Esc if self.state.view_mode == ViewMode::AgentMonitor => {
+                    if self.state.agent_monitor_focused {
+                        self.state.agent_monitor_focused = false;
+                    } else {
+                        self.state.toggle_agent_monitor();
+                    }
                     return Ok(false);
                 }
                 // Agent-view-only keys: `p` toggles the preview panel, `s`
@@ -422,7 +479,7 @@ impl UIActor {
                     self.state.open_group_session_popup();
                     self.refresh_control.pause();
                 }
-                Action::Input => {
+                Action::Input if self.state.view_mode != ViewMode::AgentMonitor => {
                     self.state.enter_input_mode();
                     self.refresh_control.pause();
                 }
@@ -460,10 +517,11 @@ impl UIActor {
                         }
                     }
                 }
+                Action::AgentMonitor => self.state.toggle_agent_monitor(),
                 Action::Dashboard => self.state.toggle_dashboard(),
                 // Context-gated actions whose gate is not satisfied fall through
                 // to navigation so the key is not swallowed.
-                Action::Sort | Action::Group => {
+                Action::Sort | Action::Group | Action::Input => {
                     if !is_ctrl {
                         self.handle_navigation_key(key.code);
                     }
@@ -622,11 +680,37 @@ impl UIActor {
                 KeyCode::Right | KeyCode::Char('l') => self.state.tree_next_focus(),
                 _ => {}
             },
-            ViewMode::MultiPreview => match code {
-                KeyCode::Up | KeyCode::Char('k') => self.state.multi_move_up(),
-                KeyCode::Down | KeyCode::Char('j') => self.state.multi_move_down(),
-                KeyCode::Left | KeyCode::Char('h') => self.state.multi_move_left(),
-                KeyCode::Right | KeyCode::Char('l') => self.state.multi_move_right(),
+            ViewMode::AgentMonitor => match code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let area = self.terminal.size().unwrap_or_default();
+                    self.state
+                        .agent_move_visual(0, -1, area.width, area.height);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let area = self.terminal.size().unwrap_or_default();
+                    self.state
+                        .agent_move_visual(0, 1, area.width, area.height);
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    let area = self.terminal.size().unwrap_or_default();
+                    self.state
+                        .agent_move_visual(-1, 0, area.width, area.height);
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    let area = self.terminal.size().unwrap_or_default();
+                    self.state
+                        .agent_move_visual(1, 0, area.width, area.height);
+                }
+                KeyCode::PageUp => {
+                    let height = self.terminal.size().map(|area| area.height).unwrap_or(24);
+                    self.state.agent_move_page(usize::from(height.saturating_sub(2)), false);
+                }
+                KeyCode::PageDown => {
+                    let height = self.terminal.size().map(|area| area.height).unwrap_or(24);
+                    self.state.agent_move_page(usize::from(height.saturating_sub(2)), true);
+                }
+                KeyCode::Home => self.state.agent_move_home(),
+                KeyCode::End => self.state.agent_move_end(),
                 _ => {}
             },
             ViewMode::Dashboard => match code {
@@ -646,8 +730,18 @@ impl UIActor {
             TmuxResponse::SessionsRefreshed { sessions } => {
                 self.state.update_sessions(sessions);
             }
-            TmuxResponse::PaneCaptured { target: _, content } => {
-                self.state.update_pane_content(content);
+            TmuxResponse::PaneCaptured { target, content } => {
+                if self
+                    .state
+                    .agent_panes
+                    .iter()
+                    .any(|agent| agent.target == target)
+                {
+                    self.state.update_agent_pane_content(&target, content.clone());
+                }
+                if self.state.get_selected_pane_target().as_deref() == Some(target.as_str()) {
+                    self.state.update_pane_content(content);
+                }
             }
             TmuxResponse::SessionCreated {
                 name,
