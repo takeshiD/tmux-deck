@@ -85,13 +85,12 @@ done    = { glyph = "✓", color = "#ff8700" }        # finished its turn
 error   = { glyph = "✗", color = "#ff8700" }        # turn ended with an error
 running = { glyph = "●", color = "#ff8700" }        # process detected, no hook state
 
-# Reserved for future Codex hook integration; currently parsed but not consumed.
 [hooks.codex]
-# working = { glyph = "spinner", color = "#5fafff" }
-# waiting = { glyph = "◆", color = "#5fafff" }
-# done    = { glyph = "✓", color = "#5fafff" }
-# error   = { glyph = "✗", color = "#5fafff" }
-# running = { glyph = "●", color = "#5fafff" }
+working = { glyph = "spinner", color = "#5fafff" } # prompt submitted / tool running
+waiting = { glyph = "◆", color = "#5fafff" }       # waiting on you for permission
+done    = { glyph = "✓", color = "#5fafff" }        # finished or interrupted turn
+error   = { glyph = "✗", color = "#5fafff" }        # turn ended with an error
+running = { glyph = "●", color = "#5fafff" }        # process detected, no hook state
 
 # -----------------------------------------------------------------------------
 [layout]

@@ -42,11 +42,11 @@ async fn main() -> Result<()> {
     if let Some(command) = &cmd.command {
         return match command {
             Command::Hook { action } => match action {
-                HookAction::Report => {
-                    hook::run_report();
+                HookAction::Report { codex } => {
+                    hook::run_report(*codex);
                     Ok(())
                 }
-                HookAction::Install { project } => hook::run_install(*project),
+                HookAction::Install { project, codex } => hook::run_install(*project, *codex),
             },
         };
     }

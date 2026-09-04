@@ -24,7 +24,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Claude Code hook integration: drive treeview markers from Claude's state.
+    /// Drive tree-view markers from Claude Code or Codex lifecycle hooks.
     Hook {
         #[command(subcommand)]
         action: HookAction,
@@ -33,18 +33,24 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum HookAction {
-    /// Report a Claude hook event (reads the hook JSON on stdin).
+    /// Report an agent hook event (reads the hook JSON on stdin).
     ///
-    /// This is meant to be wired into Claude Code's `settings.json` as a
-    /// `command` hook. It records the calling pane's Claude state so the
-    /// tmux-deck TUI can render a per-pane marker.
-    Report,
-    /// Install the tmux-deck hooks into Claude Code's settings.json.
+    /// This is meant to be wired into Claude Code or Codex as a command hook.
+    /// It records the calling pane's agent state so tmux-deck can render a
+    /// per-pane marker.
+    Report {
+        /// Store Codex state instead of Claude Code state.
+        #[arg(long)]
+        codex: bool,
+    },
+    /// Install hooks for Claude Code (default) or Codex.
     Install {
-        /// Install into the project-local `.claude/settings.json` instead of
-        /// the user-global `~/.claude/settings.json`.
+        /// Use project-local .claude/settings.json or .codex/hooks.json.
         #[arg(long)]
         project: bool,
+        /// Target Codex hooks.json instead of Claude Code settings.json.
+        #[arg(long)]
+        codex: bool,
     },
 }
 
@@ -57,5 +63,53 @@ impl Cli {
             .placeholder(AnsiColor::Cyan.on_default().bold());
         let cmd = Self::command().styles(STYLES);
         Self::from_arg_matches(&cmd.get_matches())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn help_for(args: &[&str]) -> String {
+        Cli::command()
+            .try_get_matches_from(args)
+            .expect_err("--help should stop argument parsing")
+            .to_string()
+    }
+
+    #[test]
+    fn install_help_identifies_both_targets() {
+        let help = help_for(&["tmux-deck", "hook", "install", "--help"]);
+        assert!(help.contains("Claude Code (default) or Codex"));
+        assert!(help.contains(".codex/hooks.json"));
+        assert!(help.contains(".claude/settings.json"));
+    }
+
+    #[test]
+    fn report_help_explains_codex_state_separation() {
+        let help = help_for(&["tmux-deck", "hook", "report", "--help"]);
+        assert!(help.contains("Store Codex state instead of Claude Code state"));
+    }
+
+    #[test]
+    fn existing_claude_commands_remain_the_default() {
+        let report = Cli::try_parse_from(["tmux-deck", "hook", "report"]).unwrap();
+        assert!(matches!(
+            report.command,
+            Some(Command::Hook {
+                action: HookAction::Report { codex: false }
+            })
+        ));
+
+        let install = Cli::try_parse_from(["tmux-deck", "hook", "install", "--project"]).unwrap();
+        assert!(matches!(
+            install.command,
+            Some(Command::Hook {
+                action: HookAction::Install {
+                    project: true,
+                    codex: false
+                }
+            })
+        ));
     }
 }

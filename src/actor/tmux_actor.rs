@@ -219,7 +219,7 @@ impl TmuxActor {
         };
 
         let mut sessions = build_sessions(&stdout);
-        annotate_claude_panes(&mut sessions).await;
+        annotate_agent_panes(&mut sessions).await;
         crate::hook::apply_states(&mut sessions);
         TmuxResponse::SessionsRefreshed { sessions }
     }
@@ -769,6 +769,11 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                             claude_activity: None,
                             claude_state_since: None,
                             claude_cwd: None,
+                            has_codex: false,
+                            codex_state: None,
+                            codex_activity: None,
+                            codex_state_since: None,
+                            codex_cwd: None,
                         },
                     ));
                 }
@@ -817,6 +822,8 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                     panes: w.panes_raw.into_iter().map(|(_, _, _, p)| p).collect(),
                     has_claude: false,
                     claude_state: None,
+                    has_codex: false,
+                    codex_state: None,
                 })
                 .collect();
             Some(TmuxSession {
@@ -824,6 +831,8 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
                 windows,
                 has_claude: false,
                 claude_state: None,
+                has_codex: false,
+                codex_state: None,
                 last_attached: s.last_attached,
                 activity: s.activity,
                 // Group labels are applied tmux-deck-side in UIState once the
@@ -835,16 +844,16 @@ fn build_sessions(stdout: &str) -> Vec<TmuxSession> {
 }
 
 // =============================================================================
-// Claude-process detection
+// Coding-agent process detection
 // =============================================================================
 //
-// For each pane we already know the shell pid. A claude process running in
-// that pane shows up as a descendant — `claude` (or `.claude-wrapped`) under
-// the shell. We snapshot the full process table once per refresh and mark
-// any pane whose descendant tree contains such a process. The chrome native
-// host instance is excluded so it does not light up unrelated panes.
+// For each pane we already know the shell pid. A Claude or Codex process in
+// that pane shows up as a descendant under the shell. We snapshot the full
+// process table once per refresh and mark any pane whose descendant tree
+// contains either agent. Claude's chrome native host is excluded so it does
+// not light up unrelated panes.
 
-async fn annotate_claude_panes(sessions: &mut [TmuxSession]) {
+async fn annotate_agent_panes(sessions: &mut [TmuxSession]) {
     use std::collections::{HashMap, HashSet};
 
     let output = match Command::new("ps")
@@ -859,6 +868,7 @@ async fn annotate_claude_panes(sessions: &mut [TmuxSession]) {
 
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut claude_pids: HashSet<u32> = HashSet::new();
+    let mut codex_pids: HashSet<u32> = HashSet::new();
 
     for line in stdout.lines() {
         let mut it = line.split_whitespace();
@@ -876,28 +886,42 @@ async fn annotate_claude_panes(sessions: &mut [TmuxSession]) {
         if is_claude_args(&args) {
             claude_pids.insert(pid);
         }
+        if is_codex_args(&args) {
+            codex_pids.insert(pid);
+        }
     }
 
-    if claude_pids.is_empty() {
+    if claude_pids.is_empty() && codex_pids.is_empty() {
         return;
     }
 
     for session in sessions.iter_mut() {
         let mut session_has = false;
+        let mut session_has_codex = false;
         for window in session.windows.iter_mut() {
             let mut window_has = false;
+            let mut window_has_codex = false;
             for pane in window.panes.iter_mut() {
-                if pane.pid != 0 && pane_has_claude(pane.pid, &children, &claude_pids) {
+                if pane.pid != 0 && pane_has_agent(pane.pid, &children, &claude_pids) {
                     pane.has_claude = true;
                     window_has = true;
                 }
+                if pane.pid != 0 && pane_has_agent(pane.pid, &children, &codex_pids) {
+                    pane.has_codex = true;
+                    window_has_codex = true;
+                }
             }
             window.has_claude = window_has;
+            window.has_codex = window_has_codex;
             if window_has {
                 session_has = true;
             }
+            if window_has_codex {
+                session_has_codex = true;
+            }
         }
         session.has_claude = session_has;
+        session.has_codex = session_has_codex;
     }
 }
 
@@ -910,15 +934,22 @@ fn is_claude_args(args: &str) -> bool {
     if args.contains("--chrome-native-host") {
         return false;
     }
-    args.contains(".claude-wrapped")
+    let command = args.split_whitespace().next().unwrap_or_default();
+    matches!(command.rsplit('/').next(), Some("claude" | ".claude-wrapped"))
         || args.contains("claude-code/cli")
-        || args.split_whitespace().next() == Some("claude")
 }
 
-fn pane_has_claude(
+fn is_codex_args(args: &str) -> bool {
+    let Some(command) = args.split_whitespace().next() else {
+        return false;
+    };
+    matches!(command.rsplit('/').next(), Some("codex" | ".codex-wrapped"))
+}
+
+fn pane_has_agent(
     root: u32,
     children: &std::collections::HashMap<u32, Vec<u32>>,
-    claude_pids: &std::collections::HashSet<u32>,
+    agent_pids: &std::collections::HashSet<u32>,
 ) -> bool {
     let mut stack = vec![root];
     let mut visited = std::collections::HashSet::new();
@@ -926,7 +957,7 @@ fn pane_has_claude(
         if !visited.insert(pid) {
             continue;
         }
-        if claude_pids.contains(&pid) {
+        if agent_pids.contains(&pid) {
             return true;
         }
         if let Some(kids) = children.get(&pid) {
@@ -947,4 +978,38 @@ fn append_switch_log(path: &str, target: &str, success: bool, error: Option<&str
         "switch-client target=\"{}\" success={} error=\"{}\"",
         target, success, error
     );
+}
+
+#[cfg(test)]
+mod coding_agent_detection_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn claude_detection_keeps_existing_launch_forms() {
+        assert!(is_claude_args("claude --model sonnet"));
+        assert!(is_claude_args("/usr/local/bin/claude --model sonnet"));
+        assert!(is_claude_args("/nix/store/example/.claude-wrapped"));
+        assert!(is_claude_args("node /opt/claude-code/cli.js"));
+        assert!(!is_claude_args("claude --chrome-native-host"));
+        assert!(!is_claude_args("claude-helper"));
+    }
+
+    #[test]
+    fn codex_detection_matches_only_the_executable() {
+        assert!(is_codex_args("codex"));
+        assert!(is_codex_args("/usr/local/bin/codex --model gpt-5"));
+        assert!(is_codex_args("/tmp/.codex-wrapped resume"));
+        assert!(!is_codex_args("bash -lc codex"));
+        assert!(!is_codex_args("codex-helper"));
+        assert!(!is_codex_args(""));
+    }
+
+    #[test]
+    fn descendant_scan_handles_nested_and_cyclic_process_trees() {
+        let children = HashMap::from([(10, vec![11]), (11, vec![12]), (12, vec![10])]);
+        let agents = HashSet::from([12]);
+        assert!(pane_has_agent(10, &children, &agents));
+        assert!(!pane_has_agent(20, &children, &agents));
+    }
 }
