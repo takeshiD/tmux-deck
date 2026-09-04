@@ -150,10 +150,10 @@ impl UIActor {
                 Some(event) = self.ui_event_rx.recv() => {
                     match event {
                         UIEvent::Tick => {
-                            // Cheap, local: fold the latest Claude hook states
-                            // into the tree so markers stay live between full
-                            // tmux refreshes.
-                            self.state.refresh_claude_states();
+                            // Cheap, local: fold the latest coding-agent hook
+                            // states into the tree so markers stay live between
+                            // full tmux refreshes.
+                            self.state.refresh_agent_states();
 
                             match self.state.view_mode {
                                 // TreeView captures the selected pane for its preview.
@@ -186,7 +186,7 @@ impl UIActor {
 
                 // Spinner animation tick: only redraw if a spinner is active.
                 _ = anim.tick() => {
-                    redraw = self.state.has_working_claude();
+                    redraw = self.state.has_working_agent();
                 }
             }
 

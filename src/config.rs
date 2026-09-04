@@ -3,7 +3,7 @@
 //! tmux-deck is zero-config by default: when no config file exists the built-in
 //! defaults reproduce the previous hard-coded behaviour exactly. A config file
 //! lets the user tune the preview interval, the colour theme, key bindings, the
-//! per-state Claude hook markers (and, in future, Codex markers), the panel
+//! per-state Claude and Codex hook markers, the panel
 //! layout and a handful of behavioural toggles.
 //!
 //! Loading is best-effort, mirroring [`crate::group::GroupStore`]: a missing
@@ -479,22 +479,55 @@ pub fn parse_hex_color(s: &str) -> Option<Color> {
 // [hooks.claude] / [hooks.codex]
 // =============================================================================
 
-/// Default marker colour as a truecolor code (`#ff8700`, the orange of the
-/// classic xterm-256 slot 208). Marker colours are specified as hex colour
-/// codes in the config.
-const DEFAULT_MARKER_COLOR: Color = Color::Rgb(0xff, 0x87, 0x00);
+/// Default marker colours. Claude keeps its historical xterm-orange while
+/// Codex uses blue; user overrides remain hex truecolor values.
+const DEFAULT_CLAUDE_MARKER_COLOR: Color = Color::Rgb(0xff, 0x87, 0x00);
+const DEFAULT_CODEX_MARKER_COLOR: Color = Color::Rgb(0x5f, 0xaf, 0xff);
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone)]
 pub struct HooksConfig {
     pub claude: MarkerSet,
     pub codex: MarkerSet,
 }
 
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            claude: MarkerSet::with_color(DEFAULT_CLAUDE_MARKER_COLOR),
+            codex: MarkerSet::with_color(DEFAULT_CODEX_MARKER_COLOR),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HooksConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct RawHooksConfig {
+            claude: RawMarkerSet,
+            codex: RawMarkerSet,
+        }
+
+        let raw = RawHooksConfig::deserialize(deserializer)?;
+        Ok(Self {
+            claude: raw
+                .claude
+                .resolve(DEFAULT_CLAUDE_MARKER_COLOR)
+                .map_err(de::Error::custom)?,
+            codex: raw
+                .codex
+                .resolve(DEFAULT_CODEX_MARKER_COLOR)
+                .map_err(de::Error::custom)?,
+        })
+    }
+}
+
 /// The five markers shown for a hook-driven agent's states. `running` is shown
 /// when the process is detected but no hook state is known yet.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone)]
 pub struct MarkerSet {
     pub working: Marker,
     pub waiting: Marker,
@@ -505,7 +538,59 @@ pub struct MarkerSet {
 
 impl Default for MarkerSet {
     fn default() -> Self {
-        let color = DEFAULT_MARKER_COLOR;
+        Self::with_color(DEFAULT_CLAUDE_MARKER_COLOR)
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawMarkerSet {
+    working: Option<RawMarker>,
+    waiting: Option<RawMarker>,
+    done: Option<RawMarker>,
+    error: Option<RawMarker>,
+    running: Option<RawMarker>,
+}
+
+impl RawMarkerSet {
+    fn resolve(self, color: Color) -> Result<MarkerSet, String> {
+        let defaults = MarkerSet::with_color(color);
+        Ok(MarkerSet {
+            working: resolve_marker(self.working, defaults.working, color)?,
+            waiting: resolve_marker(self.waiting, defaults.waiting, color)?,
+            done: resolve_marker(self.done, defaults.done, color)?,
+            error: resolve_marker(self.error, defaults.error, color)?,
+            running: resolve_marker(self.running, defaults.running, color)?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct RawMarker {
+    glyph: String,
+    #[serde(default)]
+    color: Option<String>,
+}
+
+fn resolve_marker(raw: Option<RawMarker>, default: Marker, color: Color) -> Result<Marker, String> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let color = match raw.color.as_deref() {
+        Some(value) => parse_hex_color(value).ok_or_else(|| {
+            format!("invalid marker colour {value:?}, expected a hex code like \"#ff8700\"")
+        })?,
+        None => color,
+    };
+    Ok(Marker {
+        animated: raw.glyph == "spinner",
+        glyph: raw.glyph,
+        color,
+    })
+}
+
+impl MarkerSet {
+    fn with_color(color: Color) -> Self {
         Self {
             working: Marker::spinner(color),
             waiting: Marker::glyph("◆", color),
@@ -541,33 +626,6 @@ impl Marker {
             color,
             animated: true,
         }
-    }
-}
-
-impl<'de> Deserialize<'de> for Marker {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            glyph: String,
-            #[serde(default)]
-            color: Option<String>,
-        }
-        let raw = Raw::deserialize(deserializer)?;
-        // Marker colours are given as a hex colour code, e.g. `color = "#ff8700"`.
-        let color = match raw.color.as_deref() {
-            Some(c) => parse_hex_color(c).ok_or_else(|| {
-                de::Error::custom(format!("invalid marker colour {c:?}, expected a hex code like \"#ff8700\""))
-            })?,
-            None => DEFAULT_MARKER_COLOR,
-        };
-        Ok(Marker {
-            animated: raw.glyph == "spinner",
-            glyph: raw.glyph,
-            color,
-        })
     }
 }
 
@@ -899,6 +957,24 @@ mod tests {
         // Default markers match the historical glyphs.
         assert_eq!(cfg.hooks.claude.done.glyph, "✓");
         assert!(cfg.hooks.claude.working.animated);
+        assert_eq!(cfg.hooks.claude.done.color, Color::Rgb(0xff, 0x87, 0x00));
+        assert_eq!(cfg.hooks.codex.done.color, Color::Rgb(0x5f, 0xaf, 0xff));
+    }
+
+    #[test]
+    fn partial_codex_markers_keep_codex_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [hooks.codex]
+            done = { glyph = "C" }
+        "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.hooks.codex.done.glyph, "C");
+        assert_eq!(cfg.hooks.codex.done.color, Color::Rgb(0x5f, 0xaf, 0xff));
+        assert_eq!(cfg.hooks.codex.waiting.color, Color::Rgb(0x5f, 0xaf, 0xff));
+        assert_eq!(cfg.hooks.claude.waiting.color, Color::Rgb(0xff, 0x87, 0x00));
     }
 
     #[test]

@@ -59,33 +59,36 @@ pub const SESSION_NAME_MAX_LEN: usize = 30;
 // Data Structures
 // =============================================================================
 
-/// State reported by Claude Code hooks for a given pane.
+/// State reported by agent lifecycle hooks for a given pane.
 ///
-/// Process detection (`has_claude`) only tells us whether claude is running;
-/// these states tell us *what claude is doing*, sourced from Claude Code's
-/// hook events (see [`crate::hook`]). Variants are ordered loosely by how much
-/// they want the user's attention — see [`ClaudeState::priority`].
+/// Process detection only tells us whether an agent is running; these states
+/// describe what it is doing, sourced from its hook events (see
+/// [`crate::hook`]). Variants are ordered loosely by how much
+/// they want the user's attention — see [`HookState::priority`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaudeState {
-    /// Claude is actively working (prompt submitted / tool running).
+pub enum HookState {
+    /// The agent is actively working (prompt submitted / tool running).
     Working,
-    /// Claude is waiting on the user (permission prompt / idle prompt).
+    /// The agent is waiting on the user (permission prompt / idle prompt).
     Waiting,
-    /// Claude finished its turn.
+    /// The agent finished its turn.
     Done,
-    /// Claude's turn ended with an error.
+    /// The agent's turn ended with an error.
     Error,
 }
 
-impl ClaudeState {
-    /// Map a Claude Code `hook_event_name` to the state it implies.
+impl HookState {
+    /// Map a Claude/Codex `hook_event_name` to the state it implies.
     /// Returns `None` for events that carry no marker meaning (the caller may
     /// treat `SessionEnd` specially, clearing any existing marker).
     pub fn from_hook_event(event: &str) -> Option<Self> {
         match event {
-            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PreCompact" => Some(Self::Working),
-            "Notification" => Some(Self::Waiting),
+            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PreCompact" | "PostCompact" => {
+                Some(Self::Working)
+            }
+            "Notification" | "PermissionRequest" => Some(Self::Waiting),
             "Stop" | "SubagentStop" => Some(Self::Done),
+            "Interrupt" => Some(Self::Done),
             // StopFailure is not yet confirmed in the public docs; map it
             // defensively so it lights up red if it ever fires.
             "StopFailure" => Some(Self::Error),
@@ -151,7 +154,7 @@ pub struct TmuxPane {
     /// True if a claude process is running in this pane (detected via descendant process scan).
     pub has_claude: bool,
     /// Latest state reported by Claude Code hooks for this pane, if any.
-    pub claude_state: Option<ClaudeState>,
+    pub claude_state: Option<HookState>,
     // The hook (see [`crate::hook`]) still collects this per-pane context;
     // it is reserved for an inline tree-view indicator and not yet displayed,
     // so these carry `#[allow(dead_code)]`.
@@ -164,6 +167,19 @@ pub struct TmuxPane {
     /// Working directory Claude reported for this pane (repo identification).
     #[allow(dead_code)]
     pub claude_cwd: Option<String>,
+    /// True if a Codex process is running in this pane.
+    pub has_codex: bool,
+    /// Latest state reported by Codex hooks for this pane, if any.
+    pub codex_state: Option<HookState>,
+    /// One-line summary of what Codex is currently doing.
+    #[allow(dead_code)]
+    pub codex_activity: Option<String>,
+    /// Unix timestamp (secs) when the current Codex state began.
+    #[allow(dead_code)]
+    pub codex_state_since: Option<i64>,
+    /// Working directory Codex reported for this pane.
+    #[allow(dead_code)]
+    pub codex_cwd: Option<String>,
 }
 
 impl TmuxPane {
@@ -171,6 +187,12 @@ impl TmuxPane {
     #[allow(dead_code)]
     pub fn claude_state_elapsed_secs(&self) -> Option<i64> {
         self.claude_state_since
+            .map(|since| crate::hook::now_secs().saturating_sub(since).max(0))
+    }
+
+    #[allow(dead_code)]
+    pub fn codex_state_elapsed_secs(&self) -> Option<i64> {
+        self.codex_state_since
             .map(|since| crate::hook::now_secs().saturating_sub(since).max(0))
     }
 }
@@ -184,7 +206,11 @@ pub struct TmuxWindow {
     /// True if any pane in this window has claude running.
     pub has_claude: bool,
     /// Highest-priority Claude hook state across this window's panes.
-    pub claude_state: Option<ClaudeState>,
+    pub claude_state: Option<HookState>,
+    /// True if any pane in this window has Codex running.
+    pub has_codex: bool,
+    /// Highest-priority Codex hook state across this window's panes.
+    pub codex_state: Option<HookState>,
 }
 
 impl TmuxWindow {
@@ -201,7 +227,11 @@ pub struct TmuxSession {
     /// True if any window in this session has claude running.
     pub has_claude: bool,
     /// Highest-priority Claude hook state across this session's windows.
-    pub claude_state: Option<ClaudeState>,
+    pub claude_state: Option<HookState>,
+    /// True if any window in this session has Codex running.
+    pub has_codex: bool,
+    /// Highest-priority Codex hook state across this session's windows.
+    pub codex_state: Option<HookState>,
     /// Epoch seconds — kept on the struct so [`SessionSort`] can reorder
     /// the list without re-querying tmux.
     pub last_attached: i64,
@@ -581,20 +611,20 @@ impl UIState {
     // View Mode Switching
     // =========================================================================
 
-    /// Re-read Claude hook state files and patch the in-memory session tree.
+    /// Re-read Claude and Codex hook state files and patch the session tree.
     ///
     /// Cheap enough to call on every refresh tick: it only reads a small local
-    /// state directory. This keeps markers live without a full tmux refresh.
-    pub fn refresh_claude_states(&mut self) {
+    /// state directories. This keeps markers live without a full tmux refresh.
+    pub fn refresh_agent_states(&mut self) {
         crate::hook::apply_states(&mut self.sessions);
     }
 
-    /// True if any session currently has a `Working` Claude marker, used to
+    /// True if any session currently has a `Working` agent marker, used to
     /// decide whether the spinner animation needs frequent redraws.
-    pub fn has_working_claude(&self) -> bool {
-        self.sessions
-            .iter()
-            .any(|s| s.claude_state == Some(ClaudeState::Working))
+    pub fn has_working_agent(&self) -> bool {
+        self.sessions.iter().any(|s| {
+            s.claude_state == Some(HookState::Working) || s.codex_state == Some(HookState::Working)
+        })
     }
 
     pub fn handle_space_press(&mut self) -> bool {
@@ -1459,6 +1489,8 @@ mod tests {
             windows: Vec::new(),
             has_claude: false,
             claude_state: None,
+            has_codex: false,
+            codex_state: None,
             last_attached: 0,
             activity: 0,
             group: None,
