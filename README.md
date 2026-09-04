@@ -21,8 +21,8 @@ that monitors several sessions at once.
   from the TUI.
 - **Zero configuration** — sensible defaults work immediately; themes, layout,
   refresh rate, and key bindings remain configurable.
-- **Optional Claude Code awareness** — show working, waiting, done, and error
-  markers, plus a dedicated background-agent view.
+- **Optional coding-agent awareness** — show working, waiting, done, and error
+  markers for Claude Code and Codex panes, plus a Claude background-agent view.
 
 `tmux-deck` is distributed as a Rust binary and requires a working `tmux`
 installation.
@@ -121,28 +121,34 @@ The built-in presets are `default`, `monochrome`, `dracula`, `nord`,
 `carbonfox`. Individual semantic colours can be overridden with named colours,
 256-colour indexes, or `#rrggbb` values.
 
-## Advanced: Claude Code integration
+## Advanced: coding-agent integration
 
-tmux-deck can identify panes running
-[Claude Code](https://code.claude.com) and display a `●` marker. Installing the
-optional hooks makes the marker reflect the pane's current state:
+tmux-deck can identify panes running Claude Code or
+[Codex](https://learn.chatgpt.com/docs/hooks) and display a `●` marker.
+Installing the optional lifecycle hooks makes the marker reflect the pane's
+current state. Claude markers are orange by default; Codex markers are blue.
+When both are present on one node, the Claude marker is shown first.
 
 | Marker | State | Meaning |
 | --- | --- | --- |
 | `⠋⠙⠹…` | Working | A prompt or tool is running |
-| `◆` | Waiting | Claude is waiting for input |
+| `◆` | Waiting | The agent is waiting for input or permission |
 | `✓` | Done | The turn completed |
 | `✗` | Error | The turn ended with an error |
-| `●` | Running | Claude is detected without hook state |
+| `●` | Running | An agent is detected without hook state |
 
-Install the hooks in your user settings:
+Install either integration in your user settings:
 
 ```bash
-tmux-deck hook install
+tmux-deck hook install          # ~/.claude/settings.json
+tmux-deck hook install --codex  # ~/.codex/hooks.json
 ```
 
-Use `tmux-deck hook install --project` for project-local Claude settings. The
-installer is idempotent and preserves existing settings.
+Add `--project` for project-local settings (`.claude/settings.json` or
+`.codex/hooks.json`). The installer is idempotent and preserves existing
+hooks. User-global installs respect `CLAUDE_CONFIG_DIR` and `CODEX_HOME` when
+set. Codex requires newly installed hooks to be reviewed and trusted with
+`/hooks` before first use.
 
 ### Agent view
 
