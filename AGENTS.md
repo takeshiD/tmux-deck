@@ -4,6 +4,8 @@ These instructions apply to the whole repository.
 
 ## Shared workflow
 
+- Before changing product code, configuration, CLI behavior, or the TUI, read
+  and follow `.agents/rules/architecture.md`.
 - For implementation, bug fixes, reviews that may edit files, or parallel agent
   work, read and follow `.agents/skills/tmux-deck-workflow/SKILL.md`.
 - Keep the primary checkout clean. Do implementation in a dedicated Git
@@ -31,7 +33,7 @@ unrelated files merely to make a repository-wide format check pass.
 
 ## Instruction ownership
 
-`AGENTS.md` is the canonical cross-agent instruction file. `CLAUDE.md` is a
-Claude Code adapter and must point back here instead of duplicating these
-rules. Put reusable operational detail in the repository skill, not in
-tool-specific instruction files.
+`AGENTS.md` is the canonical cross-agent instruction file. Keep the root
+`CLAUDE.md` as a symbolic link to this file so agents share one source of
+truth. Put architecture constraints under `.agents/rules/` and reusable
+project workflows under `.agents/skills/`.

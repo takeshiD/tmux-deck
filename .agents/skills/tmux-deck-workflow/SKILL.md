@@ -37,8 +37,10 @@ task boundary. Tell the agent which branch it owns and whether it should commit.
 
 - When a request references a GitHub issue, read that issue before deciding its
   behavior. Preserve its configurable defaults and acceptance criteria.
-- Follow existing `src/app.rs`, actor, configuration, and rendering boundaries.
-  Add state transitions and config parsing tests where behavior changes.
+- Follow `.agents/rules/architecture.md` and the existing application, actor,
+  configuration, and rendering boundaries.
+- Add state-transition, parser, configuration, or rendering tests at the
+  lowest stable boundary affected by the change.
 - Run focused tests while iterating, then run:
 
   ```bash
