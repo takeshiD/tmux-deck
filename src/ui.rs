@@ -1423,4 +1423,62 @@ mod cursor_alignment_tests {
         state.set_summary_pending("a1".to_string());
         term.draw(|f| render_ui(f, &mut state)).unwrap();
     }
+
+    #[test]
+    fn tree_preview_scroll_renders_wide_unicode_lines() {
+        let mut state = UIState::new(crate::config::Config::default());
+        state.update_pane_content(
+            (0..7)
+                .map(|n| format!("line {n} 日本🙂"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let mut term = Terminal::new(TestBackend::new(24, 6)).unwrap();
+        term.draw(|frame| {
+            let area = frame.area();
+            render_pane_preview_tree(frame, &mut state, area);
+        })
+        .unwrap();
+        state.tree_preview_scroll_up_line();
+        term.draw(|frame| {
+            let area = frame.area();
+            render_pane_preview_tree(frame, &mut state, area);
+        })
+        .unwrap();
+
+        let symbols: Vec<&str> = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let rendered = symbols.concat();
+        assert!(rendered.contains("line 2"));
+        assert!(!rendered.contains("line 6"));
+        assert!(symbols.contains(&"日"));
+        assert!(symbols.contains(&"本"));
+        assert!(symbols.contains(&"🙂"));
+    }
+
+    #[test]
+    fn tree_view_handles_narrow_terminals_and_wide_key_labels() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+            [keybindings]
+            preview_half_page_down = "界"
+            preview_half_page_up = "🙂"
+            preview_line_down = "C-j"
+            preview_line_up = "C-k"
+            "#,
+        )
+        .unwrap();
+        let mut state = UIState::new(config);
+        state.update_pane_content("日本語🙂\ncombining: e\u{301}".to_string());
+
+        for (width, height) in [(1, 1), (10, 3), (40, 10)] {
+            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+            term.draw(|frame| render_ui(frame, &mut state)).unwrap();
+        }
+    }
 }

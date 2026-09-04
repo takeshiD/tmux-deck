@@ -78,6 +78,9 @@ The status bar always reflects your configured bindings.
 | `d` | Toggle agent view | `r` | Refresh |
 | `Ctrl+d` / `Ctrl+u` | Scroll preview half-page down/up | `Ctrl+j` / `Ctrl+k` | Scroll preview one line down/up |
 
+Preview scrolling applies to TreeView. Moving to another pane returns its
+preview to the live tail; all four bindings can be changed in the configuration.
+
 ## Configuration
 
 Configuration is optional. Put a TOML file at:

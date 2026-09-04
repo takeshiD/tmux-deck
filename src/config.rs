@@ -1051,7 +1051,13 @@ mod tests {
         let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(kb.action_for(&j), None);
         let ctrl_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        let ctrl_k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
         assert_eq!(kb.action_for(&ctrl_j), Some(Action::PreviewLineDown));
+        assert_eq!(kb.action_for(&ctrl_k), Some(Action::PreviewLineUp));
+        assert_eq!(kb.action_for(&ctrl_d), Some(Action::PreviewHalfPageDown));
+        assert_eq!(kb.action_for(&ctrl_u), Some(Action::PreviewHalfPageUp));
     }
 
     #[test]
@@ -1068,11 +1074,16 @@ mod tests {
         .unwrap();
 
         let alt_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT);
+        let alt_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT);
         let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(
             cfg.keybindings.action_for(&alt_d),
             Some(Action::PreviewHalfPageDown)
+        );
+        assert_eq!(
+            cfg.keybindings.action_for(&alt_u),
+            Some(Action::PreviewHalfPageUp)
         );
         assert_eq!(
             cfg.keybindings.action_for(&down),

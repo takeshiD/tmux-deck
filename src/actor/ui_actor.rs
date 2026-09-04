@@ -476,7 +476,14 @@ impl UIActor {
                 Action::PreviewHalfPageDown
                 | Action::PreviewHalfPageUp
                 | Action::PreviewLineDown
-                | Action::PreviewLineUp => {}
+                | Action::PreviewLineUp => {
+                    // A preview binding remapped to a plain navigation key
+                    // remains usable in views where preview scrolling is not
+                    // available.
+                    if !is_ctrl {
+                        self.handle_navigation_key(key.code);
+                    }
+                }
                 // Context-gated actions whose gate is not satisfied fall through
                 // to navigation so the key is not swallowed.
                 Action::Sort | Action::Group => {
@@ -662,8 +669,8 @@ impl UIActor {
             TmuxResponse::SessionsRefreshed { sessions } => {
                 self.state.update_sessions(sessions);
             }
-            TmuxResponse::PaneCaptured { target: _, content } => {
-                self.state.update_pane_content(content);
+            TmuxResponse::PaneCaptured { target, content } => {
+                self.state.update_tree_preview_content(&target, content);
             }
             TmuxResponse::SessionCreated {
                 name,
