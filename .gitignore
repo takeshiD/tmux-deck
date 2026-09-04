@@ -2,4 +2,4 @@
 .serena
 .envrc
 .direnv
-/.agents/worktrees/
+/.worktrees/
