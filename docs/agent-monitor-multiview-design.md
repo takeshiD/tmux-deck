@@ -1,6 +1,6 @@
 # Agent Monitor Multiview Design
 
-Status: Draft
+Status: Accepted for implementation
 
 ## Intent
 
@@ -12,8 +12,8 @@ loops:
 2. Observe the overall activity of all running agents without losing spatial
    context.
 
-This document records decisions as they are made. Open questions are not
-implementation requirements.
+This document is the implementation contract for the first Agent Monitor
+release.
 
 ## Current behavior
 
@@ -32,12 +32,12 @@ does not represent interactive coding agents running in tmux panes.
 - The first version monitors only coding agents running in tmux panes.
 - One agent pane is one monitor card. A tmux session containing multiple agent
   panes contributes multiple cards.
-- MultiView has two presentation modes:
+- Agent Monitor has two presentation modes:
   - **Attention** makes waiting and failed agents difficult to miss and quick
     to enter.
   - **Overview** keeps all active agents visible for ambient progress
     monitoring.
-- MultiView restores the last presentation mode selected by the user. `Tab`
+- Agent Monitor restores the last presentation mode selected by the user. `Tab`
   switches between Attention and Overview; state changes never switch modes
   automatically.
 - Attention orders cards by `Waiting > Error > Working > Done`.
@@ -48,8 +48,8 @@ does not represent interactive coding agents running in tmux panes.
 - Overview adapts its card content to both agent count and available terminal
   area. It may show all live previews, a selected live preview with summarized
   peers, or summary-only cards with an on-demand focused preview.
-- Design for four simultaneous Agent Panes as the normal case and thirty as the
-  supported maximum.
+- Design for four simultaneous Agent Panes as the normal case and thirty as a
+  required verification target, not a visibility cap.
 - The first version exposes only two card actions: `Enter` switches to the
   pane, and `f` temporarily focuses its live preview.
 - Summary uses a borderless virtual list rather than a grid of bordered cards.
@@ -87,13 +87,32 @@ does not represent interactive coding agents running in tmux panes.
   as a compatibility alias.
 - A configurable `m` action opens Agent Monitor and replaces the double-Space
   gesture. Do not retain double-Space as a second binding.
-- The existing background-agent Dashboard remains for now. MultiView and the
-  Dashboard should move toward a common agent model so they can be unified
-  later without rewriting their state semantics.
+- Pressing `m` toggles Sessions and Agent Monitor. From Background Agents, `m`
+  opens Agent Monitor. The existing `d` action continues to open Background
+  Agents.
+- Thirty agents is a verification target, not a visibility cap. Continue to
+  expose every detected agent through the virtual Summary List.
+- Default state symbols and colors are `! WAIT` yellow, `× ERROR` red,
+  Braille-spinner `WORK` cyan, `✓ DONE` green, and `● RUN` neutral/dim. Agent
+  kind remains a text label; color communicates state only.
+- `Esc` dismisses the innermost transient state first: filter input, then
+  focused preview, then Agent Monitor itself.
+- At 100 columns or wider, Attention uses a 34/66 horizontal queue/preview
+  split. At 60-99 columns it uses a 35/65 vertical split. Below 60 columns it
+  shows the queue alone and opens preview on demand with `f`.
+- Agent Monitor settings live under `[agent_monitor]`. The first public setting
+  is `completed_retention_secs = 600`; density minimums remain internal layout
+  rules.
+- With no detected agents, explain how to start an agent inside tmux and how to
+  install hooks for detailed state. A detected hookless agent uses the `RUN`
+  row instead of the empty state.
+- The existing Background Agents view remains for now. Agent Monitor and
+  Background Agents should move toward a common agent model so they can be
+  unified later without rewriting their state semantics.
 - A progress display must report observed state and recent activity, not invent
   a percentage when the agent provides no measurable completion value.
 
-## Proposed information hierarchy
+## Information hierarchy
 
 Every card starts with the same compact identity and state header:
 
@@ -109,7 +128,7 @@ is limited.
 The global header shows counts for actionable, working, and recently completed
 agents. State is always encoded by a word or symbol as well as color.
 
-## Proposed presentation modes
+## Presentation modes
 
 ### Attention
 
@@ -119,6 +138,15 @@ recently completed agents remain discoverable but visually subordinate.
 
 The layout optimizes for noticing an action and entering its pane with one
 command. It may reorder when an agent crosses an attention boundary.
+
+When no agent is actionable, Attention remains active and shows an `All clear`
+message above the working and recently completed agents. It never switches to
+Overview automatically.
+
+At 100 columns or wider, the queue occupies 34% and the selected live preview
+66% of the width. At 60-99 columns, the queue occupies the upper 35% and the
+preview the lower 65%. Below 60 columns, render only the queue; `f` temporarily
+opens the selected preview full-screen.
 
 ### Overview
 
@@ -155,7 +183,7 @@ In Summary List, Working is rendered with a one-cell Braille spinner and a
 
 ```text
 ! WAIT   Codex   tmux-deck/feature-auth    permission required   3m
-x ERROR  Claude  tmux-deck/fix-cache       cargo test failed      8m
+× ERROR  Claude  tmux-deck/fix-cache       cargo test failed      8m
 ⠋ WORK   Codex   tmux-deck/feature-layout  editing ui.rs         42s
 ✓ DONE   Claude  tmux-deck/fix-config       completed              4m
 ● RUN    Codex   session:window.%pane       state unavailable       -
@@ -187,9 +215,13 @@ response to changing agent state.
   selection from the user. Overview never reorders solely because state
   changed.
 - The contextual footer shows only actions available in the current mode.
-- MultiView writes the selected Presentation Mode to
+- Agent Monitor writes the selected Presentation Mode to
   `$XDG_STATE_HOME/tmux-deck/ui-state.json` on change and loads it
   best-effort. State-file failure must never prevent startup.
+- Escape handling is layered: cancel filter input first, then leave focused
+  preview, then return from Agent Monitor to Sessions.
+- From Sessions, `m` opens Agent Monitor; from Agent Monitor, `m` returns to
+  Sessions; from Background Agents, `m` opens Agent Monitor directly.
 
 ## Capture and refresh budget
 
@@ -211,11 +243,40 @@ response to changing agent state.
 - Below the minimum size needed for identity, state, and controls, show an
   explicit terminal-too-small message.
 
+## Empty state
+
+When no Agent Pane is detected, render concise recovery guidance:
+
+```text
+No coding agents detected in tmux.
+
+Start Claude Code or Codex inside a tmux pane.
+Install hooks for detailed working/waiting status:
+  tmux-deck hook install
+```
+
+Do not show this state when a supported process is detected without hooks;
+render that pane as `RUN` / `state unavailable` instead.
+
+## Configuration and runtime state
+
+The public configuration surface begins with:
+
+```toml
+[agent_monitor]
+completed_retention_secs = 600
+```
+
+Keep density minimums internal until real usage shows a need to configure them.
+Persist only the last Attention/Overview choice in
+`$XDG_STATE_HOME/tmux-deck/ui-state.json`. Filters, selection, scroll position,
+and focused preview are session-transient.
+
 ## Domain language
 
 **Agent Pane**
 : A tmux pane in which a supported coding-agent process is detected. This is
-  the identity and selection unit of MultiView.
+  the identity and selection unit of Agent Monitor.
 
 **Agent Kind**
 : The supported agent implementation, initially Claude Code or Codex. Kind is
@@ -250,7 +311,7 @@ response to changing agent state.
 
 **Background Agent**
 : A non-pane Claude session discovered from Claude's jobs data and currently
-  shown by the Dashboard. It is outside the first MultiView scope.
+  shown by Background Agents. It is outside the first Agent Monitor scope.
 
 ## Implementation sequence
 
@@ -265,17 +326,44 @@ response to changing agent state.
 5. Keep Background Agents separate, but adapt it to the common state vocabulary
    only where that does not expand the first release.
 
-## Open questions
+## Acceptance criteria
 
-- What layout and content does Attention show when no agent is actionable?
-- Does `m` always return to Sessions when pressed inside Agent Monitor, and how
-  does it behave when pressed inside Background Agents?
-- Is thirty a tested design target or a hard visibility cap? Hiding additional
-  detected agents would weaken the monitoring contract.
-- Which state colors and symbols are the semantic defaults?
-- Does `Esc` also leave focused preview, or only `f`?
-- What split ratio should Attention use at wide and narrow sizes?
-- Which configuration section owns completion retention and any future Agent
-  Monitor settings?
-- Should an empty MultiView explain hook installation, or only report that no
-  coding agents are detected?
+- Agent Monitor contains only supported coding-agent panes and represents each
+  pane independently, including multiple agents within one tmux session.
+- `m` performs the documented view transitions and is configurable. The old
+  double-Space gesture does not switch views.
+- Attention and Overview switch with `Tab`; the last choice survives restart
+  without mutating the user's configuration file.
+- Attention orders states and same-state age as documented, keeps user
+  selection stable, and clearly exposes an actionable agent from Overview even
+  when its row is off-screen.
+- Overview selects Live Grid, Hybrid, or Summary List from available cell area
+  while preserving selection and stable repository/worktree ordering.
+- Summary List remains navigable with more than thirty agents and never hides
+  a detected agent because a design target was exceeded.
+- Working agents animate with one shared spinner tick. Non-working states do
+  not animate, and no state transition emits a terminal bell.
+- Pane capture follows the density budget and never originates in rendering.
+- Completed agents disappear after the configured retention and reappear when
+  a new working transition is observed.
+- Hookless and incomplete identity data use the documented fallbacks without
+  entering Attention or crashing.
+- `Enter`, `f`, `/`, navigation, and layered `Esc` behavior match the contextual
+  footer in every density and responsive layout.
+- Sessions, Agent Monitor, and Background Agents are the user-facing names;
+  the existing `multi` configuration value continues to load.
+
+## Verification matrix
+
+- Unit-test pane-to-agent projection, attention ordering, stable insertion,
+  selection fallback, retention, filtering, persisted mode, and density choice.
+- Render-test Attention with waiting, error, working, done, all-clear, and empty
+  states.
+- Render-test Overview with 1, 4, 5, 12, 13, 30, and 31 agents at 120x40; also
+  test 80x24, a 60-column split, and the terminal-too-small boundary.
+- Test duplicate repository names, missing Git identity, hookless processes,
+  wide Unicode text, long Activity Digests, and disappearing panes.
+- Verify capture requests for Live Grid, Hybrid, Summary List, and focused
+  preview independently from rendered output.
+- Verify mode persistence failure degrades safely and terminal cleanup remains
+  correct on normal exit and errors.
