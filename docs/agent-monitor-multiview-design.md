@@ -37,8 +37,21 @@ does not represent interactive coding agents running in tmux panes.
     to enter.
   - **Overview** keeps all active agents visible for ambient progress
     monitoring.
-- Completed agents remain visible for a short retention period and then leave
-  the view automatically. The exact default remains open.
+- MultiView restores the last presentation mode selected by the user. `Tab`
+  switches between Attention and Overview; state changes never switch modes
+  automatically.
+- Attention orders cards by `Waiting > Error > Working > Done`.
+- Completed agents remain visible for ten minutes by default and then leave the
+  view automatically. Completion retention is configurable.
+- Overview groups cards by repository, then worktree, then pane. Within a
+  group, card positions remain stable while the view is open.
+- Overview adapts its card content to both agent count and available terminal
+  area. It may show all live previews, a selected live preview with summarized
+  peers, or summary-only cards with an on-demand focused preview.
+- Design for four simultaneous Agent Panes as the normal case and thirty as the
+  supported maximum.
+- The first version exposes only two card actions: `Enter` switches to the
+  pane, and `f` temporarily focuses its live preview.
 - The existing background-agent Dashboard remains for now. MultiView and the
   Dashboard should move toward a common agent model so they can be unified
   later without rewriting their state semantics.
@@ -74,11 +87,45 @@ command. It may reorder when an agent crosses an attention boundary.
 
 ### Overview
 
-Use an adaptive grid of equal-size agent cards. Preserve card position while
-the view is open; state changes update a card without reshuffling the whole
-grid. Page rather than shrinking cards below a useful preview size.
+Use an adaptive grid of agent cards. Preserve card position while the view is
+open; state changes update a card without reshuffling the whole grid. Page
+rather than shrinking cards below a useful summary size.
 
 The layout optimizes for spatial memory and ambient progress monitoring.
+
+Overview selects one of three density levels from agent count and available
+terminal area:
+
+1. **Live Grid** renders a live terminal tail in every card when every visible
+   card can retain a useful minimum width and height.
+2. **Hybrid** gives the selected card a live preview and renders the remaining
+   agents as compact activity summaries.
+3. **Summary Grid** renders identity, state, elapsed time, and Activity Digest
+   for all visible cards. `f` temporarily replaces it with the selected live
+   preview.
+
+The decision is based on fit, not count alone. Initial target capacities for a
+120x40 terminal are one to four agents for Live Grid, five to twelve for
+Hybrid, and thirteen to thirty for Summary Grid. These are design targets, not
+hard-coded thresholds: the layout computes how many cards meet the minimum
+dimensions in the current frame.
+
+Automatic density changes must preserve selection and reading order. To avoid
+layout oscillation, density changes only after crossing a fit boundary, not in
+response to changing agent state.
+
+## Interaction contract
+
+- `Tab`: switch Attention / Overview and persist the choice.
+- `h/j/k/l` and arrow keys: move through agents using visual grid order.
+- `Enter`: switch the tmux client to the selected Agent Pane, following the
+  existing exit-on-switch behavior.
+- `f`: enter or leave a temporary focused live preview without changing the
+  stored Presentation Mode.
+- State transitions may reorder the Attention queue, but must not steal
+  selection from the user. Overview never reorders solely because state
+  changed.
+- The contextual footer shows only actions available in the current mode.
 
 ### Responsive floor
 
@@ -103,8 +150,9 @@ The layout optimizes for spatial memory and ambient progress monitoring.
   waiting, working, done, failed, or running-without-hook-data.
 
 **Actionable Agent**
-: An Agent Pane whose Observed State requires human intervention. The exact
-  state set and priority order remain open.
+: An Agent Pane whose Observed State requires human intervention. Waiting and
+  error states are actionable; waiting has the higher display priority because
+  user input can immediately resume blocked work.
 
 **Activity Digest**
 : A bounded, non-sensitive description of the latest observed action. It is
@@ -112,11 +160,17 @@ The layout optimizes for spatial memory and ambient progress monitoring.
 
 **Completion Retention**
 : The bounded interval during which a completed Agent Pane remains visible so
-  the user can notice completion before it disappears.
+  the user can notice completion before it disappears. It defaults to ten
+  minutes and is configurable.
 
 **Presentation Mode**
 : Either Attention or Overview. It changes ordering and layout, not the
   underlying monitored agents.
+
+**Density Level**
+: Live Grid, Hybrid, or Summary Grid. It is derived from available terminal
+  area and agent count within Overview and does not change the stored
+  Presentation Mode.
 
 **Background Agent**
 : A non-pane Claude session discovered from Claude's jobs data and currently
@@ -124,15 +178,13 @@ The layout optimizes for spatial memory and ambient progress monitoring.
 
 ## Open questions
 
-- Which presentation mode opens by default, and how is it switched?
-- Does Attention prioritize waiting over failed, or failed over waiting?
-- Which actions are available directly from a card besides entering its pane?
-- What is the expected and maximum number of simultaneous Agent Panes?
-- Is Overview order grouped by repository, tmux session, or a user-defined
-  pinned order?
-- What exact Completion Retention default should be used, and is it
-  configurable?
+- What minimum card dimensions make a live preview and a summary useful?
+- How should pages be ordered and navigated when all Agent Panes do not fit?
+- Where is the last Presentation Mode persisted, and should it be a config
+  default, runtime state, or both?
 - What identity remains visible when repository, worktree, or branch data
   cannot be discovered?
 - How should hookless but detected Agent Panes be distinguished from agents
   whose state is known?
+- Should a newly waiting Agent Pane produce only a visual notification, a
+  terminal bell, or an optional external notification?
