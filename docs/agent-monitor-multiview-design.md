@@ -52,6 +52,24 @@ does not represent interactive coding agents running in tmux panes.
   supported maximum.
 - The first version exposes only two card actions: `Enter` switches to the
   pane, and `f` temporarily focuses its live preview.
+- Summary uses a borderless virtual list rather than a grid of bordered cards.
+  Working rows retain a one-cell animated spinner; waiting, error, done, and
+  hookless states use stable symbols and labels.
+- Live previews require at least 44x10 cells. A Hybrid selected preview requires
+  at least 60x12 cells; otherwise Overview uses Summary List.
+- Summary List uses virtual scrolling rather than explicit pages. `j/k` moves
+  one row, `PageUp/PageDown` moves one viewport, and `Home/End` moves to the
+  first or last agent. The footer reports the visible range and total.
+- Overview does not reorder when an off-screen agent becomes actionable. Its
+  global header highlights the actionable count and directs the user to switch
+  to Attention with `Tab`.
+- Persist the last Presentation Mode as best-effort runtime state under
+  `$XDG_STATE_HOME/tmux-deck/ui-state.json`, not by rewriting user config.
+- Attention uses visual notification only. It must not emit a terminal bell.
+- A detected agent without hook data appears as `RUN` / `state unavailable` in
+  Overview and does not enter the Attention queue.
+- When repository or worktree identity cannot be resolved, display the stable
+  tmux `session:window.pane` identity.
 - The existing background-agent Dashboard remains for now. MultiView and the
   Dashboard should move toward a common agent model so they can be unified
   later without rewriting their state semantics.
@@ -100,15 +118,35 @@ terminal area:
    card can retain a useful minimum width and height.
 2. **Hybrid** gives the selected card a live preview and renders the remaining
    agents as compact activity summaries.
-3. **Summary Grid** renders identity, state, elapsed time, and Activity Digest
-   for all visible cards. `f` temporarily replaces it with the selected live
-   preview.
+3. **Summary List** renders identity, state, elapsed time, and Activity Digest
+   as a borderless virtual list. `f` temporarily replaces it with the selected
+   live preview.
 
 The decision is based on fit, not count alone. Initial target capacities for a
 120x40 terminal are one to four agents for Live Grid, five to twelve for
-Hybrid, and thirteen to thirty for Summary Grid. These are design targets, not
+Hybrid, and thirteen to thirty for Summary List. These are design targets, not
 hard-coded thresholds: the layout computes how many cards meet the minimum
 dimensions in the current frame.
+
+Live preview cells require at least 44x10 terminal cells. Hybrid requires at
+least 60x12 for the selected preview. Summary List is the fallback whenever
+those minimums cannot be met. It uses virtual scrolling and reports a range
+such as `1-22/30` rather than dividing agents into explicit pages.
+
+In Summary List, Working is rendered with a one-cell Braille spinner and a
+`WORK` label. All rows use a text label or stable symbol as well as color:
+
+```text
+! WAIT   Codex   tmux-deck/feature-auth    permission required   3m
+x ERROR  Claude  tmux-deck/fix-cache       cargo test failed      8m
+⠋ WORK   Codex   tmux-deck/feature-layout  editing ui.rs         42s
+✓ DONE   Claude  tmux-deck/fix-config       completed              4m
+● RUN    Codex   session:window.%pane       state unavailable       -
+```
+
+The spinner uses the existing shared animation tick; each row does not own a
+timer. Redraw at animation cadence only while at least one visible agent is
+Working.
 
 Automatic density changes must preserve selection and reading order. To avoid
 layout oscillation, density changes only after crossing a fit boundary, not in
@@ -118,6 +156,8 @@ response to changing agent state.
 
 - `Tab`: switch Attention / Overview and persist the choice.
 - `h/j/k/l` and arrow keys: move through agents using visual grid order.
+- `PageUp/PageDown` and `Home/End`: navigate Summary List by viewport or
+  boundary.
 - `Enter`: switch the tmux client to the selected Agent Pane, following the
   existing exit-on-switch behavior.
 - `f`: enter or leave a temporary focused live preview without changing the
@@ -126,6 +166,21 @@ response to changing agent state.
   selection from the user. Overview never reorders solely because state
   changed.
 - The contextual footer shows only actions available in the current mode.
+- MultiView writes the selected Presentation Mode to
+  `$XDG_STATE_HOME/tmux-deck/ui-state.json` on change and loads it
+  best-effort. State-file failure must never prevent startup.
+
+## Capture and refresh budget
+
+- Live Grid captures every visible Agent Pane because each card renders a live
+  tail.
+- Hybrid captures only the selected Agent Pane; peer summaries use hook state
+  and Activity Digest.
+- Summary List performs no pane capture unless focused preview is active.
+- Focused preview captures only the selected Agent Pane.
+- Agent discovery and repository/worktree metadata are resolved outside
+  rendering and cached by stable pane identity. Rendering never launches git,
+  tmux, or agent commands.
 
 ### Responsive floor
 
@@ -168,7 +223,7 @@ response to changing agent state.
   underlying monitored agents.
 
 **Density Level**
-: Live Grid, Hybrid, or Summary Grid. It is derived from available terminal
+: Live Grid, Hybrid, or Summary List. It is derived from available terminal
   area and agent count within Overview and does not change the stored
   Presentation Mode.
 
@@ -178,13 +233,13 @@ response to changing agent state.
 
 ## Open questions
 
-- What minimum card dimensions make a live preview and a summary useful?
-- How should pages be ordered and navigated when all Agent Panes do not fit?
-- Where is the last Presentation Mode persisted, and should it be a config
-  default, runtime state, or both?
-- What identity remains visible when repository, worktree, or branch data
-  cannot be discovered?
-- How should hookless but detected Agent Panes be distinguished from agents
-  whose state is known?
-- Should a newly waiting Agent Pane produce only a visual notification, a
-  terminal bell, or an optional external notification?
+- Within the same Attention state, are older or newer transitions shown first?
+- When a new Agent Pane appears, where is it inserted without disrupting
+  Overview spatial memory?
+- What happens to selection and focused preview when an Agent Pane disappears?
+- Which repository and worktree labels are shown when space permits, and how
+  are duplicate names disambiguated?
+- Does `/` filter by free text only, or also expose state, agent kind, and
+  repository filters?
+- Should an empty MultiView explain hook installation, or only report that no
+  coding agents are detected?
