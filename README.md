@@ -183,22 +183,23 @@ without lifecycle hooks still appear as `RUN` with state unavailable.
 
 ### Background Agents
 
-Press `d` to open a full-screen view of Claude Code background sessions. It
-reads the sessions managed by `claude agents` and groups them by working
-directory.
+Press `d` to open a full-screen view of Claude Code background jobs and Codex
+threads. It reads Claude's jobs data and Codex's documented `thread/list`
+app-server API, then groups both providers by working directory.
 
 | Key | Action |
 | --- | --- |
 | `j` / `k` | Select an agent session |
-| `Enter` | Attach with `claude attach` |
+| `Enter` | Attach with `claude attach` or resume with `codex resume` |
 | `p` | Toggle the preview panel |
-| `v` | Toggle transcript/screen preview |
-| `s` | Generate an execution summary |
+| `v` | Toggle transcript/screen preview (Claude) |
+| `s` | Generate an execution summary (Claude) |
 | `d` | Return to Sessions |
 
-Background Agents needs a Claude Code version that provides background
-sessions. Pane markers, Agent Monitor, and Background Agents degrade
-independently when their optional metadata is unavailable.
+Claude rows need a Claude Code version that provides background sessions.
+Codex rows need a Codex CLI version with `app-server` and display the stored
+thread preview; `Enter` resumes the selected thread. Either provider degrades
+independently when its CLI or optional metadata is unavailable.
 
 ## How it differs
 

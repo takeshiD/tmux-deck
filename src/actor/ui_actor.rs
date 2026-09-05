@@ -12,6 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::messages::{RefreshControl, TmuxCommand, TmuxResponse, UIEvent};
+use crate::agents::{AgentProvider, AgentSession};
 use crate::app::{
     Focus, GroupChoice, InputMode, PopupMode, SESSION_NAME_MAX_LEN, UIState, ViewMode,
 };
@@ -58,6 +59,11 @@ pub struct UIActor {
     /// Results of background `claude logs` fetches for the screen preview.
     agent_logs_tx: mpsc::Sender<(String, Vec<u8>)>,
     agent_logs_rx: mpsc::Receiver<(String, Vec<u8>)>,
+    /// Combined Claude/Codex Background Agents discovery results.
+    agent_sessions_tx: mpsc::Sender<Vec<AgentSession>>,
+    agent_sessions_rx: mpsc::Receiver<Vec<AgentSession>>,
+    agent_sessions_inflight: bool,
+    agent_sessions_fetched_at: Option<std::time::Instant>,
     /// Sessions whose `claude logs` fetch is in flight, and when each id was
     /// last fetched (to throttle refresh).
     logs_inflight: std::collections::HashSet<String>,
@@ -83,6 +89,7 @@ impl UIActor {
 
         let (agent_summary_tx, agent_summary_rx) = mpsc::channel(8);
         let (agent_logs_tx, agent_logs_rx) = mpsc::channel(8);
+        let (agent_sessions_tx, agent_sessions_rx) = mpsc::channel(1);
 
         Self {
             terminal,
@@ -97,6 +104,10 @@ impl UIActor {
             agent_summary_rx,
             agent_logs_tx,
             agent_logs_rx,
+            agent_sessions_tx,
+            agent_sessions_rx,
+            agent_sessions_inflight: false,
+            agent_sessions_fetched_at: None,
             logs_inflight: std::collections::HashSet::new(),
             logs_fetched_at: std::collections::HashMap::new(),
             agent_discovered_at: std::time::Instant::now(),
@@ -145,6 +156,13 @@ impl UIActor {
                     self.state.update_agent_logs(id, bytes);
                 }
 
+                Some(sessions) = self.agent_sessions_rx.recv() => {
+                    self.agent_sessions_inflight = false;
+                    self.state.agent_sessions_loading = false;
+                    self.agent_sessions_fetched_at = Some(std::time::Instant::now());
+                    self.state.update_agent_sessions(sessions);
+                }
+
                 // TmuxActor responses
                 Some(response) = self.tmux_res_rx.recv() => {
                     self.handle_tmux_response(response);
@@ -175,7 +193,7 @@ impl UIActor {
                                 // disk and, in screen-preview mode, refreshes the
                                 // selected session's `claude logs`.
                                 ViewMode::Dashboard => {
-                                    self.state.refresh_agents();
+                                    self.request_agents_refresh();
                                     self.maybe_fetch_logs();
                                 }
                                 ViewMode::AgentMonitor => {
@@ -213,10 +231,11 @@ impl UIActor {
                 }
             }
 
-            // An attach request suspends the TUI, hands the terminal to
-            // `claude attach <id>`, then restores the TUI when it returns.
-            if let Some(id) = self.state.pending_attach.take() {
-                self.attach_agent(&id)?;
+            // A resume request suspends the TUI and hands the terminal to the
+            // selected provider until that command returns.
+            if let Some(session) = self.state.pending_attach.take() {
+                self.attach_agent(&session)?;
+                self.request_agents_refresh_force();
                 continue;
             }
 
@@ -446,11 +465,23 @@ impl UIActor {
                     self.state.toggle_agent_preview();
                     return Ok(false);
                 }
-                KeyCode::Char('v') if self.state.view_mode == ViewMode::Dashboard => {
+                KeyCode::Char('v')
+                    if self.state.view_mode == ViewMode::Dashboard
+                        && self
+                            .state
+                            .selected_agent()
+                            .is_some_and(|session| session.provider == AgentProvider::Claude) =>
+                {
                     self.state.cycle_preview_mode();
                     return Ok(false);
                 }
-                KeyCode::Char('s') if self.state.view_mode == ViewMode::Dashboard => {
+                KeyCode::Char('s')
+                    if self.state.view_mode == ViewMode::Dashboard
+                        && self
+                            .state
+                            .selected_agent()
+                            .is_some_and(|session| session.provider == AgentProvider::Claude) =>
+                {
                     self.state.open_agent_summary();
                     self.request_agent_summary();
                     return Ok(false);
@@ -508,9 +539,7 @@ impl UIActor {
                     self.state.tree_preview_scroll_up_line();
                 }
                 Action::Enter if self.state.view_mode == ViewMode::Dashboard => {
-                    // Attach to the selected background session. The UI loop
-                    // consumes `pending_attach` to run `claude attach <id>`.
-                    self.state.pending_attach = self.state.selected_agent_id();
+                    self.state.pending_attach = self.state.selected_agent_attach();
                 }
                 Action::Enter => {
                     if let Some(target) = self.state.get_enter_target() {
@@ -530,7 +559,12 @@ impl UIActor {
                     }
                 }
                 Action::AgentMonitor => self.state.toggle_agent_monitor(),
-                Action::Dashboard => self.state.toggle_dashboard(),
+                Action::Dashboard => {
+                    self.state.toggle_dashboard();
+                    if self.state.view_mode == ViewMode::Dashboard {
+                        self.request_agents_refresh_force();
+                    }
+                }
                 Action::PreviewHalfPageDown
                 | Action::PreviewHalfPageUp
                 | Action::PreviewLineDown
@@ -595,31 +629,70 @@ impl UIActor {
         Ok(())
     }
 
-    /// Suspend the TUI, run `claude attach <id>` with the terminal handed over,
-    /// then restore the TUI. Mirrors the agent view's attach/detach: when the
-    /// user detaches (or the session ends) we come back to the list.
-    fn attach_agent(&mut self, id: &str) -> Result<()> {
-        // Tear down our TUI so claude owns a clean terminal.
+    /// Suspend the TUI and hand the terminal to the provider's resume command.
+    fn attach_agent(&mut self, session: &AgentSession) -> Result<()> {
+        // Tear down our TUI so the provider owns a clean terminal.
         self.refresh_control.pause();
         disable_raw_mode()?;
         io::stdout().execute(LeaveAlternateScreen)?;
 
-        let status = std::process::Command::new("claude")
-            .arg("attach")
-            .arg(id)
-            .status();
+        let mut command = std::process::Command::new(session.provider.resume_program());
+        command
+            .arg(session.provider.resume_subcommand())
+            .arg(&session.id);
+        if session.provider == AgentProvider::Codex
+            && !session.cwd.is_empty()
+            && std::path::Path::new(&session.cwd).is_dir()
+        {
+            command.current_dir(&session.cwd);
+        }
+        let status = command.status();
 
-        // Restore the TUI regardless of how claude exited.
+        // Restore the TUI regardless of how the provider exited.
         enable_raw_mode()?;
         io::stdout().execute(EnterAlternateScreen)?;
         self.terminal.clear()?;
         self.refresh_control.resume();
 
-        if let Err(e) = status {
-            self.state.set_error(format!("claude attach failed: {e}"));
+        match status {
+            Err(error) => self.state.set_error(format!(
+                "{} resume failed: {error}",
+                session.provider.label()
+            )),
+            Ok(status) if !status.success() => self.state.set_error(format!(
+                "{} resume exited with {status}",
+                session.provider.label()
+            )),
+            Ok(_) => {}
         }
-        self.state.refresh_agents();
         Ok(())
+    }
+
+    fn request_agents_refresh(&mut self) {
+        if self.agent_sessions_inflight
+            || self
+                .agent_sessions_fetched_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(2))
+        {
+            return;
+        }
+        self.spawn_agents_refresh();
+    }
+
+    fn request_agents_refresh_force(&mut self) {
+        if !self.agent_sessions_inflight {
+            self.spawn_agents_refresh();
+        }
+    }
+
+    fn spawn_agents_refresh(&mut self) {
+        self.agent_sessions_inflight = true;
+        self.state.agent_sessions_loading = true;
+        let tx = self.agent_sessions_tx.clone();
+        tokio::spawn(async move {
+            let sessions = crate::agents::load_background_sessions().await;
+            let _ = tx.send(sessions).await;
+        });
     }
 
     /// In screen-preview mode, fetch the selected session's `claude logs`
@@ -634,7 +707,11 @@ impl UIActor {
         let Some(session) = self.state.selected_agent() else {
             return;
         };
-        let id = session.id.clone();
+        if session.provider != AgentProvider::Claude {
+            return;
+        }
+        let id = session.cache_key();
+        let native_id = session.id.clone();
         if self.logs_inflight.contains(&id) {
             return;
         }
@@ -651,7 +728,7 @@ impl UIActor {
         tokio::spawn(async move {
             let bytes = tokio::process::Command::new("claude")
                 .arg("logs")
-                .arg(&id)
+                .arg(&native_id)
                 .output()
                 .await
                 .map(|o| o.stdout)
@@ -667,21 +744,25 @@ impl UIActor {
         let Some(session) = self.state.selected_agent() else {
             return;
         };
+        if session.provider != AgentProvider::Claude {
+            return;
+        }
         // Don't double-dispatch while one is already running.
+        let cache_key = session.cache_key();
         if matches!(
-            self.state.summary_status(&session.id),
+            self.state.summary_status(&cache_key),
             Some(crate::app::SummaryStatus::Pending)
         ) {
             return;
         }
         let Some(path) = session.transcript_path.clone() else {
             self.state.set_summary_result(
-                session.id.clone(),
+                cache_key,
                 Err("no transcript for this session".into()),
             );
             return;
         };
-        let id = session.id.clone();
+        let id = cache_key;
         let model = self.state.agents_config.summary_model.clone();
         let tx = self.agent_summary_tx.clone();
         self.state.set_summary_pending(id.clone());

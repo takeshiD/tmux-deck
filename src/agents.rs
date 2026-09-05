@@ -1,4 +1,4 @@
-//! Claude Code background-session ("agents view") integration.
+//! Claude Code and Codex background-session discovery.
 //!
 //! Claude Code hosts background sessions through a per-user supervisor and
 //! persists each one's state under `$CLAUDE_CONFIG_DIR/jobs/<id>/state.json`
@@ -8,12 +8,46 @@
 //!
 //! This is independent of the tmux/hook integration in [`crate::hook`]: those
 //! track interactive Claude running in tmux panes; the sessions here are
-//! supervisor-hosted background sessions that need no terminal attached.
+//! provider-managed sessions that need no terminal attached. Codex discovery
+//! uses its documented app-server `thread/list` method instead of depending on
+//! the layout of rollout files on disk.
 
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentProvider {
+    Claude,
+    Codex,
+}
+
+impl AgentProvider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+        }
+    }
+
+    pub fn resume_program(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    pub fn resume_subcommand(self) -> &'static str {
+        match self {
+            Self::Claude => "attach",
+            Self::Codex => "resume",
+        }
+    }
+}
 
 /// Lifecycle state of a background session, mirroring the agent view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +110,8 @@ pub struct PrRef {
 /// One background session as shown in the agent view.
 #[derive(Debug, Clone)]
 pub struct AgentSession {
-    /// Short id (the `jobs/<id>` directory name) used by `claude attach <id>`.
+    pub provider: AgentProvider,
+    /// Provider-native id used by `claude attach` or `codex resume`.
     pub id: String,
     pub name: String,
     pub state: AgentState,
@@ -91,6 +126,12 @@ pub struct AgentSession {
     pub alive: bool,
     /// Path to the conversation transcript JSONL, if known (for preview/summary).
     pub transcript_path: Option<String>,
+}
+
+impl AgentSession {
+    pub fn cache_key(&self) -> String {
+        format!("{}:{}", self.provider.label().to_ascii_lowercase(), self.id)
+    }
 }
 
 fn now_secs() -> i64 {
@@ -204,6 +245,7 @@ pub fn load_agent_sessions() -> Vec<AgentSession> {
             .map(String::from);
 
         sessions.push(AgentSession {
+            provider: AgentProvider::Claude,
             alive: alive.contains(&id),
             id,
             name,
@@ -216,6 +258,164 @@ pub fn load_agent_sessions() -> Vec<AgentSession> {
         });
     }
 
+    sort_for_display(&mut sessions);
+    sessions
+}
+
+/// Load Codex interactive threads through the documented app-server protocol.
+/// The process is short-lived and bounded; unsupported or unavailable Codex
+/// installations simply contribute no sessions.
+pub async fn load_codex_sessions() -> Vec<AgentSession> {
+    let mut child = match Command::new("codex")
+        .arg("app-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Vec::new(),
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill().await;
+        return Vec::new();
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        return Vec::new();
+    };
+    let requests = [
+        serde_json::json!({
+            "method": "initialize",
+            "id": 0,
+            "params": { "clientInfo": {
+                "name": "tmux_deck",
+                "title": "tmux-deck",
+                "version": env!("CARGO_PKG_VERSION")
+            }}
+        }),
+        serde_json::json!({ "method": "initialized", "params": {} }),
+        serde_json::json!({
+            "method": "thread/list",
+            "id": 1,
+            "params": {
+                "limit": 100,
+                "useStateDbOnly": true,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+                "sourceKinds": [
+                    "cli", "vscode", "subAgent", "subAgentReview", "subAgentCompact",
+                    "subAgentThreadSpawn", "subAgentOther"
+                ]
+            }
+        }),
+    ]
+    .into_iter()
+    .map(|request| request.to_string())
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    if stdin.write_all(requests.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+        let _ = child.kill().await;
+        return Vec::new();
+    }
+
+    let mut lines = BufReader::new(stdout).lines();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value.get("id").and_then(Value::as_i64) == Some(1) {
+                return Some(value);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    let _ = child.kill().await;
+    response
+        .map(|value| parse_codex_thread_list(&value, now_secs()))
+        .unwrap_or_default()
+}
+
+fn parse_codex_thread_list(response: &Value, now: i64) -> Vec<AgentSession> {
+    let mut sessions = Vec::new();
+    let Some(threads) = response
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(Value::as_array)
+    else {
+        return sessions;
+    };
+    for thread in threads {
+        let Some(id) = thread.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let preview = thread
+            .get("preview")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let name = thread
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(if preview.is_empty() { id } else { preview });
+        let status = thread
+            .get("status")
+            .and_then(|status| status.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("notLoaded");
+        let waiting = thread
+            .get("status")
+            .and_then(|status| status.get("activeFlags"))
+            .and_then(Value::as_array)
+            .is_some_and(|flags| {
+                flags
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|flag| flag == "waitingOnApproval" || flag == "waitingOnUserInput")
+            });
+        let state = match (status, waiting) {
+            ("active", true) => AgentState::Blocked,
+            ("active", false) => AgentState::Working,
+            ("idle", _) => AgentState::Idle,
+            ("systemError", _) => AgentState::Failed,
+            _ => AgentState::Done,
+        };
+        let updated_at = thread
+            .get("updatedAt")
+            .or_else(|| thread.get("createdAt"))
+            .and_then(Value::as_i64)
+            .unwrap_or(now);
+        sessions.push(AgentSession {
+            provider: AgentProvider::Codex,
+            id: id.to_string(),
+            name: one_line(name, 80),
+            state,
+            summary: one_line(preview, 80),
+            cwd: thread
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or("Codex")
+                .to_string(),
+            elapsed_secs: now.saturating_sub(updated_at).max(0),
+            prs: Vec::new(),
+            alive: matches!(status, "active" | "idle"),
+            transcript_path: None,
+        });
+    }
+    sessions
+}
+
+pub async fn load_background_sessions() -> Vec<AgentSession> {
+    let claude = tokio::task::spawn_blocking(load_agent_sessions);
+    let codex = load_codex_sessions();
+    let (claude, codex) = tokio::join!(claude, codex);
+    let mut sessions = claude.unwrap_or_default();
+    sessions.extend(codex);
     sort_for_display(&mut sessions);
     sessions
 }
@@ -362,6 +562,7 @@ mod tests {
 
     fn sess(cwd: &str, state: AgentState, elapsed: i64) -> AgentSession {
         AgentSession {
+            provider: AgentProvider::Claude,
             id: format!("{cwd}-{elapsed}"),
             name: "n".into(),
             state,
@@ -412,5 +613,37 @@ mod tests {
         unsafe { std::env::set_var("HOME", "/home/u") };
         assert_eq!(abbreviate_path("/home/u/proj"), "~/proj");
         assert_eq!(abbreviate_path("/etc/x"), "/etc/x");
+    }
+
+    #[test]
+    fn parses_codex_threads_and_runtime_status() {
+        let response = serde_json::json!({
+            "id": 1,
+            "result": { "data": [
+                {
+                    "id": "thr_wait",
+                    "preview": "permission needed",
+                    "cwd": "/work/repo",
+                    "updatedAt": 90,
+                    "status": { "type": "active", "activeFlags": ["waitingOnApproval"] }
+                },
+                {
+                    "id": "thr_done",
+                    "name": "finished task",
+                    "createdAt": 80,
+                    "status": { "type": "notLoaded" }
+                }
+            ] }
+        });
+        let sessions = parse_codex_thread_list(&response, 100);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].provider, AgentProvider::Codex);
+        assert_eq!(sessions[0].state, AgentState::Blocked);
+        assert!(sessions[0].alive);
+        assert_eq!(sessions[0].elapsed_secs, 10);
+        assert_eq!(sessions[1].state, AgentState::Done);
+        assert!(!sessions[1].alive);
+        assert_eq!(AgentProvider::Claude.resume_subcommand(), "attach");
+        assert_eq!(AgentProvider::Codex.resume_subcommand(), "resume");
     }
 }

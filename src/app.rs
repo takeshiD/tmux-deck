@@ -6,7 +6,7 @@ use ansi_to_tui::IntoText;
 use ratatui::text::Text;
 use ratatui::widgets::ListState;
 
-use crate::agents::{self, AgentSession};
+use crate::agents::AgentSession;
 use crate::config::{
     AgentMonitorConfig, AgentsConfig, BehaviorConfig, Config, HooksConfig, KeyBindings,
     LayoutConfig, Theme,
@@ -759,15 +759,14 @@ pub struct UIState {
     pub agent_pane_contents: HashMap<String, Text<'static>>,
     pub agent_monitor_config: AgentMonitorConfig,
 
-    /// Claude Code background sessions shown in the agent view, refreshed from
-    /// `~/.claude/jobs` while the dashboard is open. Order matches the rendered
-    /// (grouped-by-directory) order, so `agent_selected` indexes it directly.
+    /// Claude jobs and Codex threads shown in Background Agents. Order matches
+    /// the rendered grouped-by-directory order, so `agent_selected` indexes it.
     pub agent_sessions: Vec<AgentSession>,
+    pub agent_sessions_loading: bool,
     /// Selected row in the agent view (`ViewMode::Dashboard`).
     pub agent_selected: usize,
-    /// Set to a session id when the user asks to attach; the UI loop consumes it
-    /// to run `claude attach <id>` and clears it.
-    pub pending_attach: Option<String>,
+    /// Selected provider-native session to resume; consumed by the UI loop.
+    pub pending_attach: Option<AgentSession>,
     /// Whether the agent-view preview panel is shown (`p`).
     pub agent_preview: bool,
     /// How the preview renders (transcript vs screen); toggled with `v`.
@@ -779,7 +778,7 @@ pub struct UIState {
     /// Cached `claude logs` output (raw PTY bytes) per session id, for the
     /// screen preview mode.
     pub agent_logs: HashMap<String, Vec<u8>>,
-    /// Agent-view config (e.g. summary model).
+    /// Background Agents config (currently Claude preview/summary settings).
     pub agents_config: AgentsConfig,
 
     // Shared state
@@ -857,6 +856,7 @@ impl UIState {
             agent_monitor_config: config.agent_monitor,
 
             agent_sessions: Vec::new(),
+            agent_sessions_loading: false,
             agent_selected: 0,
             pending_attach: None,
             agent_preview: false,
@@ -1345,24 +1345,29 @@ impl UIState {
     // Agent View (Claude Code background sessions)
     // =========================================================================
 
-    /// Toggle the agent view on/off. Entering it loads the current background
-    /// sessions and resets the selection.
+    /// Toggle Background Agents on/off. Loading is dispatched asynchronously
+    /// by UIActor so filesystem and app-server work never blocks input.
     pub fn toggle_dashboard(&mut self) {
         if self.view_mode == ViewMode::Dashboard {
             self.view_mode = ViewMode::TreeView;
         } else {
             self.agent_selected = 0;
-            self.refresh_agents();
             self.view_mode = ViewMode::Dashboard;
         }
     }
 
-    /// Reload background sessions from `~/.claude/jobs`, keeping the selection
-    /// in range.
-    pub fn refresh_agents(&mut self) {
-        self.agent_sessions = agents::load_agent_sessions();
+    pub fn update_agent_sessions(&mut self, sessions: Vec<AgentSession>) {
+        let selected_key = self.selected_agent().map(AgentSession::cache_key);
+        self.agent_sessions = sessions;
         if self.agent_sessions.is_empty() {
             self.agent_selected = 0;
+        } else if let Some(key) = selected_key
+            && let Some(index) = self
+                .agent_sessions
+                .iter()
+                .position(|session| session.cache_key() == key)
+        {
+            self.agent_selected = index;
         } else {
             self.agent_selected = self.agent_selected.min(self.agent_sessions.len() - 1);
         }
@@ -1370,19 +1375,18 @@ impl UIState {
 
     pub fn agent_select_prev(&mut self) {
         self.agent_selected = self.agent_selected.saturating_sub(1);
+        self.agent_summary_open = false;
     }
 
     pub fn agent_select_next(&mut self) {
         if !self.agent_sessions.is_empty() {
             self.agent_selected = (self.agent_selected + 1).min(self.agent_sessions.len() - 1);
         }
+        self.agent_summary_open = false;
     }
 
-    /// Id of the selected background session, for `claude attach <id>`.
-    pub fn selected_agent_id(&self) -> Option<String> {
-        self.agent_sessions
-            .get(self.agent_selected)
-            .map(|s| s.id.clone())
+    pub fn selected_agent_attach(&self) -> Option<AgentSession> {
+        self.selected_agent().cloned()
     }
 
     /// The selected background session, if any.
@@ -2492,6 +2496,40 @@ mod tests {
         assert_eq!(state.agent_pane_selected.as_deref(), Some("%20"));
         state.agent_move_home();
         assert_eq!(state.agent_pane_selected.as_deref(), Some("%0"));
+    }
+
+    #[test]
+    fn background_refresh_preserves_provider_scoped_selection() {
+        fn background(provider: crate::agents::AgentProvider) -> AgentSession {
+            AgentSession {
+                provider,
+                id: "same-id".to_string(),
+                name: provider.label().to_string(),
+                state: crate::agents::AgentState::Idle,
+                summary: String::new(),
+                cwd: "/work".to_string(),
+                elapsed_secs: 0,
+                prs: Vec::new(),
+                alive: true,
+                transcript_path: None,
+            }
+        }
+
+        let mut state = monitor_state();
+        state.agent_sessions = vec![
+            background(crate::agents::AgentProvider::Claude),
+            background(crate::agents::AgentProvider::Codex),
+        ];
+        state.agent_selected = 1;
+        state.update_agent_sessions(vec![
+            background(crate::agents::AgentProvider::Codex),
+            background(crate::agents::AgentProvider::Claude),
+        ]);
+        assert_eq!(state.agent_selected, 0);
+        assert_eq!(
+            state.selected_agent().unwrap().provider,
+            crate::agents::AgentProvider::Codex
+        );
     }
 
     /// Build a session with a single window holding the given panes, each

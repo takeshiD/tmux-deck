@@ -111,12 +111,11 @@ pub struct PreviewConfig {
 #[serde(default)]
 pub struct AgentsConfig {
     /// Model passed to `claude -p` when generating an execution summary for the
-    /// selected background session (agent view, `s`). Accepts a `claude`
+    /// selected Claude background session (`s`). Accepts a `claude`
     /// `--model` value such as an alias (`haiku`, `sonnet`, `opus`) or a full id.
     pub summary_model: String,
-    /// Default preview mode in the agent view: `transcript` (reconstructed
-    /// conversation) or `screen` (reconstructed terminal screen via
-    /// `claude logs`). Toggle at runtime with `v`.
+    /// Default Claude preview mode: `transcript` (reconstructed conversation)
+    /// or `screen` (reconstructed terminal screen via `claude logs`).
     pub preview_mode: String,
 }
 
