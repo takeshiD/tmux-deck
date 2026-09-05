@@ -103,7 +103,9 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.target }}
-          path: dist/*
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
           if-no-files-found: error
 
   nix-build:
@@ -289,6 +291,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Download release artifacts
         uses: actions/download-artifact@v6
         with:
