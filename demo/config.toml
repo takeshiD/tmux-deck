@@ -1,0 +1,16 @@
+[preview]
+interval = 200
+
+[theme]
+preset = "tokyonight"
+
+[layout]
+session_panel_width = 32
+tree_split = [34, 33, 33]
+multi_selected_ratio = 56
+
+[behavior]
+default_view = "tree"
+default_sort = "abc_asc"
+double_space_ms = 400
+exit_on_switch = true

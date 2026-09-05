@@ -3,7 +3,7 @@
 //! tmux-deck is zero-config by default: when no config file exists the built-in
 //! defaults reproduce the previous hard-coded behaviour exactly. A config file
 //! lets the user tune the preview interval, the colour theme, key bindings, the
-//! per-state Claude hook markers (and, in future, Codex markers), the panel
+//! per-state Claude and Codex hook markers, the panel
 //! layout and a handful of behavioural toggles.
 //!
 //! Loading is best-effort, mirroring [`crate::group::GroupStore`]: a missing
@@ -479,22 +479,55 @@ pub fn parse_hex_color(s: &str) -> Option<Color> {
 // [hooks.claude] / [hooks.codex]
 // =============================================================================
 
-/// Default marker colour as a truecolor code (`#ff8700`, the orange of the
-/// classic xterm-256 slot 208). Marker colours are specified as hex colour
-/// codes in the config.
-const DEFAULT_MARKER_COLOR: Color = Color::Rgb(0xff, 0x87, 0x00);
+/// Default marker colours. Claude keeps its historical xterm-orange while
+/// Codex uses blue; user overrides remain hex truecolor values.
+const DEFAULT_CLAUDE_MARKER_COLOR: Color = Color::Rgb(0xff, 0x87, 0x00);
+const DEFAULT_CODEX_MARKER_COLOR: Color = Color::Rgb(0x5f, 0xaf, 0xff);
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone)]
 pub struct HooksConfig {
     pub claude: MarkerSet,
     pub codex: MarkerSet,
 }
 
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            claude: MarkerSet::with_color(DEFAULT_CLAUDE_MARKER_COLOR),
+            codex: MarkerSet::with_color(DEFAULT_CODEX_MARKER_COLOR),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HooksConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct RawHooksConfig {
+            claude: RawMarkerSet,
+            codex: RawMarkerSet,
+        }
+
+        let raw = RawHooksConfig::deserialize(deserializer)?;
+        Ok(Self {
+            claude: raw
+                .claude
+                .resolve(DEFAULT_CLAUDE_MARKER_COLOR)
+                .map_err(de::Error::custom)?,
+            codex: raw
+                .codex
+                .resolve(DEFAULT_CODEX_MARKER_COLOR)
+                .map_err(de::Error::custom)?,
+        })
+    }
+}
+
 /// The five markers shown for a hook-driven agent's states. `running` is shown
 /// when the process is detected but no hook state is known yet.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone)]
 pub struct MarkerSet {
     pub working: Marker,
     pub waiting: Marker,
@@ -505,7 +538,59 @@ pub struct MarkerSet {
 
 impl Default for MarkerSet {
     fn default() -> Self {
-        let color = DEFAULT_MARKER_COLOR;
+        Self::with_color(DEFAULT_CLAUDE_MARKER_COLOR)
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawMarkerSet {
+    working: Option<RawMarker>,
+    waiting: Option<RawMarker>,
+    done: Option<RawMarker>,
+    error: Option<RawMarker>,
+    running: Option<RawMarker>,
+}
+
+impl RawMarkerSet {
+    fn resolve(self, color: Color) -> Result<MarkerSet, String> {
+        let defaults = MarkerSet::with_color(color);
+        Ok(MarkerSet {
+            working: resolve_marker(self.working, defaults.working, color)?,
+            waiting: resolve_marker(self.waiting, defaults.waiting, color)?,
+            done: resolve_marker(self.done, defaults.done, color)?,
+            error: resolve_marker(self.error, defaults.error, color)?,
+            running: resolve_marker(self.running, defaults.running, color)?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct RawMarker {
+    glyph: String,
+    #[serde(default)]
+    color: Option<String>,
+}
+
+fn resolve_marker(raw: Option<RawMarker>, default: Marker, color: Color) -> Result<Marker, String> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let color = match raw.color.as_deref() {
+        Some(value) => parse_hex_color(value).ok_or_else(|| {
+            format!("invalid marker colour {value:?}, expected a hex code like \"#ff8700\"")
+        })?,
+        None => color,
+    };
+    Ok(Marker {
+        animated: raw.glyph == "spinner",
+        glyph: raw.glyph,
+        color,
+    })
+}
+
+impl MarkerSet {
+    fn with_color(color: Color) -> Self {
         Self {
             working: Marker::spinner(color),
             waiting: Marker::glyph("◆", color),
@@ -544,38 +629,11 @@ impl Marker {
     }
 }
 
-impl<'de> Deserialize<'de> for Marker {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            glyph: String,
-            #[serde(default)]
-            color: Option<String>,
-        }
-        let raw = Raw::deserialize(deserializer)?;
-        // Marker colours are given as a hex colour code, e.g. `color = "#ff8700"`.
-        let color = match raw.color.as_deref() {
-            Some(c) => parse_hex_color(c).ok_or_else(|| {
-                de::Error::custom(format!("invalid marker colour {c:?}, expected a hex code like \"#ff8700\""))
-            })?,
-            None => DEFAULT_MARKER_COLOR,
-        };
-        Ok(Marker {
-            animated: raw.glyph == "spinner",
-            glyph: raw.glyph,
-            color,
-        })
-    }
-}
-
 // =============================================================================
 // [keybindings]
 // =============================================================================
 
-/// A remappable user action. Navigation (j/k/h/l/arrows/Tab) and chords
+/// A remappable user action. Tree navigation (j/k/h/l/arrows/Tab) and chords
 /// (`za` fold, double-Space) are intentionally not remappable yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -590,6 +648,14 @@ pub enum Action {
     KillSession,
     /// Toggle the fleet dashboard (all Claude panes, sorted by attention).
     Dashboard,
+    /// Scroll the TreeView pane preview down by half a page.
+    PreviewHalfPageDown,
+    /// Scroll the TreeView pane preview up by half a page.
+    PreviewHalfPageUp,
+    /// Scroll the TreeView pane preview down by one line.
+    PreviewLineDown,
+    /// Scroll the TreeView pane preview up by one line.
+    PreviewLineUp,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -615,6 +681,14 @@ pub struct KeyBindings {
     pub kill_session: Vec<KeySpec>,
     #[serde(deserialize_with = "de_keys")]
     pub dashboard: Vec<KeySpec>,
+    #[serde(deserialize_with = "de_keys")]
+    pub preview_half_page_down: Vec<KeySpec>,
+    #[serde(deserialize_with = "de_keys")]
+    pub preview_half_page_up: Vec<KeySpec>,
+    #[serde(deserialize_with = "de_keys")]
+    pub preview_line_down: Vec<KeySpec>,
+    #[serde(deserialize_with = "de_keys")]
+    pub preview_line_up: Vec<KeySpec>,
 }
 
 impl Default for KeyBindings {
@@ -631,6 +705,10 @@ impl Default for KeyBindings {
             rename_session: vec![ctrl('r')],
             kill_session: vec![ctrl('x')],
             dashboard: vec![key('d')],
+            preview_half_page_down: vec![ctrl('d')],
+            preview_half_page_up: vec![ctrl('u')],
+            preview_line_down: vec![ctrl('j')],
+            preview_line_up: vec![ctrl('k')],
         }
     }
 }
@@ -638,8 +716,12 @@ impl Default for KeyBindings {
 impl KeyBindings {
     /// Pairs of (action, bindings) in match priority order. Modifier-bearing
     /// bindings (e.g. `C-r`) are listed so they win over the plain `r` refresh.
-    fn entries(&self) -> [(Action, &Vec<KeySpec>); 10] {
+    fn entries(&self) -> [(Action, &Vec<KeySpec>); 14] {
         [
+            (Action::PreviewHalfPageDown, &self.preview_half_page_down),
+            (Action::PreviewHalfPageUp, &self.preview_half_page_up),
+            (Action::PreviewLineDown, &self.preview_line_down),
+            (Action::PreviewLineUp, &self.preview_line_up),
             (Action::NewSession, &self.new_session),
             (Action::RenameSession, &self.rename_session),
             (Action::KillSession, &self.kill_session),
@@ -875,6 +957,24 @@ mod tests {
         // Default markers match the historical glyphs.
         assert_eq!(cfg.hooks.claude.done.glyph, "✓");
         assert!(cfg.hooks.claude.working.animated);
+        assert_eq!(cfg.hooks.claude.done.color, Color::Rgb(0xff, 0x87, 0x00));
+        assert_eq!(cfg.hooks.codex.done.color, Color::Rgb(0x5f, 0xaf, 0xff));
+    }
+
+    #[test]
+    fn partial_codex_markers_keep_codex_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [hooks.codex]
+            done = { glyph = "C" }
+        "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.hooks.codex.done.glyph, "C");
+        assert_eq!(cfg.hooks.codex.done.color, Color::Rgb(0x5f, 0xaf, 0xff));
+        assert_eq!(cfg.hooks.codex.waiting.color, Color::Rgb(0x5f, 0xaf, 0xff));
+        assert_eq!(cfg.hooks.claude.waiting.color, Color::Rgb(0xff, 0x87, 0x00));
     }
 
     #[test]
@@ -950,6 +1050,46 @@ mod tests {
         assert_eq!(kb.action_for(&ctrl_r), Some(Action::RenameSession));
         let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(kb.action_for(&j), None);
+        let ctrl_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        let ctrl_k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(kb.action_for(&ctrl_j), Some(Action::PreviewLineDown));
+        assert_eq!(kb.action_for(&ctrl_k), Some(Action::PreviewLineUp));
+        assert_eq!(kb.action_for(&ctrl_d), Some(Action::PreviewHalfPageDown));
+        assert_eq!(kb.action_for(&ctrl_u), Some(Action::PreviewHalfPageUp));
+    }
+
+    #[test]
+    fn preview_scroll_bindings_are_remappable() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [keybindings]
+            preview_half_page_down = "A-d"
+            preview_half_page_up = "A-u"
+            preview_line_down = ["Down", "C-e"]
+            preview_line_up = "Up"
+        "#,
+        )
+        .unwrap();
+
+        let alt_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT);
+        let alt_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            cfg.keybindings.action_for(&alt_d),
+            Some(Action::PreviewHalfPageDown)
+        );
+        assert_eq!(
+            cfg.keybindings.action_for(&alt_u),
+            Some(Action::PreviewHalfPageUp)
+        );
+        assert_eq!(
+            cfg.keybindings.action_for(&down),
+            Some(Action::PreviewLineDown)
+        );
+        assert_eq!(cfg.keybindings.action_for(&up), Some(Action::PreviewLineUp));
     }
 
     #[test]

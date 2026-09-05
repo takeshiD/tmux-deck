@@ -59,33 +59,36 @@ pub const SESSION_NAME_MAX_LEN: usize = 30;
 // Data Structures
 // =============================================================================
 
-/// State reported by Claude Code hooks for a given pane.
+/// State reported by agent lifecycle hooks for a given pane.
 ///
-/// Process detection (`has_claude`) only tells us whether claude is running;
-/// these states tell us *what claude is doing*, sourced from Claude Code's
-/// hook events (see [`crate::hook`]). Variants are ordered loosely by how much
-/// they want the user's attention — see [`ClaudeState::priority`].
+/// Process detection only tells us whether an agent is running; these states
+/// describe what it is doing, sourced from its hook events (see
+/// [`crate::hook`]). Variants are ordered loosely by how much
+/// they want the user's attention — see [`HookState::priority`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaudeState {
-    /// Claude is actively working (prompt submitted / tool running).
+pub enum HookState {
+    /// The agent is actively working (prompt submitted / tool running).
     Working,
-    /// Claude is waiting on the user (permission prompt / idle prompt).
+    /// The agent is waiting on the user (permission prompt / idle prompt).
     Waiting,
-    /// Claude finished its turn.
+    /// The agent finished its turn.
     Done,
-    /// Claude's turn ended with an error.
+    /// The agent's turn ended with an error.
     Error,
 }
 
-impl ClaudeState {
-    /// Map a Claude Code `hook_event_name` to the state it implies.
+impl HookState {
+    /// Map a Claude/Codex `hook_event_name` to the state it implies.
     /// Returns `None` for events that carry no marker meaning (the caller may
     /// treat `SessionEnd` specially, clearing any existing marker).
     pub fn from_hook_event(event: &str) -> Option<Self> {
         match event {
-            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PreCompact" => Some(Self::Working),
-            "Notification" => Some(Self::Waiting),
+            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PreCompact" | "PostCompact" => {
+                Some(Self::Working)
+            }
+            "Notification" | "PermissionRequest" => Some(Self::Waiting),
             "Stop" | "SubagentStop" => Some(Self::Done),
+            "Interrupt" => Some(Self::Done),
             // StopFailure is not yet confirmed in the public docs; map it
             // defensively so it lights up red if it ever fires.
             "StopFailure" => Some(Self::Error),
@@ -151,7 +154,7 @@ pub struct TmuxPane {
     /// True if a claude process is running in this pane (detected via descendant process scan).
     pub has_claude: bool,
     /// Latest state reported by Claude Code hooks for this pane, if any.
-    pub claude_state: Option<ClaudeState>,
+    pub claude_state: Option<HookState>,
     // The hook (see [`crate::hook`]) still collects this per-pane context;
     // it is reserved for an inline tree-view indicator and not yet displayed,
     // so these carry `#[allow(dead_code)]`.
@@ -164,6 +167,19 @@ pub struct TmuxPane {
     /// Working directory Claude reported for this pane (repo identification).
     #[allow(dead_code)]
     pub claude_cwd: Option<String>,
+    /// True if a Codex process is running in this pane.
+    pub has_codex: bool,
+    /// Latest state reported by Codex hooks for this pane, if any.
+    pub codex_state: Option<HookState>,
+    /// One-line summary of what Codex is currently doing.
+    #[allow(dead_code)]
+    pub codex_activity: Option<String>,
+    /// Unix timestamp (secs) when the current Codex state began.
+    #[allow(dead_code)]
+    pub codex_state_since: Option<i64>,
+    /// Working directory Codex reported for this pane.
+    #[allow(dead_code)]
+    pub codex_cwd: Option<String>,
 }
 
 impl TmuxPane {
@@ -171,6 +187,12 @@ impl TmuxPane {
     #[allow(dead_code)]
     pub fn claude_state_elapsed_secs(&self) -> Option<i64> {
         self.claude_state_since
+            .map(|since| crate::hook::now_secs().saturating_sub(since).max(0))
+    }
+
+    #[allow(dead_code)]
+    pub fn codex_state_elapsed_secs(&self) -> Option<i64> {
+        self.codex_state_since
             .map(|since| crate::hook::now_secs().saturating_sub(since).max(0))
     }
 }
@@ -184,7 +206,11 @@ pub struct TmuxWindow {
     /// True if any pane in this window has claude running.
     pub has_claude: bool,
     /// Highest-priority Claude hook state across this window's panes.
-    pub claude_state: Option<ClaudeState>,
+    pub claude_state: Option<HookState>,
+    /// True if any pane in this window has Codex running.
+    pub has_codex: bool,
+    /// Highest-priority Codex hook state across this window's panes.
+    pub codex_state: Option<HookState>,
 }
 
 impl TmuxWindow {
@@ -201,7 +227,11 @@ pub struct TmuxSession {
     /// True if any window in this session has claude running.
     pub has_claude: bool,
     /// Highest-priority Claude hook state across this session's windows.
-    pub claude_state: Option<ClaudeState>,
+    pub claude_state: Option<HookState>,
+    /// True if any window in this session has Codex running.
+    pub has_codex: bool,
+    /// Highest-priority Codex hook state across this session's windows.
+    pub codex_state: Option<HookState>,
     /// Epoch seconds — kept on the struct so [`SessionSort`] can reorder
     /// the list without re-querying tmux.
     pub last_attached: i64,
@@ -477,6 +507,10 @@ pub struct UIState {
     // Shared state
     pub pane_content: String,
     pub pane_content_parsed: Option<Text<'static>>,
+    /// Number of lines the TreeView preview is scrolled back from the live tail.
+    tree_preview_scroll: usize,
+    /// Last rendered height of the TreeView preview's inner viewport.
+    tree_preview_height: usize,
     pub last_error: Option<String>,
     #[allow(dead_code)]
     pub interval: Duration,
@@ -547,6 +581,8 @@ impl UIState {
 
             pane_content: String::new(),
             pane_content_parsed: None,
+            tree_preview_scroll: 0,
+            tree_preview_height: 0,
             last_error: None,
             interval: Duration::from_millis(interval_ms),
 
@@ -575,20 +611,20 @@ impl UIState {
     // View Mode Switching
     // =========================================================================
 
-    /// Re-read Claude hook state files and patch the in-memory session tree.
+    /// Re-read Claude and Codex hook state files and patch the session tree.
     ///
     /// Cheap enough to call on every refresh tick: it only reads a small local
-    /// state directory. This keeps markers live without a full tmux refresh.
-    pub fn refresh_claude_states(&mut self) {
+    /// state directories. This keeps markers live without a full tmux refresh.
+    pub fn refresh_agent_states(&mut self) {
         crate::hook::apply_states(&mut self.sessions);
     }
 
-    /// True if any session currently has a `Working` Claude marker, used to
+    /// True if any session currently has a `Working` agent marker, used to
     /// decide whether the spinner animation needs frequent redraws.
-    pub fn has_working_claude(&self) -> bool {
-        self.sessions
-            .iter()
-            .any(|s| s.claude_state == Some(ClaudeState::Working))
+    pub fn has_working_agent(&self) -> bool {
+        self.sessions.iter().any(|s| {
+            s.claude_state == Some(HookState::Working) || s.codex_state == Some(HookState::Working)
+        })
     }
 
     pub fn handle_space_press(&mut self) -> bool {
@@ -618,6 +654,7 @@ impl UIState {
                 self.selected_session = self.multi_session;
                 self.selected_window = self.multi_window;
                 self.selected_pane = 0;
+                self.reset_tree_preview_scroll();
                 self.session_list_state.select(Some(self.selected_session));
                 self.window_list_state.select(Some(self.selected_window));
                 self.pane_list_state.select(Some(0));
@@ -992,6 +1029,7 @@ impl UIState {
     // =========================================================================
 
     pub fn update_sessions(&mut self, sessions: Vec<TmuxSession>) {
+        let previous_target = self.get_selected_pane_target();
         // Preserve the user's currently-highlighted session across the refresh:
         // it may move to a new index once the new order is applied (e.g. when
         // sort is Alphabet and a session was renamed).
@@ -1011,6 +1049,9 @@ impl UIState {
         }
 
         self.validate_selections();
+        if self.get_selected_pane_target() != previous_target {
+            self.reset_tree_preview_scroll();
+        }
         self.last_error = None;
     }
 
@@ -1099,6 +1140,7 @@ impl UIState {
     /// cursor stays on the (now folded) header and the group can be reopened
     /// with another `za`.
     pub fn toggle_fold_current_group(&mut self) {
+        let previous_target = self.get_selected_pane_target();
         if !self.any_grouped() {
             return;
         }
@@ -1119,6 +1161,9 @@ impl UIState {
                 self.window_list_state.select(Some(0));
                 self.pane_list_state.select(Some(0));
             }
+        }
+        if self.get_selected_pane_target() != previous_target {
+            self.reset_tree_preview_scroll();
         }
     }
 
@@ -1187,6 +1232,86 @@ impl UIState {
     pub fn update_pane_content(&mut self, content: String) {
         self.pane_content_parsed = content.as_bytes().into_text().ok();
         self.pane_content = content;
+        self.clamp_tree_preview_scroll();
+    }
+
+    /// Apply a capture only while its pane is still selected. Preview captures
+    /// are asynchronous, so a response for the previous selection may arrive
+    /// after the user has moved elsewhere in the tree.
+    pub fn update_tree_preview_content(&mut self, target: &str, content: String) -> bool {
+        if self.get_selected_pane_target().as_deref() != Some(target) {
+            return false;
+        }
+        self.update_pane_content(content);
+        true
+    }
+
+    /// Record the current preview viewport height so page-wise key actions use
+    /// the dimensions the user actually sees.
+    pub fn set_tree_preview_height(&mut self, height: usize) {
+        self.tree_preview_height = height;
+        self.clamp_tree_preview_scroll();
+    }
+
+    pub fn tree_preview_scroll_up_line(&mut self) {
+        self.scroll_tree_preview_up(1);
+    }
+
+    pub fn tree_preview_scroll_down_line(&mut self) {
+        self.tree_preview_scroll = self.tree_preview_scroll.saturating_sub(1);
+    }
+
+    pub fn tree_preview_scroll_up_half_page(&mut self) {
+        self.scroll_tree_preview_up((self.tree_preview_height / 2).max(1));
+    }
+
+    pub fn tree_preview_scroll_down_half_page(&mut self) {
+        let amount = (self.tree_preview_height / 2).max(1);
+        self.tree_preview_scroll = self.tree_preview_scroll.saturating_sub(amount);
+    }
+
+    /// Line range to render, keeping offset zero anchored to the live tail.
+    pub fn tree_preview_visible_range(&self, line_count: usize) -> std::ops::Range<usize> {
+        let height = self.tree_preview_height;
+        if height == 0 {
+            return line_count..line_count;
+        }
+        let offset = self
+            .tree_preview_scroll
+            .min(line_count.saturating_sub(height));
+        let end = line_count.saturating_sub(offset);
+        end.saturating_sub(height)..end
+    }
+
+    fn scroll_tree_preview_up(&mut self, amount: usize) {
+        if self.tree_preview_height == 0 {
+            return;
+        }
+        let max_scroll = self
+            .tree_preview_line_count()
+            .saturating_sub(self.tree_preview_height);
+        self.tree_preview_scroll = self
+            .tree_preview_scroll
+            .saturating_add(amount)
+            .min(max_scroll);
+    }
+
+    fn clamp_tree_preview_scroll(&mut self) {
+        let max_scroll = self
+            .tree_preview_line_count()
+            .saturating_sub(self.tree_preview_height);
+        self.tree_preview_scroll = self.tree_preview_scroll.min(max_scroll);
+    }
+
+    fn tree_preview_line_count(&self) -> usize {
+        self.pane_content_parsed
+            .as_ref()
+            .map(|text| text.lines.len())
+            .unwrap_or_else(|| self.pane_content.lines().count())
+    }
+
+    fn reset_tree_preview_scroll(&mut self) {
+        self.tree_preview_scroll = 0;
     }
 
     pub fn set_error(&mut self, message: String) {
@@ -1248,6 +1373,7 @@ impl UIState {
     }
 
     pub fn tree_move_up(&mut self) {
+        let previous_target = self.get_selected_pane_target();
         match self.focus {
             Focus::Sessions => {
                 if let Some(prev) = self.prev_cursor_stop(self.selected_session) {
@@ -1274,9 +1400,13 @@ impl UIState {
                 self.pane_list_state.select(Some(self.selected_pane));
             }
         }
+        if self.get_selected_pane_target() != previous_target {
+            self.reset_tree_preview_scroll();
+        }
     }
 
     pub fn tree_move_down(&mut self) {
+        let previous_target = self.get_selected_pane_target();
         match self.focus {
             Focus::Sessions => {
                 if let Some(next) = self.next_cursor_stop(self.selected_session) {
@@ -1307,6 +1437,9 @@ impl UIState {
                 }
                 self.pane_list_state.select(Some(self.selected_pane));
             }
+        }
+        if self.get_selected_pane_target() != previous_target {
+            self.reset_tree_preview_scroll();
         }
     }
 
@@ -1378,9 +1511,45 @@ mod tests {
             windows: Vec::new(),
             has_claude: false,
             claude_state: None,
+            has_codex: false,
+            codex_state: None,
             last_attached: 0,
             activity: 0,
             group: None,
+        }
+    }
+
+    fn session_with_pane(name: &str, pane_index: u32) -> TmuxSession {
+        TmuxSession {
+            name: name.to_string(),
+            windows: vec![TmuxWindow {
+                index: 0,
+                name: "window".to_string(),
+                panes: vec![TmuxPane {
+                    id: format!("%{pane_index}"),
+                    index: pane_index,
+                    width: 80,
+                    height: 24,
+                    active: true,
+                    current_command: "shell".to_string(),
+                    pid: 1,
+                    has_claude: false,
+                    claude_state: None,
+                    claude_activity: None,
+                    claude_state_since: None,
+                    claude_cwd: None,
+                    has_codex: false,
+                    codex_state: None,
+                    codex_activity: None,
+                    codex_state_since: None,
+                    codex_cwd: None,
+                }],
+                has_claude: false,
+                claude_state: None,
+                has_codex: false,
+                codex_state: None,
+            }],
+            ..session(name)
         }
     }
 
@@ -1650,5 +1819,105 @@ mod tests {
             state.input_char_limited('あ', SESSION_NAME_MAX_LEN);
         }
         assert_eq!(state.input_buffer.chars().count(), SESSION_NAME_MAX_LEN);
+    }
+
+    #[test]
+    fn tree_preview_scrolls_by_line_and_clamps_at_both_ends() {
+        let mut state = UIState::new(Config::default());
+        state.update_pane_content(
+            (0..10)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        state.tree_preview_scroll_up_line();
+        assert_eq!(state.tree_preview_scroll, 0);
+        state.set_tree_preview_height(4);
+
+        assert_eq!(state.tree_preview_visible_range(10), 6..10);
+        state.tree_preview_scroll_up_line();
+        assert_eq!(state.tree_preview_scroll, 1);
+        assert_eq!(state.tree_preview_visible_range(10), 5..9);
+
+        for _ in 0..20 {
+            state.tree_preview_scroll_up_line();
+        }
+        assert_eq!(state.tree_preview_scroll, 6);
+        assert_eq!(state.tree_preview_visible_range(10), 0..4);
+
+        for _ in 0..20 {
+            state.tree_preview_scroll_down_line();
+        }
+        assert_eq!(state.tree_preview_scroll, 0);
+        assert_eq!(state.tree_preview_visible_range(10), 6..10);
+    }
+
+    #[test]
+    fn tree_preview_half_page_uses_rendered_viewport_height() {
+        let mut state = UIState::new(Config::default());
+        state.update_pane_content(
+            (0..20)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        state.set_tree_preview_height(7);
+
+        state.tree_preview_scroll_up_half_page();
+        assert_eq!(state.tree_preview_scroll, 3);
+        state.tree_preview_scroll_up_half_page();
+        assert_eq!(state.tree_preview_scroll, 6);
+        state.tree_preview_scroll_down_half_page();
+        assert_eq!(state.tree_preview_scroll, 3);
+    }
+
+    #[test]
+    fn tree_preview_resets_when_refresh_changes_the_selected_pane() {
+        let mut state = UIState::new(Config::default());
+        state.groups = GroupStore::default();
+        state.update_sessions(vec![session_with_pane("session", 0)]);
+        state.update_pane_content(
+            (0..10)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        state.set_tree_preview_height(4);
+        state.tree_preview_scroll_up_half_page();
+        assert_eq!(state.tree_preview_scroll, 2);
+
+        state.update_sessions(vec![session_with_pane("session", 1)]);
+
+        assert_eq!(state.tree_preview_scroll, 0);
+        assert_eq!(
+            state.get_selected_pane_target().as_deref(),
+            Some("session:0.1")
+        );
+    }
+
+    #[test]
+    fn tree_preview_ignores_capture_for_a_previous_selection() {
+        let mut state = UIState::new(Config::default());
+        state.groups = GroupStore::default();
+        state.update_sessions(vec![
+            session_with_pane("first", 0),
+            session_with_pane("second", 1),
+        ]);
+
+        assert!(state.update_tree_preview_content("first:0.0", "first pane".to_string()));
+        state.set_tree_preview_height(1);
+        state.update_pane_content("first line\nsecond line".to_string());
+        state.tree_preview_scroll_up_line();
+        assert_eq!(state.tree_preview_scroll, 1);
+        state.tree_move_down();
+        assert_eq!(
+            state.get_selected_pane_target().as_deref(),
+            Some("second:0.1")
+        );
+        assert_eq!(state.tree_preview_scroll, 0);
+        assert!(!state.update_tree_preview_content("first:0.0", "stale".to_string()));
+        assert_eq!(state.pane_content, "first line\nsecond line");
+        assert!(state.update_tree_preview_content("second:0.1", "second pane".to_string()));
+        assert_eq!(state.pane_content, "second pane");
     }
 }

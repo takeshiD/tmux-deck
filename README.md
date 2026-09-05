@@ -1,292 +1,210 @@
-# Tmux Deck
-tmux-deck is a tmux session manager. 
-Monitoring multi session Realtime preview.
+# tmux-deck
 
+[![crates.io](https://img.shields.io/crates/v/tmux-deck.svg)](https://crates.io/crates/tmux-deck)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-# Features
-- 🗂️ Tmux Session Management(New, Rename, Kill)
-- 📄 Easy management Windows and Panes between Sessions
-- 👀 Realtime Preview
-- 🤖 Claude Code status markers (working / waiting / done) driven by hooks
-- 🛰️ Claude agent view (`d`): lists Claude Code background sessions (`claude agents`) grouped by directory — state, name, summary, PRs, elapsed. `Enter` attaches via `claude attach`, `p` toggles a preview (`v` switches transcript ↔ reconstructed screen), `s` generates an execution summary (`claude -p`)
-- ⚙️ Easy Configure
+See every tmux session before you switch.
 
-# Quick Start
+`tmux-deck` is an interactive session manager with live pane previews. Browse
+sessions, windows, and panes in one keyboard-driven view, or open a dashboard
+that monitors several sessions at once.
 
-```bash
-tmux-deck
-```
-
-![session manager](assets/tmux-deck_session_manager.png)
-
-
-## Using in tmux popup
-Add following key-bind in your `.tmux.conf`, `tmux-deck` would start up on tmux popup.
-
-```bash
-bind SPACE run-shell "tmux popup -w80% -h80% -E tmux-deck"
-```
-
-![popup](assets/tmux-deck_popup.png)
-
-# Installation
-## `cargo`
-```
-cargo install tmux-deck     # build from source
-cargo binstall tmux-deck    # prebuild-binary
-```
-
-## `nix run`
-You can try `tmux-deck` easily following.
-```
-nix run github:takeshid/tmux-deck
-```
-
-Also you can config it like following in your `.tmux.conf`.
-```bash
-bind SPACE run-shell "tmux popup -w80% -h80% -E nix run github:takeshid/tmux-deck"
-```
-
-## `flake.nix`
-if youde use flake, you can add `tmux-deck` in your flake.nix
-
-```nix
-{
-  inputs = {
-    tmux-deck.url = "github:takeshid/tmux-deck";
-  };
-  outputs = {
-    devShells = nixpkgs.lib.mkShell {
-        packages = [
-        ]
-        ++ tmux-deck.packages.x86_64-linux
-    };
-  };
-}
-```
-
-# Configuration
-
-tmux-deck is **zero-config**: it runs with sensible defaults and needs no file.
-To customise it, drop a TOML file at:
-
-```
-$XDG_CONFIG_HOME/tmux-deck/config.toml   # usually ~/.config/tmux-deck/config.toml
-```
-
-(or point at one with `tmux-deck --config <path>`). A missing or malformed file
-just falls back to the defaults, so it can never stop the app from starting. A
-fully-commented template lives at [`docs/config.example.toml`](docs/config.example.toml).
-
-```toml
-[preview]
-interval = 300            # preview refresh interval (ms); --interval overrides this
-
-[theme]
-preset = "default"        # see the table below
-[theme.colors]            # optional per-role overrides on top of the preset
-# accent = "#7dcfff"
-
-[keybindings]             # remap the main actions (chords like `za` are fixed)
-quit           = ["q", "Esc"]
-new_session    = "C-n"
-
-[hooks.claude]            # per-state markers: glyph + hex colour ("spinner" animates)
-working = { glyph = "spinner", color = "#ff8700" }
-waiting = { glyph = "◆", color = "#ff8700" }
-
-[layout]
-session_panel_width = 30  # left panel width (%); tree_split / multi_selected_ratio too
-
-[behavior]
-default_view   = "tree"   # "tree" | "multi"
-exit_on_switch = true     # exit after switching to a session
-```
-
-## Themes
-
-Set `theme.preset` to one of:
-
-| Preset       | Notes                                                         |
-| ------       | -----                                                         |
-| `default`    | The original palette (orange markers, cyan/yellow accents).   |
-| `monochrome` | Distinguished by brightness, not hue — colour-blind friendly. |
-| `dracula`    |                                                               |
-| `nord`       |                                                               |
-| `gruvbox`    |                                                               |
-| `tokyonight` |                                                               |
-| `catppuccin` | Mocha flavour.                                                |
-| `solarized`  | Dark variant.                                                 |
-| `cyberdream` |                                                               |
-| `carbonfox`  |                                                               |
-
-Theme colour values are a name (`red`, `darkgray`, `lightblue`…), a 256-colour
-index (`"208"`), or truecolor hex (`"#rrggbb"`). **Marker colours under
-`[hooks.*]` are hex codes only** (e.g. `color = "#ff8700"`).
-
-## Key bindings
-
-The status bar at the bottom of the deck always reflects your current bindings,
-so remapping (e.g. `kill_session = "C-d"`) updates the on-screen hint too.
-
-The remappable actions and their defaults:
-
-| Action    | Default    | Action           | Default |
-| ------    | -------    | ------           | ------- |
-| `quit`    | `q`, `Esc` | `new_session`    | `C-n`   |
-| `refresh` | `r`        | `rename_session` | `C-r`   |
-| `sort`    | `s`        | `kill_session`   | `C-x`   |
-| `group`   | `g`        | `enter`          | `Enter` |
-| `input`   | `i`        | `dashboard`      | `d`     |
-
-A binding is one key string or a list. Modifiers are joined with `-` (`C`/`Ctrl`,
-`S`/`Shift`, `A`/`M`/`Alt`); keys are a single character or a name (`Esc`, `Tab`,
-`Up`, `Space`, …). Navigation (`j/k/h/l`, arrows, Tab) and the `za` fold /
-double-`Space` chords are fixed for now.
-
-# Claude Code Integration
-
-tmux-deck highlights tmux entities that are running [Claude Code](https://code.claude.com).
-By default it detects the `claude` process and shows a `●`. If you also install
-the Claude **hooks**, the marker reflects what Claude is *doing* in each pane.
-States are distinguished by the marker **shape** (the colour is always the
-same), so they stay legible on any terminal palette:
-
-| Marker            | State   | Meaning                                             |
-| ------            | -----   | -------                                             |
-| `⠋⠙⠹…` (animated) | Working | A prompt was submitted / a tool is running          |
-| `◆`               | Waiting | Claude is waiting on you (permission / idle prompt) |
-| `✓`               | Done    | Claude finished its turn                            |
-| `✗`               | Error   | The turn ended with an error                        |
-| `●`               | Running | Claude process detected, no hook state yet          |
-
-Windows and sessions roll up to the most attention-worthy state of their
-children (waiting > error > working > done).
-
-## Agent view
-
-Press `d` to open the **agent view** — a full-screen list of Claude Code
-*background sessions* (the ones `claude agents` manages, started with
-`claude --bg` or `/bg`), read straight from `~/.claude/jobs`. Sessions are
-grouped by working directory, with a header summarising how many are awaiting
-input / working / completed. Each row shows the state marker, name, a one-line
-summary, any pull requests it opened, and how long since it last changed.
-
-| Key     | Action                                                              |
-| ------- | ------------------------------------------------------------------- |
-| `j`/`k` | Move the selection                                                  |
-| `Enter` | Attach to the session (`claude attach`); detach returns to the list |
-| `p`     | Toggle the preview panel for the selected session                   |
-| `v`     | Switch the preview between **transcript** and **screen** mode       |
-| `s`     | Generate an execution summary in a popup (`claude -p`, async)       |
-| `d`     | Back to the tree view                                               |
-
-The preview has two modes (default set by `[agents] preview_mode`, toggled with
-`v`):
-
-- **transcript** — the conversation reconstructed from the session's JSONL,
-  coloured by role (user / assistant / tool). Fast, no subprocess.
-- **screen** — the session's terminal screen reconstructed from `claude logs`
-  through a built-in ANSI emulator. Closer to the real display, but heavier
-  (logs are fetched in the background and throttled).
-
-The execution summary (`s`) runs `claude -p` against a transcript digest in the
-background — statelessly, so it never touches the live session — and shows a
-short bulleted summary. Both behaviours are configurable:
-
-```toml
-[agents]
-summary_model = "haiku"      # any `claude --model` value (alias or full id)
-preview_mode  = "transcript" # or "screen"
-```
-
-> The agent view reads Claude Code's own background-session state, so it needs a
-> Claude Code version that has the agent view. It is independent of the tmux
-> hook markers above.
-
-## Setup
-
-Install the hooks into Claude Code's user settings (`~/.claude/settings.json`):
-
-```bash
-tmux-deck hook install
-```
-
-Use `--project` to write to the project-local `.claude/settings.json` instead.
-The command is idempotent and preserves any existing settings.
-
-### How it works
-
-`hook install` registers `tmux-deck hook report` for the `UserPromptSubmit`,
-`PreToolUse`, `PostToolUse`, `Notification`, `Stop`, `SubagentStop` and
-`SessionEnd` events. On each event Claude runs the reporter, which records the
-calling pane's state (keyed by `$TMUX_PANE`) under
-`$XDG_STATE_HOME/tmux-deck/claude/`. The TUI reads those files on each refresh
-and updates the markers. Stale files are cleaned up automatically, and nothing
-is shown for panes that never ran Claude — so the integration is entirely
-opt-in.
-
-# Comparison with Similar Project
-
-`tmux-deck` takes a different approach compared to other tmux session managers.
-
-| Feature                     | tmux-deck            | tmuxinator         | tmuxp                   |
-| ---------                   | -----------          | ------------       | -------                 |
-| **Language**                | Rust                 | Ruby               | Python                  |
-| **Interface**               | TUI (Interactive)    | CLI                | CLI                     |
-| **Realtime Preview**        | ✅                   | ❌                 | ❌                      |
-| **Multi-session Preview**   | ✅                   | ❌                 | ❌                      |
-| **Runtime Dependencies**    | None (single binary) | Ruby runtime       | Python runtime          |
-| **Configuration Format**    | TOML                 | YAML               | YAML/JSON               |
-| **Session Definition**      | Interactive          | Declarative (YAML) | Declarative (YAML/JSON) |
-| **Save/Restore Sessions**   | Planned              | ✅                 | ✅                      |
-| **Freeze Existing Session** | -                    | ✅                 | ✅                      |
+![tmux-deck demo](assets/tmux-deck-demo.gif)
 
 ## Why tmux-deck?
 
-### 🔴 Realtime Preview
-The most distinctive feature of tmux-deck. Preview the actual content of all your tmux sessions in real-time. No more blindly switching between sessions.
+- **Live previews** — inspect the current contents of a pane without switching
+  away from your work.
+- **Multi-session view** — monitor windows across several sessions on one
+  screen.
+- **Interactive management** — create, rename, group, sort, and kill sessions
+  from the TUI.
+- **Zero configuration** — sensible defaults work immediately; themes, layout,
+  refresh rate, and key bindings remain configurable.
+- **Optional coding-agent awareness** — show working, waiting, done, and error
+  markers for Claude Code and Codex panes, plus a Claude background-agent view.
 
-### 🚀 Zero Configuration
-Start using immediately without writing any configuration files. Just run `tmux-deck` and manage your sessions visually.
+`tmux-deck` is distributed as a Rust binary and requires a working `tmux`
+installation.
 
-### 📦 Single Binary
-No runtime dependencies. No Ruby, no Python, no gem/pip packages. Just download and run.
+## Install
 
-### 🎯 Interactive TUI
-Visual tree structure of sessions, windows, and panes. Navigate with keyboard shortcuts and see changes instantly.
+### Cargo
 
-### ⚡ Fast & Lightweight
-Written in Rust for maximum performance and minimal resource usage.
+```bash
+cargo install tmux-deck
+tmux-deck
+```
 
+### Nix
 
-## When to use others?
+Try the latest revision without installing it:
 
-- **tmuxinator/tmuxp**: When you need declarative session definitions that can be version-controlled and shared across teams. Ideal for reproducible development environments.
-- **tmux-deck**: When you need real-time visibility into multiple sessions and prefer interactive management over configuration files.
+```bash
+nix run github:takeshiD/tmux-deck
+```
 
-# Status
-- [x] Session Management(New, Rename, Kill)
-    - [x] Realtime Preview
-    - [ ] Search and Filtering(fuzzy find)
-    - [ ] Saving and Restoring sessions
-    - [ ] Sort
-        - [x] Most Recently Used
-        - [x] Alphabet
-        - [ ] Pinning
-- [x] Multi Preview
-    - [x] Injection command to pane
-    - [x] Zoom preview
-    - [ ] Pinning
-- [x] Configure (TOML, XDG `~/.config/tmux-deck/config.toml`)
-    - [x] Keybinding
-    - [x] Layout
-    - [x] Color Theme
-- Misc
-    - [x] LLM Integration
-        - [x] Claude Code status markers via hooks
-    - [x] Installation for nix
+## Use it as a tmux popup
 
-# License
-MIT License.
-See [LICENSE](LICENSE).
+Add this binding to `~/.tmux.conf`, then press `prefix + Space`:
+
+```tmux
+bind-key Space display-popup -w 80% -h 80% -E tmux-deck
+```
+
+If you prefer the Nix command:
+
+```tmux
+bind-key Space display-popup -w 80% -h 80% -E \
+  'nix run github:takeshiD/tmux-deck'
+```
+
+| Full session manager | tmux popup |
+| --- | --- |
+| <img src="assets/tmux-deck-session-manager.png" alt="tmux-deck session manager with a live API pane preview" width="600"> | <img src="assets/tmux-deck-popup.png" alt="tmux-deck running inside a tmux popup" width="600"> |
+
+## Essential keys
+
+The status bar always reflects your configured bindings.
+
+| Key | Action | Key | Action |
+| --- | --- | --- | --- |
+| `j` / `k` or arrows | Move | `Tab` / `Shift+Tab` | Change panel |
+| `Enter` | Switch to selection | `Space` twice | Toggle tree/multi preview |
+| `s` | Cycle sort order | `g` | Assign a session group |
+| `za` | Fold/unfold a group | `i` | Send input to a pane |
+| `Ctrl+n` | New session | `Ctrl+r` | Rename session |
+| `Ctrl+x` | Kill session | `q` / `Esc` | Quit |
+| `d` | Toggle agent view | `r` | Refresh |
+| `Ctrl+d` / `Ctrl+u` | Scroll preview half-page down/up | `Ctrl+j` / `Ctrl+k` | Scroll preview one line down/up |
+
+Preview scrolling applies to TreeView. Moving to another pane returns its
+preview to the live tail; all four bindings can be changed in the configuration.
+
+## Configuration
+
+Configuration is optional. Put a TOML file at:
+
+```text
+$XDG_CONFIG_HOME/tmux-deck/config.toml
+```
+
+This is usually `~/.config/tmux-deck/config.toml`. You can also pass a file
+with `tmux-deck --config <path>`. A missing or malformed file falls back to the
+defaults.
+
+```toml
+[preview]
+interval = 300
+
+[theme]
+preset = "tokyonight"
+
+[layout]
+session_panel_width = 30
+tree_split = [30, 35, 35]
+multi_selected_ratio = 70
+
+[behavior]
+default_view = "tree"       # "tree" or "multi"
+default_sort = "recent"     # "recent", "recent_asc", "abc", "abc_asc"
+exit_on_switch = true
+
+[keybindings]
+quit = ["q", "Esc"]
+new_session = "C-n"
+preview_half_page_down = "C-d"
+preview_half_page_up = "C-u"
+preview_line_down = "C-j"
+preview_line_up = "C-k"
+```
+
+See the fully commented [configuration reference](docs/config.example.toml)
+for every setting and semantic colour role.
+
+### Themes
+
+The built-in presets are `default`, `monochrome`, `dracula`, `nord`,
+`gruvbox`, `tokyonight`, `catppuccin`, `solarized`, `cyberdream`, and
+`carbonfox`. Individual semantic colours can be overridden with named colours,
+256-colour indexes, or `#rrggbb` values.
+
+## Advanced: coding-agent integration
+
+tmux-deck can identify panes running Claude Code or
+[Codex](https://learn.chatgpt.com/docs/hooks) and display a `●` marker.
+Installing the optional lifecycle hooks makes the marker reflect the pane's
+current state. Claude markers are orange by default; Codex markers are blue.
+When both are present on one node, the Claude marker is shown first.
+
+| Marker | State | Meaning |
+| --- | --- | --- |
+| `⠋⠙⠹…` | Working | A prompt or tool is running |
+| `◆` | Waiting | The agent is waiting for input or permission |
+| `✓` | Done | The turn completed |
+| `✗` | Error | The turn ended with an error |
+| `●` | Running | An agent is detected without hook state |
+
+Install either integration in your user settings:
+
+```bash
+tmux-deck hook install          # ~/.claude/settings.json
+tmux-deck hook install --codex  # ~/.codex/hooks.json
+```
+
+Add `--project` for project-local settings (`.claude/settings.json` or
+`.codex/hooks.json`). The installer is idempotent and preserves existing
+hooks. User-global installs respect `CLAUDE_CONFIG_DIR` and `CODEX_HOME` when
+set. Codex requires newly installed hooks to be reviewed and trusted with
+`/hooks` before first use.
+
+### Agent view
+
+Press `d` to open a full-screen view of Claude Code background sessions. It
+reads the sessions managed by `claude agents` and groups them by working
+directory.
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Select an agent session |
+| `Enter` | Attach with `claude attach` |
+| `p` | Toggle the preview panel |
+| `v` | Toggle transcript/screen preview |
+| `s` | Generate an execution summary |
+| `d` | Return to the tmux tree |
+
+The agent view needs a Claude Code version that provides background sessions.
+The tmux pane markers and the agent view are independent features.
+
+## How it differs
+
+tmux-deck focuses on interactively inspecting and managing sessions that are
+running now. Tools such as tmuxinator and tmuxp focus on declaratively defining,
+sharing, and restoring session layouts. Use tmux-deck for live visibility; use
+a declarative manager when reproducible session setup is the primary goal.
+
+## Development
+
+Run the Rust checks:
+
+```bash
+cargo test --all --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+```
+
+Regenerate the README demo and screenshots:
+
+```bash
+nix run .#demo
+```
+
+The demo command starts an isolated tmux server with synthetic sessions. It
+does not read from or modify your current tmux server. The VHS tapes and fixture
+live in [`demo/`](demo/).
+
+Contributor documentation will be maintained separately from this user-facing
+README.
+
+## License
+
+[MIT](LICENSE)

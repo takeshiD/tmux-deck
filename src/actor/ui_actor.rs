@@ -150,10 +150,10 @@ impl UIActor {
                 Some(event) = self.ui_event_rx.recv() => {
                     match event {
                         UIEvent::Tick => {
-                            // Cheap, local: fold the latest Claude hook states
-                            // into the tree so markers stay live between full
-                            // tmux refreshes.
-                            self.state.refresh_claude_states();
+                            // Cheap, local: fold the latest coding-agent hook
+                            // states into the tree so markers stay live between
+                            // full tmux refreshes.
+                            self.state.refresh_agent_states();
 
                             match self.state.view_mode {
                                 // TreeView captures the selected pane for its preview.
@@ -186,7 +186,7 @@ impl UIActor {
 
                 // Spinner animation tick: only redraw if a spinner is active.
                 _ = anim.tick() => {
-                    redraw = self.state.has_working_claude();
+                    redraw = self.state.has_working_agent();
                 }
             }
 
@@ -438,6 +438,18 @@ impl UIActor {
                     self.state.open_kill_session_popup();
                     self.refresh_control.pause();
                 }
+                Action::PreviewHalfPageDown if self.state.view_mode == ViewMode::TreeView => {
+                    self.state.tree_preview_scroll_down_half_page();
+                }
+                Action::PreviewHalfPageUp if self.state.view_mode == ViewMode::TreeView => {
+                    self.state.tree_preview_scroll_up_half_page();
+                }
+                Action::PreviewLineDown if self.state.view_mode == ViewMode::TreeView => {
+                    self.state.tree_preview_scroll_down_line();
+                }
+                Action::PreviewLineUp if self.state.view_mode == ViewMode::TreeView => {
+                    self.state.tree_preview_scroll_up_line();
+                }
                 Action::Enter if self.state.view_mode == ViewMode::Dashboard => {
                     // Attach to the selected background session. The UI loop
                     // consumes `pending_attach` to run `claude attach <id>`.
@@ -461,6 +473,17 @@ impl UIActor {
                     }
                 }
                 Action::Dashboard => self.state.toggle_dashboard(),
+                Action::PreviewHalfPageDown
+                | Action::PreviewHalfPageUp
+                | Action::PreviewLineDown
+                | Action::PreviewLineUp => {
+                    // A preview binding remapped to a plain navigation key
+                    // remains usable in views where preview scrolling is not
+                    // available.
+                    if !is_ctrl {
+                        self.handle_navigation_key(key.code);
+                    }
+                }
                 // Context-gated actions whose gate is not satisfied fall through
                 // to navigation so the key is not swallowed.
                 Action::Sort | Action::Group => {
@@ -646,8 +669,8 @@ impl UIActor {
             TmuxResponse::SessionsRefreshed { sessions } => {
                 self.state.update_sessions(sessions);
             }
-            TmuxResponse::PaneCaptured { target: _, content } => {
-                self.state.update_pane_content(content);
+            TmuxResponse::PaneCaptured { target, content } => {
+                self.state.update_tree_preview_content(&target, content);
             }
             TmuxResponse::SessionCreated {
                 name,

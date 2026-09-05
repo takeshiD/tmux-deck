@@ -5,13 +5,13 @@ use ratatui::{
 
 use crate::agents::{self, AgentSession, AgentState};
 use crate::app::{
-    ClaudeState, Focus, InputMode, PopupMode, SessionRow, TmuxPane, TmuxWindow, UIState,
+    Focus, HookState, InputMode, PopupMode, SessionRow, TmuxPane, TmuxWindow, UIState,
     UNGROUPED_LABEL, ViewMode,
 };
-use crate::config::{Action, MarkerSet, Theme};
+use crate::config::{Action, HooksConfig, MarkerSet, Theme};
 
 /// Braille "dots" spinner frames (cli-spinners `dots`). Rendered for a marker
-/// configured as `"spinner"` (the default `Working` Claude state) so it
+/// configured as `"spinner"` (the default `Working` agent state) so it
 /// visibly animates.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Milliseconds each spinner frame is shown.
@@ -32,22 +32,22 @@ fn spinner_frame() -> &'static str {
 }
 
 /// The marker glyph + colour to show for a node, given its hook state and
-/// whether a claude process was detected. The glyph and colour come from the
+/// whether an agent process was detected. The glyph and colour come from the
 /// user-configurable [`MarkerSet`]; a marker configured as `"spinner"` animates.
-/// Hook state wins, otherwise we fall back to the plain "claude is running"
+/// Hook state wins, otherwise we fall back to the plain "agent is running"
 /// marker so behaviour is unchanged when hooks are not installed. Returns
 /// `None` when there is nothing to show.
-fn claude_marker(
+fn hook_marker(
     markers: &MarkerSet,
-    state: Option<ClaudeState>,
-    has_claude: bool,
+    state: Option<HookState>,
+    process_running: bool,
 ) -> Option<(String, Color)> {
     let marker = match state {
-        Some(ClaudeState::Working) => &markers.working,
-        Some(ClaudeState::Waiting) => &markers.waiting,
-        Some(ClaudeState::Done) => &markers.done,
-        Some(ClaudeState::Error) => &markers.error,
-        None if has_claude => &markers.running,
+        Some(HookState::Working) => &markers.working,
+        Some(HookState::Waiting) => &markers.waiting,
+        Some(HookState::Done) => &markers.done,
+        Some(HookState::Error) => &markers.error,
+        None if process_running => &markers.running,
         None => return None,
     };
     let glyph = if marker.animated {
@@ -58,14 +58,42 @@ fn claude_marker(
     Some((glyph, marker.color))
 }
 
-/// Border accent colour for a node that is running claude (any state). The
-/// border only signals presence; it reuses the marker's colour for that state.
-fn claude_border_color(
-    markers: &MarkerSet,
-    state: Option<ClaudeState>,
+/// Markers for every coding agent detected on a node.
+fn coding_agent_markers(
+    hooks: &HooksConfig,
+    claude_state: Option<HookState>,
     has_claude: bool,
+    codex_state: Option<HookState>,
+    has_codex: bool,
+) -> Vec<(String, Color)> {
+    [
+        hook_marker(&hooks.claude, claude_state, has_claude),
+        hook_marker(&hooks.codex, codex_state, has_codex),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn coding_agent_border_color(
+    hooks: &HooksConfig,
+    claude_state: Option<HookState>,
+    has_claude: bool,
+    codex_state: Option<HookState>,
+    has_codex: bool,
 ) -> Option<Color> {
-    claude_marker(markers, state, has_claude).map(|(_, color)| color)
+    let mut candidates = [
+        (claude_state, has_claude, &hooks.claude),
+        (codex_state, has_codex, &hooks.codex),
+    ];
+    candidates.sort_by_key(|(state, running, _)| {
+        state.map(HookState::priority).unwrap_or(u8::from(*running))
+    });
+    candidates
+        .into_iter()
+        .rev()
+        .find_map(|(state, running, markers)| hook_marker(markers, state, running))
+        .map(|(_, color)| color)
 }
 
 // =============================================================================
@@ -204,9 +232,13 @@ fn render_sessions_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
                 } else {
                     session.name.clone()
                 })];
-                if let Some((sym, color)) =
-                    claude_marker(&state.hooks.claude, session.claude_state, session.has_claude)
-                {
+                for (sym, color) in coding_agent_markers(
+                    &state.hooks,
+                    session.claude_state,
+                    session.has_claude,
+                    session.codex_state,
+                    session.has_codex,
+                ) {
                     spans.push(Span::styled(
                         format!(" {}", sym),
                         Style::default().fg(color),
@@ -264,9 +296,13 @@ fn render_windows_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
                 Style::default()
             };
             let mut spans = vec![Span::raw(format!("{}:{}", window.index, window.name))];
-            if let Some((sym, color)) =
-                claude_marker(&state.hooks.claude, window.claude_state, window.has_claude)
-            {
+            for (sym, color) in coding_agent_markers(
+                &state.hooks,
+                window.claude_state,
+                window.has_claude,
+                window.codex_state,
+                window.has_codex,
+            ) {
                 spans.push(Span::styled(
                     format!(" {}", sym),
                     Style::default().fg(color),
@@ -325,9 +361,13 @@ fn render_panes_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
                 "{}:{} [{}]",
                 pane.index, pane.id, pane.current_command
             ))];
-            if let Some((sym, color)) =
-                claude_marker(&state.hooks.claude, pane.claude_state, pane.has_claude)
-            {
+            for (sym, color) in coding_agent_markers(
+                &state.hooks,
+                pane.claude_state,
+                pane.has_claude,
+                pane.codex_state,
+                pane.has_codex,
+            ) {
                 spans.push(Span::styled(
                     format!(" {}", sym),
                     Style::default().fg(color),
@@ -357,7 +397,7 @@ fn render_panes_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state.pane_list_state);
 }
 
-fn render_pane_preview_tree(frame: &mut Frame, state: &UIState, area: Rect) {
+fn render_pane_preview_tree(frame: &mut Frame, state: &mut UIState, area: Rect) {
     let title = state
         .get_selected_pane_target()
         .map(|t| format!(" Preview: {} ", t))
@@ -370,21 +410,16 @@ fn render_pane_preview_tree(frame: &mut Frame, state: &UIState, area: Rect) {
 
     let inner = block.inner(area);
     let max_lines = inner.height as usize;
+    state.set_tree_preview_height(max_lines);
 
     // Use cached parsed Text (rebuilt only when pane_content changes).
     let text = if let Some(parsed) = state.pane_content_parsed.as_ref() {
-        if parsed.lines.len() > max_lines {
-            let start = parsed.lines.len().saturating_sub(max_lines);
-            Text::from(parsed.lines[start..].to_vec())
-        } else {
-            parsed.clone()
-        }
+        let range = state.tree_preview_visible_range(parsed.lines.len());
+        Text::from(parsed.lines[range].to_vec())
     } else {
-        let mut raw: Vec<&str> = state.pane_content.lines().collect();
-        if raw.len() > max_lines {
-            raw = raw[raw.len().saturating_sub(max_lines)..].to_vec();
-        }
-        Text::raw(raw.join("\n"))
+        let raw: Vec<&str> = state.pane_content.lines().collect();
+        let range = state.tree_preview_visible_range(raw.len());
+        Text::raw(raw[range].join("\n"))
     };
 
     let paragraph = Paragraph::new(text).block(block);
@@ -400,13 +435,31 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
         )])
     } else {
         let kb = &state.keybindings;
-        // `j/k`, `Tab`, `za` and `Space×2` are fixed (not remappable); the rest
-        // reflect the user's key bindings so the hint bar always stays accurate.
+        // Tree navigation, `Tab`, `za` and `Space×2` are fixed; the rest reflect
+        // the user's key bindings so the hint bar stays accurate after remaps.
         Line::from(vec![
             Span::styled("j/k", Style::default().fg(theme.focus_border)),
             Span::raw(":move "),
             Span::styled("Tab", Style::default().fg(theme.focus_border)),
             Span::raw(":focus "),
+            Span::styled(
+                format!(
+                    "{}/{}",
+                    kb.label(Action::PreviewHalfPageDown),
+                    kb.label(Action::PreviewHalfPageUp)
+                ),
+                Style::default().fg(theme.accent),
+            ),
+            Span::raw(":½page "),
+            Span::styled(
+                format!(
+                    "{}/{}",
+                    kb.label(Action::PreviewLineDown),
+                    kb.label(Action::PreviewLineUp)
+                ),
+                Style::default().fg(theme.accent),
+            ),
+            Span::raw(":scroll "),
             Span::styled(kb.label(Action::Sort), Style::default().fg(theme.focus_border)),
             Span::raw(":sort "),
             Span::styled(kb.label(Action::Group), Style::default().fg(theme.focus_border)),
@@ -451,14 +504,14 @@ fn format_elapsed(secs: i64) -> String {
 /// configured Claude marker set.
 fn agent_marker(markers: &MarkerSet, state: AgentState, theme: &Theme) -> (String, Color) {
     let mapped = match state {
-        AgentState::Blocked => Some(ClaudeState::Waiting),
-        AgentState::Working => Some(ClaudeState::Working),
-        AgentState::Done => Some(ClaudeState::Done),
-        AgentState::Failed => Some(ClaudeState::Error),
+        AgentState::Blocked => Some(HookState::Waiting),
+        AgentState::Working => Some(HookState::Working),
+        AgentState::Done => Some(HookState::Done),
+        AgentState::Failed => Some(HookState::Error),
         AgentState::Idle | AgentState::Stopped | AgentState::Unknown => None,
     };
     let has_claude = matches!(state, AgentState::Idle);
-    claude_marker(markers, mapped, has_claude)
+    hook_marker(markers, mapped, has_claude)
         .unwrap_or_else(|| ("∙".to_string(), theme.unfocus_border))
 }
 
@@ -774,18 +827,26 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
             // session (selection colour wins so focus is never lost).
             let session_border_style = if is_selected_session {
                 Style::default().fg(theme.focus_border).add_modifier(Modifier::BOLD)
-            } else if let Some(color) =
-                claude_border_color(&state.hooks.claude, session.claude_state, session.has_claude)
-            {
+            } else if let Some(color) = coding_agent_border_color(
+                &state.hooks,
+                session.claude_state,
+                session.has_claude,
+                session.codex_state,
+                session.has_codex,
+            ) {
                 Style::default().fg(color)
             } else {
                 Style::default().fg(theme.unfocus_border)
             };
 
             let mut title_spans = vec![Span::raw(format!(" {} ", session.name))];
-            if let Some((sym, color)) =
-                claude_marker(&state.hooks.claude, session.claude_state, session.has_claude)
-            {
+            for (sym, color) in coding_agent_markers(
+                &state.hooks,
+                session.claude_state,
+                session.has_claude,
+                session.codex_state,
+                session.has_codex,
+            ) {
                 title_spans.push(Span::styled(
                     format!("{} ", sym),
                     Style::default().fg(color),
@@ -825,7 +886,7 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
                 render_window_preview(
                     frame,
                     &state.theme,
-                    &state.hooks.claude,
+                    &state.hooks,
                     window,
                     *window_area,
                     is_selected_window,
@@ -878,7 +939,7 @@ fn render_multi_preview(frame: &mut Frame, state: &UIState) {
 fn render_window_preview(
     frame: &mut Frame,
     theme: &Theme,
-    markers: &MarkerSet,
+    hooks: &HooksConfig,
     window: &TmuxWindow,
     area: Rect,
     is_selected: bool,
@@ -887,7 +948,13 @@ fn render_window_preview(
         Style::default()
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD)
-    } else if let Some(color) = claude_border_color(markers, window.claude_state, window.has_claude) {
+    } else if let Some(color) = coding_agent_border_color(
+        hooks,
+        window.claude_state,
+        window.has_claude,
+        window.codex_state,
+        window.has_codex,
+    ) {
         Style::default().fg(color)
     } else {
         Style::default().fg(theme.unfocus_border)
@@ -902,7 +969,13 @@ fn render_window_preview(
         " {}:{} [{}] ",
         window.index, window.name, cmd
     ))];
-    if let Some((sym, color)) = claude_marker(markers, window.claude_state, window.has_claude) {
+    for (sym, color) in coding_agent_markers(
+        hooks,
+        window.claude_state,
+        window.has_claude,
+        window.codex_state,
+        window.has_codex,
+    ) {
         title_spans.push(Span::styled(
             format!("{} ", sym),
             Style::default().fg(color),
@@ -1218,6 +1291,51 @@ mod cursor_alignment_tests {
         assert_eq!(format_elapsed(3600), "1h");
     }
 
+    #[test]
+    fn simultaneous_agents_render_both_markers_in_stable_order() {
+        let hooks = HooksConfig::default();
+        let markers = coding_agent_markers(
+            &hooks,
+            Some(HookState::Done),
+            true,
+            Some(HookState::Waiting),
+            true,
+        );
+
+        assert_eq!(
+            markers,
+            vec![
+                ("✓".to_string(), Color::Rgb(0xff, 0x87, 0x00)),
+                ("◆".to_string(), Color::Rgb(0x5f, 0xaf, 0xff)),
+            ]
+        );
+    }
+
+    #[test]
+    fn simultaneous_agent_border_prefers_attention_then_codex_on_ties() {
+        let hooks = HooksConfig::default();
+        assert_eq!(
+            coding_agent_border_color(
+                &hooks,
+                Some(HookState::Error),
+                true,
+                Some(HookState::Waiting),
+                true,
+            ),
+            Some(Color::Rgb(0x5f, 0xaf, 0xff))
+        );
+        assert_eq!(
+            coding_agent_border_color(
+                &hooks,
+                Some(HookState::Working),
+                true,
+                Some(HookState::Working),
+                true,
+            ),
+            Some(Color::Rgb(0x5f, 0xaf, 0xff))
+        );
+    }
+
     /// 白背景（カーソルブロック）のセルの (x, y) を返す。
     fn cursor_cell(buf: &ratatui::buffer::Buffer) -> Option<(u16, u16)> {
         for y in 0..buf.area.height {
@@ -1304,5 +1422,63 @@ mod cursor_alignment_tests {
         state.agent_summary_open = true;
         state.set_summary_pending("a1".to_string());
         term.draw(|f| render_ui(f, &mut state)).unwrap();
+    }
+
+    #[test]
+    fn tree_preview_scroll_renders_wide_unicode_lines() {
+        let mut state = UIState::new(crate::config::Config::default());
+        state.update_pane_content(
+            (0..7)
+                .map(|n| format!("line {n} 日本🙂"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let mut term = Terminal::new(TestBackend::new(24, 6)).unwrap();
+        term.draw(|frame| {
+            let area = frame.area();
+            render_pane_preview_tree(frame, &mut state, area);
+        })
+        .unwrap();
+        state.tree_preview_scroll_up_line();
+        term.draw(|frame| {
+            let area = frame.area();
+            render_pane_preview_tree(frame, &mut state, area);
+        })
+        .unwrap();
+
+        let symbols: Vec<&str> = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let rendered = symbols.concat();
+        assert!(rendered.contains("line 2"));
+        assert!(!rendered.contains("line 6"));
+        assert!(symbols.contains(&"日"));
+        assert!(symbols.contains(&"本"));
+        assert!(symbols.contains(&"🙂"));
+    }
+
+    #[test]
+    fn tree_view_handles_narrow_terminals_and_wide_key_labels() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+            [keybindings]
+            preview_half_page_down = "界"
+            preview_half_page_up = "🙂"
+            preview_line_down = "C-j"
+            preview_line_up = "C-k"
+            "#,
+        )
+        .unwrap();
+        let mut state = UIState::new(config);
+        state.update_pane_content("日本語🙂\ncombining: e\u{301}".to_string());
+
+        for (width, height) in [(1, 1), (10, 3), (40, 10)] {
+            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+            term.draw(|frame| render_ui(frame, &mut state)).unwrap();
+        }
     }
 }
