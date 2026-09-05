@@ -41,6 +41,7 @@ pub struct Config {
     pub layout: LayoutConfig,
     pub behavior: BehaviorConfig,
     pub agents: AgentsConfig,
+    pub agent_monitor: AgentMonitorConfig,
 }
 
 impl Config {
@@ -110,12 +111,11 @@ pub struct PreviewConfig {
 #[serde(default)]
 pub struct AgentsConfig {
     /// Model passed to `claude -p` when generating an execution summary for the
-    /// selected background session (agent view, `s`). Accepts a `claude`
+    /// selected Claude background session (`s`). Accepts a `claude`
     /// `--model` value such as an alias (`haiku`, `sonnet`, `opus`) or a full id.
     pub summary_model: String,
-    /// Default preview mode in the agent view: `transcript` (reconstructed
-    /// conversation) or `screen` (reconstructed terminal screen via
-    /// `claude logs`). Toggle at runtime with `v`.
+    /// Default Claude preview mode: `transcript` (reconstructed conversation)
+    /// or `screen` (reconstructed terminal screen via `claude logs`).
     pub preview_mode: String,
 }
 
@@ -129,17 +129,37 @@ impl Default for AgentsConfig {
 }
 
 // =============================================================================
+// [agent_monitor]
+// =============================================================================
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AgentMonitorConfig {
+    /// How long a completed turn remains visible in Agent Monitor.
+    pub completed_retention_secs: u64,
+}
+
+impl Default for AgentMonitorConfig {
+    fn default() -> Self {
+        Self {
+            completed_retention_secs: 600,
+        }
+    }
+}
+
+// =============================================================================
 // [behavior]
 // =============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct BehaviorConfig {
-    /// View shown on startup: `tree` or `multi`.
+    /// View shown on startup: `tree`, `agent_monitor`, or the legacy `multi` alias.
     pub default_view: String,
     /// Initial session sort: `recent`, `recent_asc`, `abc`, `abc_asc`.
     pub default_sort: String,
-    /// Window (ms) within which a second Space press toggles the view mode.
+    /// Legacy setting retained for configuration compatibility. Double-Space
+    /// no longer changes views; use the configurable Agent Monitor action.
     pub double_space_ms: u64,
     /// Whether selecting a session/window (Enter) exits tmux-deck after the
     /// tmux client switch. When false, the deck stays open.
@@ -160,7 +180,9 @@ impl Default for BehaviorConfig {
 impl BehaviorConfig {
     pub fn view_mode(&self) -> ViewMode {
         match self.default_view.to_ascii_lowercase().as_str() {
-            "multi" | "multipreview" => ViewMode::MultiPreview,
+            "agent_monitor" | "agent-monitor" | "multi" | "multipreview" => {
+                ViewMode::AgentMonitor
+            }
             _ => ViewMode::TreeView,
         }
     }
@@ -201,8 +223,7 @@ pub struct LayoutConfig {
     /// Vertical split of the left panel into Sessions / Windows / Panes, as
     /// three percentages.
     pub tree_split: [u16; 3],
-    /// In MultiPreview, the width percentage given to the selected session; the
-    /// remaining sessions share what's left.
+    /// Legacy MultiPreview ratio retained so existing configuration still loads.
     pub multi_selected_ratio: u16,
 }
 
@@ -633,8 +654,8 @@ impl Marker {
 // [keybindings]
 // =============================================================================
 
-/// A remappable user action. Tree navigation (j/k/h/l/arrows/Tab) and chords
-/// (`za` fold, double-Space) are intentionally not remappable yet.
+/// A remappable user action. Navigation (j/k/h/l/arrows/Tab) and the `za`
+/// fold chord are intentionally not remappable yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Quit,
@@ -646,7 +667,9 @@ pub enum Action {
     NewSession,
     RenameSession,
     KillSession,
-    /// Toggle the fleet dashboard (all Claude panes, sorted by attention).
+    /// Toggle Sessions and Agent Monitor. From Background Agents, opens Agent Monitor.
+    AgentMonitor,
+    /// Toggle Background Agents (non-pane Claude sessions).
     Dashboard,
     /// Scroll the TreeView pane preview down by half a page.
     PreviewHalfPageDown,
@@ -680,6 +703,8 @@ pub struct KeyBindings {
     #[serde(deserialize_with = "de_keys")]
     pub kill_session: Vec<KeySpec>,
     #[serde(deserialize_with = "de_keys")]
+    pub agent_monitor: Vec<KeySpec>,
+    #[serde(deserialize_with = "de_keys")]
     pub dashboard: Vec<KeySpec>,
     #[serde(deserialize_with = "de_keys")]
     pub preview_half_page_down: Vec<KeySpec>,
@@ -704,6 +729,7 @@ impl Default for KeyBindings {
             new_session: vec![ctrl('n')],
             rename_session: vec![ctrl('r')],
             kill_session: vec![ctrl('x')],
+            agent_monitor: vec![key('m')],
             dashboard: vec![key('d')],
             preview_half_page_down: vec![ctrl('d')],
             preview_half_page_up: vec![ctrl('u')],
@@ -716,7 +742,7 @@ impl Default for KeyBindings {
 impl KeyBindings {
     /// Pairs of (action, bindings) in match priority order. Modifier-bearing
     /// bindings (e.g. `C-r`) are listed so they win over the plain `r` refresh.
-    fn entries(&self) -> [(Action, &Vec<KeySpec>); 14] {
+    fn entries(&self) -> [(Action, &Vec<KeySpec>); 15] {
         [
             (Action::PreviewHalfPageDown, &self.preview_half_page_down),
             (Action::PreviewHalfPageUp, &self.preview_half_page_up),
@@ -725,6 +751,7 @@ impl KeyBindings {
             (Action::NewSession, &self.new_session),
             (Action::RenameSession, &self.rename_session),
             (Action::KillSession, &self.kill_session),
+            (Action::AgentMonitor, &self.agent_monitor),
             (Action::Quit, &self.quit),
             (Action::Refresh, &self.refresh),
             (Action::Sort, &self.sort),
@@ -954,6 +981,7 @@ mod tests {
         assert_eq!(cfg.behavior.double_space_ms, 300);
         assert!(cfg.behavior.exit_on_switch);
         assert_eq!(cfg.layout.session_panel_width, 30);
+        assert_eq!(cfg.agent_monitor.completed_retention_secs, 600);
         // Default markers match the historical glyphs.
         assert_eq!(cfg.hooks.claude.done.glyph, "✓");
         assert!(cfg.hooks.claude.working.animated);
@@ -1048,6 +1076,8 @@ mod tests {
         let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
         assert_eq!(kb.action_for(&plain_r), Some(Action::Refresh));
         assert_eq!(kb.action_for(&ctrl_r), Some(Action::RenameSession));
+        let m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+        assert_eq!(kb.action_for(&m), Some(Action::AgentMonitor));
         let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(kb.action_for(&j), None);
         let ctrl_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
@@ -1112,8 +1142,14 @@ mod tests {
             default_sort: "abc".to_string(),
             ..BehaviorConfig::default()
         };
-        assert_eq!(b.view_mode(), ViewMode::MultiPreview);
+        assert_eq!(b.view_mode(), ViewMode::AgentMonitor);
         assert_eq!(b.session_sort().key, SessionSortKey::Alphabet);
         assert_eq!(b.session_sort().direction, SortDirection::Desc);
+
+        let explicit = BehaviorConfig {
+            default_view: "agent_monitor".to_string(),
+            ..BehaviorConfig::default()
+        };
+        assert_eq!(explicit.view_mode(), ViewMode::AgentMonitor);
     }
 }

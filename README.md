@@ -70,12 +70,12 @@ The status bar always reflects your configured bindings.
 | Key | Action | Key | Action |
 | --- | --- | --- | --- |
 | `j` / `k` or arrows | Move | `Tab` / `Shift+Tab` | Change panel |
-| `Enter` | Switch to selection | `Space` twice | Toggle tree/multi preview |
+| `Enter` | Switch to selection | `m` | Toggle Sessions/Agent Monitor |
 | `s` | Cycle sort order | `g` | Assign a session group |
 | `za` | Fold/unfold a group | `i` | Send input to a pane |
 | `Ctrl+n` | New session | `Ctrl+r` | Rename session |
 | `Ctrl+x` | Kill session | `q` / `Esc` | Quit |
-| `d` | Toggle agent view | `r` | Refresh |
+| `d` | Toggle Background Agents | `r` | Refresh |
 | `Ctrl+d` / `Ctrl+u` | Scroll preview half-page down/up | `Ctrl+j` / `Ctrl+k` | Scroll preview one line down/up |
 
 Preview scrolling applies to TreeView. Moving to another pane returns its
@@ -103,16 +103,19 @@ preset = "tokyonight"
 [layout]
 session_panel_width = 30
 tree_split = [30, 35, 35]
-multi_selected_ratio = 70
+
+[agent_monitor]
+completed_retention_secs = 600
 
 [behavior]
-default_view = "tree"       # "tree" or "multi"
+default_view = "tree"       # "tree" or "agent_monitor" (legacy "multi" works)
 default_sort = "recent"     # "recent", "recent_asc", "abc", "abc_asc"
 exit_on_switch = true
 
 [keybindings]
 quit = ["q", "Esc"]
 new_session = "C-n"
+agent_monitor = "m"
 preview_half_page_down = "C-d"
 preview_half_page_up = "C-u"
 preview_line_down = "C-j"
@@ -158,23 +161,45 @@ hooks. User-global installs respect `CLAUDE_CONFIG_DIR` and `CODEX_HOME` when
 set. Codex requires newly installed hooks to be reviewed and trusted with
 `/hooks` before first use.
 
-### Agent view
+### Agent Monitor
 
-Press `d` to open a full-screen view of Claude Code background sessions. It
-reads the sessions managed by `claude agents` and groups them by working
-directory.
+Press `m` to monitor every tmux pane running Claude Code or Codex. `Tab`
+switches between an attention-first queue and a stable overview. The overview
+adapts between live cards, a selected live preview with summarized peers, and
+a virtual summary list based on the terminal size and agent count.
+
+| Key | Action |
+| --- | --- |
+| `Tab` | Switch Attention/Overview (persisted) |
+| `h` / `j` / `k` / `l` or arrows | Move between agent panes |
+| `PageUp` / `PageDown`, `Home` / `End` | Navigate the summary list |
+| `Enter` | Switch to the selected tmux pane |
+| `f` | Toggle a focused live preview |
+| `/` | Filter by text, `state:`, `agent:`, or `repo:` |
+| `m` / `Esc` | Return to Sessions |
+
+Completed turns remain visible for ten minutes by default. Agents detected
+without lifecycle hooks still appear as `RUN` with state unavailable.
+
+### Background Agents
+
+Press `d` to open a full-screen view of Claude Code background jobs and Codex
+threads. It reads Claude's jobs data and Codex's documented `thread/list`
+app-server API, then groups both providers by working directory.
 
 | Key | Action |
 | --- | --- |
 | `j` / `k` | Select an agent session |
-| `Enter` | Attach with `claude attach` |
+| `Enter` | Attach with `claude attach` or resume with `codex resume` |
 | `p` | Toggle the preview panel |
-| `v` | Toggle transcript/screen preview |
-| `s` | Generate an execution summary |
-| `d` | Return to the tmux tree |
+| `v` | Toggle transcript/screen preview (Claude) |
+| `s` | Generate an execution summary (Claude) |
+| `d` | Return to Sessions |
 
-The agent view needs a Claude Code version that provides background sessions.
-The tmux pane markers and the agent view are independent features.
+Claude rows need a Claude Code version that provides background sessions.
+Codex rows need a Codex CLI version with `app-server` and display the stored
+thread preview; `Enter` resumes the selected thread. Either provider degrades
+independently when its CLI or optional metadata is unavailable.
 
 ## How it differs
 

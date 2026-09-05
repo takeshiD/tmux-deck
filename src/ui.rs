@@ -1,12 +1,13 @@
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::agents::{self, AgentSession, AgentState};
+use crate::agents::{self, AgentProvider, AgentSession, AgentState};
 use crate::app::{
-    Focus, HookState, InputMode, PopupMode, SessionRow, TmuxPane, TmuxWindow, UIState,
-    UNGROUPED_LABEL, ViewMode,
+    AgentPane, Focus, HookState, InputMode, ObservedState, OverviewDensity, PopupMode,
+    PresentationMode, SessionRow, TmuxPane, TmuxWindow, UIState, UNGROUPED_LABEL, ViewMode,
 };
 use crate::config::{Action, HooksConfig, MarkerSet, Theme};
 
@@ -75,6 +76,7 @@ fn coding_agent_markers(
     .collect()
 }
 
+#[cfg(test)]
 fn coding_agent_border_color(
     hooks: &HooksConfig,
     claude_state: Option<HookState>,
@@ -103,7 +105,7 @@ fn coding_agent_border_color(
 pub fn render_ui(frame: &mut Frame, state: &mut UIState) {
     match state.view_mode {
         ViewMode::TreeView => render_tree_view(frame, state),
-        ViewMode::MultiPreview => render_multi_preview(frame, state),
+        ViewMode::AgentMonitor => render_agent_monitor(frame, state),
         ViewMode::Dashboard => render_dashboard(frame, state),
     }
 
@@ -435,8 +437,7 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
         )])
     } else {
         let kb = &state.keybindings;
-        // Tree navigation, `Tab`, `za` and `Space×2` are fixed; the rest reflect
-        // the user's key bindings so the hint bar stays accurate after remaps.
+        // Navigation and `za` are fixed; action hints use configured bindings.
         Line::from(vec![
             Span::styled("j/k", Style::default().fg(theme.focus_border)),
             Span::raw(":move "),
@@ -466,10 +467,10 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
             Span::raw(":group "),
             Span::styled("za", Style::default().fg(theme.focus_border)),
             Span::raw(":fold "),
-            Span::styled("Space×2", Style::default().fg(theme.highlight)),
-            Span::raw(":multi "),
+            Span::styled(kb.label(Action::AgentMonitor), Style::default().fg(theme.highlight)),
+            Span::raw(":monitor "),
             Span::styled(kb.label(Action::Dashboard), Style::default().fg(theme.focus_border)),
-            Span::raw(":fleet "),
+            Span::raw(":background "),
             Span::styled(kb.label(Action::NewSession), Style::default().fg(theme.success)),
             Span::raw(":new "),
             Span::styled(kb.label(Action::RenameSession), Style::default().fg(theme.success)),
@@ -488,7 +489,7 @@ fn render_tree_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
 }
 
 // =============================================================================
-// Fleet Dashboard Rendering
+// Background Agents Rendering
 // =============================================================================
 
 /// Human-friendly elapsed time: `12s`, `3m`, `2h`.
@@ -500,8 +501,7 @@ fn format_elapsed(secs: i64) -> String {
     }
 }
 
-/// Marker glyph + colour for a background-session state, reusing the user's
-/// configured Claude marker set.
+/// Marker glyph + colour for a background-session state.
 fn agent_marker(markers: &MarkerSet, state: AgentState, theme: &Theme) -> (String, Color) {
     let mapped = match state {
         AgentState::Blocked => Some(HookState::Waiting),
@@ -515,8 +515,7 @@ fn agent_marker(markers: &MarkerSet, state: AgentState, theme: &Theme) -> (Strin
         .unwrap_or_else(|| ("∙".to_string(), theme.unfocus_border))
 }
 
-/// Render the agent view: Claude Code background sessions grouped by working
-/// directory, like `claude agents`. `Enter` attaches to the selected session.
+/// Render Claude Code jobs and Codex threads grouped by working directory.
 fn render_dashboard(frame: &mut Frame, state: &UIState) {
     let area = frame.area();
     let theme = state.theme;
@@ -534,7 +533,7 @@ fn render_dashboard(frame: &mut Frame, state: &UIState) {
     // Header: summary counts, like the agent view's "N awaiting input · …".
     let (needs, working, completed) = state.agent_group_counts();
     let header = Line::from(vec![
-        Span::styled(" Claude Agents ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(" Background Agents ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(format!("{needs} awaiting input"), Style::default().fg(theme.highlight)),
         Span::raw(" · "),
         Span::styled(format!("{working} working"), Style::default().fg(theme.focus_border)),
@@ -546,9 +545,12 @@ fn render_dashboard(frame: &mut Frame, state: &UIState) {
     let block = Block::default().borders(Borders::ALL);
 
     if state.agent_sessions.is_empty() {
-        let empty = Paragraph::new(
-            "No background sessions.\n\nStart one with `claude --bg \"<task>\"` or `/bg` inside a session.",
-        )
+        let message = if state.agent_sessions_loading {
+            "Loading Claude and Codex sessions…"
+        } else {
+            "No background sessions.\n\nStart Claude with `claude --bg \"<task>\"` or `/bg`.\nStart or resume a Codex thread with `codex` or `codex resume`."
+        };
+        let empty = Paragraph::new(message)
         .style(Style::default().fg(theme.unfocus_border))
         .block(block);
         frame.render_widget(empty, list_area);
@@ -570,6 +572,7 @@ fn render_dashboard(frame: &mut Frame, state: &UIState) {
     // Build rows, inserting a directory header whenever the cwd changes.
     let mut items: Vec<ListItem> = Vec::new();
     let mut last_cwd: Option<&str> = None;
+    let mut selected_row = 0;
     for (idx, s) in state.agent_sessions.iter().enumerate() {
         if last_cwd != Some(s.cwd.as_str()) {
             items.push(ListItem::new(Line::from(Span::styled(
@@ -578,17 +581,25 @@ fn render_dashboard(frame: &mut Frame, state: &UIState) {
             ))));
             last_cwd = Some(s.cwd.as_str());
         }
+        if idx == selected {
+            selected_row = items.len();
+        }
         items.push(agent_row_item(state, s, idx == selected));
     }
 
-    frame.render_widget(List::new(items).block(block), list_rect);
+    let viewport = usize::from(list_rect.height.saturating_sub(2)).max(1);
+    let start = selected_row.saturating_sub(viewport.saturating_sub(1));
+    let visible_items = items.into_iter().skip(start).take(viewport).collect::<Vec<_>>();
+    frame.render_widget(List::new(visible_items).block(block), list_rect);
     if let Some(preview_rect) = preview_rect {
         render_agent_preview(frame, state, &state.agent_sessions[selected], preview_rect);
     }
     render_dashboard_status_bar(frame, state, status_area);
 
     // The summary popup is independent of the preview panel.
-    if state.agent_summary_open {
+    if state.agent_summary_open
+        && state.agent_sessions[selected].provider == AgentProvider::Claude
+    {
         render_agent_summary_popup(frame, state, &state.agent_sessions[selected], area);
     }
 }
@@ -610,10 +621,16 @@ fn transcript_line_style(line: &str, theme: &Theme) -> Style {
 fn render_agent_preview(frame: &mut Frame, state: &UIState, session: &AgentSession, area: Rect) {
     let theme = state.theme;
     let mode = state.agent_preview_mode;
-    let title = format!(
-        " {} [{}] ",
-        truncate(&session.name, area.width.saturating_sub(12) as usize),
+    let mode_label = if session.provider == AgentProvider::Codex {
+        "summary"
+    } else {
         mode.label()
+    };
+    let title = format!(
+        " {} {} [{}] ",
+        session.provider.label(),
+        truncate(&session.name, area.width.saturating_sub(20) as usize),
+        mode_label
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -622,6 +639,18 @@ fn render_agent_preview(frame: &mut Frame, state: &UIState, session: &AgentSessi
         .title_bottom(Line::from(" v:mode ").right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    if session.provider == AgentProvider::Codex {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{}\n\nPress Enter to resume this Codex thread.",
+                session.summary
+            ))
+            .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
 
     match mode {
         crate::app::PreviewMode::Transcript => {
@@ -639,7 +668,7 @@ fn render_agent_preview(frame: &mut Frame, state: &UIState, session: &AgentSessi
                 .collect();
             frame.render_widget(Paragraph::new(lines), inner);
         }
-        crate::app::PreviewMode::Screen => match state.agent_logs_for(&session.id) {
+        crate::app::PreviewMode::Screen => match state.agent_logs_for(&session.cache_key()) {
             Some(bytes) if !bytes.is_empty() => {
                 let screen = crate::termscreen::render_screen(bytes, inner.width, inner.height);
                 frame.render_widget(Paragraph::new(screen), inner);
@@ -673,7 +702,7 @@ fn render_agent_summary_popup(
         .title(format!(" Summary — {} ", truncate(&session.name, 30)))
         .title_bottom(Line::from(" s:regenerate · Esc:close ").centered());
 
-    let body = match state.summary_status(&session.id) {
+    let body = match state.summary_status(&session.cache_key()) {
         Some(crate::app::SummaryStatus::Pending) => {
             Text::styled("summarizing…", Style::default().fg(theme.unfocus_border))
         }
@@ -704,7 +733,11 @@ fn centered_rect(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
 /// One agent-view row: state marker, name, summary, PR labels, elapsed time.
 fn agent_row_item<'a>(state: &UIState, session: &AgentSession, selected: bool) -> ListItem<'a> {
     let theme = state.theme;
-    let (mut glyph, color) = agent_marker(&state.hooks.claude, session.state, &theme);
+    let markers = match session.provider {
+        AgentProvider::Claude => &state.hooks.claude,
+        AgentProvider::Codex => &state.hooks.codex,
+    };
+    let (mut glyph, color) = agent_marker(markers, session.state, &theme);
     // A finished/exited worker is shown with the agent view's "∙" dot shape.
     if !session.alive {
         glyph = "∙".to_string();
@@ -714,10 +747,14 @@ fn agent_row_item<'a>(state: &UIState, session: &AgentSession, selected: bool) -
     let mut spans = vec![
         Span::styled(format!("{cursor}{glyph} "), Style::default().fg(color)),
         Span::styled(
-            format!("{:<24} ", truncate(&session.name, 24)),
+            format!("{:<7} ", session.provider.label()),
+            Style::default().fg(color),
+        ),
+        Span::styled(
+            format!("{} ", pad_display(&session.name, 20)),
             Style::default().fg(theme.focus_border),
         ),
-        Span::raw(format!("{:<46} ", truncate(&session.summary, 46))),
+        Span::raw(format!("{} ", pad_display(&session.summary, 46))),
     ];
     if !session.prs.is_empty() {
         let label = if session.prs.len() == 1 {
@@ -742,252 +779,471 @@ fn agent_row_item<'a>(state: &UIState, session: &AgentSession, selected: bool) -
 
 /// Truncate to `max` display chars with an ellipsis, padding handled by caller.
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() > max {
-        let head: String = s.chars().take(max - 1).collect();
-        format!("{head}…")
-    } else {
-        s.to_string()
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
     }
+    if max == 0 {
+        return String::new();
+    }
+    let mut width = 0;
+    let mut output = String::new();
+    for character in s.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if width + character_width + 1 > max {
+            break;
+        }
+        output.push(character);
+        width += character_width;
+    }
+    output.push('…');
+    output
+}
+
+fn pad_display(s: &str, width: usize) -> String {
+    let mut value = truncate(s, width);
+    value.extend(std::iter::repeat_n(
+        ' ',
+        width.saturating_sub(UnicodeWidthStr::width(value.as_str())),
+    ));
+    value
 }
 
 fn render_dashboard_status_bar(frame: &mut Frame, state: &UIState, area: Rect) {
     let theme = state.theme;
     let kb = &state.keybindings;
-    let status_text = Line::from(vec![
+    let mut spans = vec![
         Span::styled("j/k", Style::default().fg(theme.focus_border)),
         Span::raw(":move "),
         Span::styled(kb.label(Action::Enter), Style::default().fg(theme.highlight)),
-        Span::raw(":attach "),
+        Span::raw(":resume "),
         Span::styled("p", Style::default().fg(theme.focus_border)),
         Span::raw(":preview "),
-        Span::styled("v", Style::default().fg(theme.focus_border)),
-        Span::raw(":mode "),
-        Span::styled("s", Style::default().fg(theme.focus_border)),
-        Span::raw(":summary "),
+    ];
+    if state
+        .selected_agent()
+        .is_some_and(|session| session.provider == AgentProvider::Claude)
+    {
+        spans.extend([
+            Span::styled("v", Style::default().fg(theme.focus_border)),
+            Span::raw(":mode "),
+            Span::styled("s", Style::default().fg(theme.focus_border)),
+            Span::raw(":summary "),
+        ]);
+    }
+    spans.extend([
         Span::styled(kb.label(Action::Dashboard), Style::default().fg(theme.focus_border)),
-        Span::raw(":back "),
+        Span::raw(":Sessions "),
+        Span::styled(kb.label(Action::AgentMonitor), Style::default().fg(theme.highlight)),
+        Span::raw(":monitor "),
         Span::styled(kb.label(Action::Quit), Style::default().fg(theme.focus_border)),
         Span::raw(":quit"),
     ]);
     frame.render_widget(
-        Paragraph::new(status_text).style(Style::default().bg(theme.status_bar_bg)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.status_bar_bg)),
         area,
     );
 }
 
 // =============================================================================
-// MultiPreview Rendering
+// Agent Monitor Rendering
 // =============================================================================
 
-fn render_multi_preview(frame: &mut Frame, state: &UIState) {
+fn render_agent_monitor(frame: &mut Frame, state: &mut UIState) {
     let area = frame.area();
-    let theme = state.theme;
+    if area.width < 38 || area.height < 8 {
+        frame.render_widget(
+            Paragraph::new("Terminal too small for Agent Monitor. Resize to at least 38x8.")
+                .alignment(Alignment::Center),
+            area,
+        );
+        return;
+    }
+    let [header, content, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    render_agent_header(frame, state, header);
 
-    let main_chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
-
-    let preview_area = main_chunks[0];
-    let status_area = main_chunks[1];
-
-    if state.sessions.is_empty() {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" No sessions found ");
-        frame.render_widget(block, preview_area);
+    if state.agent_panes.is_empty() {
+        frame.render_widget(
+            Paragraph::new(
+                "No coding agents detected in tmux.\n\nStart Claude Code or Codex inside a tmux pane.\nInstall hooks for detailed working/waiting status:\n  tmux-deck hook install",
+            )
+            .wrap(Wrap { trim: false }),
+            content,
+        );
+    } else if state.agent_monitor_focused {
+        render_selected_agent_preview(frame, state, content);
     } else {
-        // Create horizontal layout for sessions: the selected session gets
-        // `multi_selected_ratio`%, the rest share what remains.
-        let selected_ratio = state.layout.multi_selected_ratio.min(100);
-        let session_constraints: Vec<Constraint> = if state.sessions.len() == 1 {
-            vec![Constraint::Percentage(100)]
-        } else {
-            let other_count = state.sessions.len() - 1;
-            let other_percentage = (100 - selected_ratio) / other_count as u16;
-            state.sessions
-                .iter()
-                .enumerate()
-                .map(|(idx, _)| {
-                    if idx == state.multi_session {
-                        Constraint::Percentage(selected_ratio)
-                    } else {
-                        Constraint::Percentage(other_percentage.max(1))
-                    }
-                })
-                .collect()
-        };
-
-        let session_chunks = Layout::horizontal(session_constraints).split(preview_area);
-
-        for (session_idx, (session, session_area)) in
-            state.sessions.iter().zip(session_chunks.iter()).enumerate()
-        {
-            let is_selected_session = session_idx == state.multi_session;
-
-            // Session block style. Sessions running Claude are accented with
-            // their Claude state colour unless they are the currently selected
-            // session (selection colour wins so focus is never lost).
-            let session_border_style = if is_selected_session {
-                Style::default().fg(theme.focus_border).add_modifier(Modifier::BOLD)
-            } else if let Some(color) = coding_agent_border_color(
-                &state.hooks,
-                session.claude_state,
-                session.has_claude,
-                session.codex_state,
-                session.has_codex,
-            ) {
-                Style::default().fg(color)
-            } else {
-                Style::default().fg(theme.unfocus_border)
-            };
-
-            let mut title_spans = vec![Span::raw(format!(" {} ", session.name))];
-            for (sym, color) in coding_agent_markers(
-                &state.hooks,
-                session.claude_state,
-                session.has_claude,
-                session.codex_state,
-                session.has_codex,
-            ) {
-                title_spans.push(Span::styled(
-                    format!("{} ", sym),
-                    Style::default().fg(color),
-                ));
-            }
-
-            let session_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(session_border_style)
-                .title(Line::from(title_spans));
-
-            let inner_area = session_block.inner(*session_area);
-            frame.render_widget(session_block, *session_area);
-
-            if session.windows.is_empty() {
-                let no_windows = Paragraph::new("No windows")
-                    .style(Style::default().fg(theme.unfocus_border));
-                frame.render_widget(no_windows, inner_area);
-                continue;
-            }
-
-            // Create vertical layout for windows within this session
-            let window_constraints: Vec<Constraint> = session
-                .windows
-                .iter()
-                .map(|_| Constraint::Ratio(1, session.windows.len() as u32))
-                .collect();
-
-            let window_chunks = Layout::vertical(window_constraints).split(inner_area);
-
-            for (window_idx, (window, window_area)) in
-                session.windows.iter().zip(window_chunks.iter()).enumerate()
-            {
-                let is_selected_window =
-                    is_selected_session && window_idx == state.multi_window;
-
-                render_window_preview(
-                    frame,
-                    &state.theme,
-                    &state.hooks,
-                    window,
-                    *window_area,
-                    is_selected_window,
-                );
-            }
+        match state.agent_monitor_mode {
+            PresentationMode::Attention => render_attention(frame, state, content),
+            PresentationMode::Overview => render_overview(frame, state, content),
         }
     }
+    render_agent_footer(frame, state, footer, content.height);
+}
 
-    // Status bar
-    let status_text = if let Some(ref err) = state.last_error {
-        Line::from(vec![Span::styled(
-            format!(" Error: {} ", err),
-            Style::default().fg(theme.error),
-        )])
-    } else {
-        let selected_info = state
-            .get_multi_selected_target()
-            .unwrap_or_else(|| "None".to_string());
-
-        let kb = &state.keybindings;
-        Line::from(vec![
-            Span::styled("h/l", Style::default().fg(theme.focus_border)),
-            Span::raw(":session "),
-            Span::styled("j/k", Style::default().fg(theme.focus_border)),
-            Span::raw(":window "),
-            Span::styled("Space×2", Style::default().fg(theme.highlight)),
-            Span::raw(":tree "),
-            Span::styled(kb.label(Action::NewSession), Style::default().fg(theme.success)),
-            Span::raw(":new "),
-            Span::styled(kb.label(Action::RenameSession), Style::default().fg(theme.success)),
-            Span::raw(":rename "),
-            Span::styled(kb.label(Action::KillSession), Style::default().fg(theme.error)),
-            Span::raw(":kill "),
-            Span::styled(kb.label(Action::Quit), Style::default().fg(theme.focus_border)),
-            Span::raw(":quit "),
-            Span::raw("| "),
-            Span::styled(
-                format!("Sel:{}", selected_info),
-                Style::default().fg(theme.accent),
-            ),
-        ])
+fn render_agent_header(frame: &mut Frame, state: &UIState, area: Rect) {
+    let (actionable, working, done) = state.agent_counts();
+    let mode = match state.agent_monitor_mode {
+        PresentationMode::Attention => "Attention",
+        PresentationMode::Overview => "Overview",
     };
+    let mut spans = vec![
+        Span::styled(" Agent Monitor ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(format!("{mode}  ")),
+        Span::styled(
+            format!("! {actionable} actionable"),
+            Style::default().fg(if actionable > 0 {
+                state.theme.focus_border
+            } else {
+                state.theme.unfocus_border
+            }),
+        ),
+        Span::styled(format!("  {working} working"), Style::default().fg(state.theme.accent)),
+        Span::styled(format!("  {done} done"), Style::default().fg(state.theme.success)),
+    ];
+    if actionable > 0 && state.agent_monitor_mode == PresentationMode::Overview {
+        spans.push(Span::styled(
+            "  Tab: open Attention",
+            Style::default().fg(state.theme.highlight).add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
 
+fn state_symbol(agent: &AgentPane) -> &'static str {
+    match agent.state {
+        ObservedState::Waiting => "!",
+        ObservedState::Error => "×",
+        ObservedState::Working => spinner_frame(),
+        ObservedState::Done => "✓",
+        ObservedState::Running => "●",
+    }
+}
+
+fn state_style(state: ObservedState, theme: Theme) -> Style {
+    let color = match state {
+        ObservedState::Waiting => theme.focus_border,
+        ObservedState::Error => theme.error,
+        ObservedState::Working => theme.accent,
+        ObservedState::Done => theme.success,
+        ObservedState::Running => theme.unfocus_border,
+    };
+    let style = Style::default().fg(color);
+    if state == ObservedState::Running {
+        style.add_modifier(Modifier::DIM)
+    } else {
+        style
+    }
+}
+
+fn elapsed_label(agent: &AgentPane) -> String {
+    let Some(seconds) = agent.elapsed_secs(crate::hook::now_secs()) else {
+        return "-".to_string();
+    };
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / 3600)
+    }
+}
+
+fn agent_summary_line(state: &UIState, agent: &AgentPane, width: u16) -> Line<'static> {
+    let available = usize::from(width).saturating_sub(24);
+    let identity_width = (available * 2 / 5).max(6).min(available);
+    let activity_width = available.saturating_sub(identity_width);
+    let identity = pad_display(&state.agent_identity(agent), identity_width);
+    let activity = pad_display(&agent.activity, activity_width);
+    Line::from(vec![
+        Span::styled(
+            format!("{} {:<5} ", state_symbol(agent), agent.state.label()),
+            state_style(agent.state, state.theme),
+        ),
+        Span::raw(format!("{} ", pad_display(agent.kind.label(), 7))),
+        Span::styled(identity, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::raw(activity),
+        Span::styled(
+            format!(" {:>5}", elapsed_label(agent)),
+            Style::default().fg(state.theme.unfocus_border),
+        ),
+    ])
+}
+
+fn render_attention(frame: &mut Frame, state: &UIState, area: Rect) {
+    if area.width < 60 {
+        render_agent_queue(frame, state, area);
+    } else if area.width >= 100 {
+        let [queue, preview] = Layout::horizontal([
+            Constraint::Percentage(34),
+            Constraint::Percentage(66),
+        ])
+        .areas(area);
+        render_agent_queue(frame, state, queue);
+        render_selected_agent_preview(frame, state, preview);
+    } else {
+        let [queue, preview] = Layout::vertical([
+            Constraint::Percentage(35),
+            Constraint::Percentage(65),
+        ])
+        .areas(area);
+        render_agent_queue(frame, state, queue);
+        render_selected_agent_preview(frame, state, preview);
+    }
+}
+
+fn render_agent_queue(frame: &mut Frame, state: &UIState, area: Rect) {
+    let agents = state.visible_agent_panes();
+    let actionable = agents.iter().filter(|agent| agent.state.actionable()).count();
+    let mut items = Vec::new();
+    if actionable == 0 {
+        items.push(ListItem::new(Line::styled(
+            "All clear",
+            Style::default().fg(state.theme.success).add_modifier(Modifier::BOLD),
+        )));
+    }
+    if agents.is_empty() && !state.agent_panes.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "Hookless agents are available in Overview (Tab)",
+            Style::default().fg(state.theme.unfocus_border),
+        )));
+    }
+    let selected_index = state
+        .agent_pane_selected
+        .as_ref()
+        .and_then(|selected| agents.iter().position(|agent| &agent.pane_id == selected))
+        .unwrap_or(0);
+    let viewport = usize::from(area.height.saturating_sub(2))
+        .saturating_sub(usize::from(actionable == 0))
+        .saturating_sub(usize::from(agents.is_empty() && !state.agent_panes.is_empty()))
+        .max(1);
+    let start = selected_index.saturating_sub(viewport.saturating_sub(1));
+    for agent in agents.into_iter().skip(start).take(viewport) {
+        let selected = state.agent_pane_selected.as_deref() == Some(agent.pane_id.as_str());
+        let mut item = ListItem::new(agent_summary_line(state, agent, area.width.saturating_sub(2)));
+        if selected {
+            item = item.style(
+                Style::default()
+                    .bg(state.theme.selection_bg)
+                    .fg(state.theme.selection_fg)
+                    .add_modifier(Modifier::REVERSED),
+            );
+        }
+        items.push(item);
+    }
     frame.render_widget(
-        Paragraph::new(status_text).style(Style::default().bg(theme.status_bar_bg)),
-        status_area,
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(state.theme.focus_border))
+                .title(" Attention Queue "),
+        ),
+        area,
     );
 }
 
-fn render_window_preview(
-    frame: &mut Frame,
-    theme: &Theme,
-    hooks: &HooksConfig,
-    window: &TmuxWindow,
-    area: Rect,
-    is_selected: bool,
-) {
-    let border_style = if is_selected {
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD)
-    } else if let Some(color) = coding_agent_border_color(
-        hooks,
-        window.claude_state,
-        window.has_claude,
-        window.codex_state,
-        window.has_codex,
-    ) {
-        Style::default().fg(color)
-    } else {
-        Style::default().fg(theme.unfocus_border)
-    };
-
-    let cmd = window
-        .get_active_pane()
-        .map(|p| p.current_command.as_str())
-        .unwrap_or("");
-
-    let mut title_spans = vec![Span::raw(format!(
-        " {}:{} [{}] ",
-        window.index, window.name, cmd
-    ))];
-    for (sym, color) in coding_agent_markers(
-        hooks,
-        window.claude_state,
-        window.has_claude,
-        window.codex_state,
-        window.has_codex,
-    ) {
-        title_spans.push(Span::styled(
-            format!("{} ", sym),
-            Style::default().fg(color),
-        ));
+fn render_overview(frame: &mut Frame, state: &mut UIState, area: Rect) {
+    let density = crate::app::overview_density(area.width, area.height, state.visible_agent_panes().len());
+    match density {
+        OverviewDensity::LiveGrid => render_live_grid(frame, state, area),
+        OverviewDensity::Hybrid => render_hybrid(frame, state, area),
+        OverviewDensity::SummaryList => render_summary_list(frame, state, area),
     }
+}
 
+fn render_live_grid(frame: &mut Frame, state: &UIState, area: Rect) {
+    let agents = state.visible_agent_panes();
+    let columns = (agents.len() as f64).sqrt().ceil().max(1.0) as usize;
+    let rows = agents.len().div_ceil(columns);
+    let row_areas = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(area);
+    for (row, row_area) in row_areas.iter().enumerate() {
+        let column_areas = Layout::horizontal(vec![Constraint::Ratio(1, columns as u32); columns])
+            .split(*row_area);
+        for (column, card_area) in column_areas.iter().enumerate() {
+            if let Some(agent) = agents.get(row * columns + column) {
+                render_agent_card(frame, state, agent, *card_area, true);
+            }
+        }
+    }
+}
+
+fn render_hybrid(frame: &mut Frame, state: &UIState, area: Rect) {
+    let (preview, peers) = if area.width >= 100 {
+        let [preview, peers] = Layout::horizontal([
+            Constraint::Percentage(60),
+            Constraint::Percentage(40),
+        ])
+        .areas(area);
+        (preview, peers)
+    } else {
+        let [preview, peers] = Layout::vertical([
+            Constraint::Percentage(60),
+            Constraint::Percentage(40),
+        ])
+        .areas(area);
+        (preview, peers)
+    };
+    render_selected_agent_preview(frame, state, preview);
+    let items: Vec<ListItem> = state
+        .visible_agent_panes()
+        .into_iter()
+        .filter(|agent| state.agent_pane_selected.as_deref() != Some(agent.pane_id.as_str()))
+        .map(|agent| ListItem::new(agent_summary_line(state, agent, peers.width)))
+        .collect();
+    frame.render_widget(List::new(items), peers);
+}
+
+fn render_summary_list(frame: &mut Frame, state: &mut UIState, area: Rect) {
+    let agents: Vec<AgentPane> = state
+        .visible_agent_panes()
+        .into_iter()
+        .cloned()
+        .collect();
+    let viewport = usize::from(area.height.max(1));
+    let selected = state
+        .agent_pane_selected
+        .as_ref()
+        .and_then(|id| agents.iter().position(|agent| &agent.pane_id == id))
+        .unwrap_or(0);
+    if selected < state.agent_monitor_scroll {
+        state.agent_monitor_scroll = selected;
+    } else if selected >= state.agent_monitor_scroll + viewport {
+        state.agent_monitor_scroll = selected + 1 - viewport;
+    }
+    let end = (state.agent_monitor_scroll + viewport).min(agents.len());
+    let items: Vec<ListItem> = agents[state.agent_monitor_scroll..end]
+        .iter()
+        .map(|agent| {
+            let selected = state.agent_pane_selected.as_deref() == Some(agent.pane_id.as_str());
+            let mut item = ListItem::new(agent_summary_line(state, agent, area.width));
+            if selected {
+                item = item.style(
+                    Style::default()
+                        .bg(state.theme.selection_bg)
+                        .fg(state.theme.selection_fg)
+                        .add_modifier(Modifier::REVERSED),
+                );
+            }
+            item
+        })
+        .collect();
+    frame.render_widget(List::new(items), area);
+}
+
+fn render_agent_card(
+    frame: &mut Frame,
+    state: &UIState,
+    agent: &AgentPane,
+    area: Rect,
+    live: bool,
+) {
+    let selected = state.agent_pane_selected.as_deref() == Some(agent.pane_id.as_str());
+    let title = format!(
+        " {} {} {} {} ",
+        agent.state.label(),
+        agent.kind.label(),
+        state.agent_identity(agent),
+        elapsed_label(agent)
+    );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(Line::from(title_spans));
-
+        .border_style(if selected {
+            Style::default().fg(state.theme.focus_border).add_modifier(Modifier::BOLD)
+        } else {
+            state_style(agent.state, state.theme)
+        })
+        .title(truncate(&title, usize::from(area.width.saturating_sub(2))));
+    let inner = block.inner(area);
     frame.render_widget(block, area);
+    if live {
+        if let Some(content) = state.agent_pane_contents.get(&agent.target) {
+            frame.render_widget(Paragraph::new(content.clone()), inner);
+        } else {
+            frame.render_widget(Paragraph::new(agent.activity.clone()), inner);
+        }
+    } else {
+        frame.render_widget(Paragraph::new(agent.activity.clone()).wrap(Wrap { trim: true }), inner);
+    }
+}
+
+fn render_selected_agent_preview(frame: &mut Frame, state: &UIState, area: Rect) {
+    if let Some(agent) = state.selected_agent_pane() {
+        render_agent_card(frame, state, agent, area, true);
+    } else {
+        frame.render_widget(
+            Paragraph::new("No matching agent. Press Tab for Overview.")
+                .alignment(Alignment::Center),
+            area,
+        );
+    }
+}
+
+fn render_agent_footer(frame: &mut Frame, state: &UIState, area: Rect, viewport_height: u16) {
+    let theme = state.theme;
+    let kb = &state.keybindings;
+    let mut spans = if state.agent_monitor_filter_editing {
+        vec![
+            Span::styled(" /", Style::default().fg(theme.focus_border)),
+            Span::raw(state.agent_monitor_filter.clone()),
+            Span::styled("  Enter/Esc:done", Style::default().fg(theme.unfocus_border)),
+        ]
+    } else {
+        let mut spans = vec![
+            Span::styled("hjkl", Style::default().fg(theme.focus_border)),
+            Span::raw(":move "),
+            Span::styled("Tab", Style::default().fg(theme.highlight)),
+            Span::raw(":mode "),
+        ];
+        if state.selected_agent_pane().is_some() {
+            spans.extend([
+                Span::styled(kb.label(Action::Enter), Style::default().fg(theme.focus_border)),
+                Span::raw(":enter "),
+                Span::styled("f", Style::default().fg(theme.focus_border)),
+                Span::raw(":focus "),
+            ]);
+        }
+        spans.extend([
+            Span::styled("/", Style::default().fg(theme.focus_border)),
+            Span::raw(":filter "),
+            Span::styled(kb.label(Action::AgentMonitor), Style::default().fg(theme.focus_border)),
+            Span::raw(":Sessions Esc:back"),
+        ]);
+        spans
+    };
+    if state.agent_monitor_mode == PresentationMode::Overview
+        && crate::app::overview_density(
+            area.width,
+            viewport_height,
+            state.visible_agent_panes().len(),
+        ) == OverviewDensity::SummaryList
+    {
+        let total = state.visible_agent_panes().len();
+        let start = if total == 0 { 0 } else { state.agent_monitor_scroll + 1 };
+        let end = (state.agent_monitor_scroll + usize::from(viewport_height)).min(total);
+        spans.push(Span::styled(
+            "  PgUp/PgDn Home/End",
+            Style::default().fg(theme.focus_border),
+        ));
+        spans.push(Span::styled(
+            format!("  {start}-{end}/{total}"),
+            Style::default().fg(theme.accent),
+        ));
+    }
+    if let Some((message, _)) = &state.agent_monitor_message {
+        spans.push(Span::styled(
+            format!("  {message}"),
+            Style::default().fg(theme.highlight),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.status_bar_bg)),
+        area,
+    );
 }
 
 // =============================================================================
@@ -1280,7 +1536,67 @@ fn render_confirm_kill_popup(frame: &mut Frame, state: &UIState) {
 #[cfg(test)]
 mod cursor_alignment_tests {
     use super::*;
+    use crate::app::AgentKind;
     use ratatui::{backend::TestBackend, Terminal};
+
+    fn monitor_agent(index: usize, state: ObservedState) -> AgentPane {
+        AgentPane {
+            pane_id: format!("%{index}"),
+            target: format!("dev:1.{index}"),
+            tmux_identity: format!("dev:1.%{index}"),
+            session_name: "dev".to_string(),
+            window_index: 1,
+            pane_index: index as u32,
+            pane_height: 40,
+            kind: if index.is_multiple_of(2) {
+                AgentKind::Codex
+            } else {
+                AgentKind::Claude
+            },
+            state,
+            activity: "editing 長い名前のui.rs without exposing prompt text".to_string(),
+            state_since: Some(crate::hook::now_secs() - index as i64),
+            repository: Some("tmux-deck".to_string()),
+            worktree: Some(format!("feature-{index}")),
+            parent: Some("rust".to_string()),
+        }
+    }
+
+    fn monitor_state(count: usize, mode: PresentationMode) -> UIState {
+        let mut state = UIState::new(crate::config::Config::default());
+        state.view_mode = ViewMode::AgentMonitor;
+        state.agent_monitor_mode = mode;
+        state.agent_panes = (0..count)
+            .map(|index| {
+                let observed = match index % 4 {
+                    0 => ObservedState::Waiting,
+                    1 => ObservedState::Error,
+                    2 => ObservedState::Working,
+                    _ => ObservedState::Done,
+                };
+                monitor_agent(index, observed)
+            })
+            .collect();
+        state.agent_order = state
+            .agent_panes
+            .iter()
+            .map(|agent| agent.pane_id.clone())
+            .collect();
+        state.agent_pane_selected = state.agent_order.first().cloned();
+        state
+    }
+
+    fn buffer_text(term: &Terminal<TestBackend>) -> String {
+        let buffer = term.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn format_elapsed_scales_units() {
@@ -1289,6 +1605,63 @@ mod cursor_alignment_tests {
         assert_eq!(format_elapsed(60), "1m");
         assert_eq!(format_elapsed(3599), "59m");
         assert_eq!(format_elapsed(3600), "1h");
+    }
+
+    #[test]
+    fn unicode_truncation_respects_terminal_cells() {
+        for width in 1..12 {
+            let value = truncate("日本語e\u{301}🙂activity", width);
+            assert!(UnicodeWidthStr::width(value.as_str()) <= width);
+            assert_eq!(UnicodeWidthStr::width(pad_display(&value, width).as_str()), width);
+        }
+        let state = monitor_state(1, PresentationMode::Overview);
+        let line = agent_summary_line(&state, &state.agent_panes[0], 38);
+        assert!(line.width() <= 38);
+    }
+
+    #[test]
+    fn attention_renders_actionable_all_clear_and_empty_states() {
+        let mut state = monitor_state(4, PresentationMode::Attention);
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|frame| render_ui(frame, &mut state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("Attention Queue"));
+        assert!(text.contains("WAIT"));
+        assert!(text.contains("ERROR"));
+
+        for agent in &mut state.agent_panes {
+            agent.state = ObservedState::Working;
+        }
+        term.draw(|frame| render_ui(frame, &mut state)).unwrap();
+        assert!(buffer_text(&term).contains("All clear"));
+
+        state.agent_panes.clear();
+        state.agent_order.clear();
+        state.agent_pane_selected = None;
+        term.draw(|frame| render_ui(frame, &mut state)).unwrap();
+        assert!(buffer_text(&term).contains("No coding agents detected in tmux"));
+    }
+
+    #[test]
+    fn overview_matrix_renders_all_density_and_responsive_targets() {
+        for count in [1, 4, 5, 12, 13, 30, 31] {
+            let mut state = monitor_state(count, PresentationMode::Overview);
+            let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            term.draw(|frame| render_ui(frame, &mut state)).unwrap();
+            let text = buffer_text(&term);
+            assert!(text.contains("Agent Monitor"));
+            if count == 31 {
+                assert!(text.contains("/31"));
+            }
+        }
+        for (width, height) in [(80, 24), (60, 20), (37, 7)] {
+            let mut state = monitor_state(4, PresentationMode::Overview);
+            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+            term.draw(|frame| render_ui(frame, &mut state)).unwrap();
+            if width < 38 {
+                assert!(buffer_text(&term).contains("Terminal too small"));
+            }
+        }
     }
 
     #[test]
@@ -1392,6 +1765,7 @@ mod cursor_alignment_tests {
         // directory headers, state markers, PR labels and selection highlight.
         fn sess(id: &str, name: &str, state: AgentState, cwd: &str, prs: &[&str]) -> AgentSession {
             AgentSession {
+                provider: AgentProvider::Claude,
                 id: id.to_string(),
                 name: name.to_string(),
                 state,
@@ -1410,6 +1784,16 @@ mod cursor_alignment_tests {
             sess("a2", "refactor", AgentState::Working, "/home/u/proj-a", &[]),
             sess("b1", "docs", AgentState::Done, "/home/u/proj-b", &["3", "4"]),
         ];
+        let mut codex = sess(
+            "c1",
+            "Codex refactor",
+            AgentState::Working,
+            "/home/u/proj-c",
+            &[],
+        );
+        codex.provider = AgentProvider::Codex;
+        codex.summary = "editing src/agents.rs".to_string();
+        state.agent_sessions.push(codex);
 
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         term.draw(|f| render_ui(f, &mut state)).unwrap();
@@ -1418,9 +1802,17 @@ mod cursor_alignment_tests {
         state.agent_preview = true;
         term.draw(|f| render_ui(f, &mut state)).unwrap();
 
+        state.agent_selected = 3;
+        state.agent_preview_mode = crate::app::PreviewMode::Screen;
+        term.draw(|f| render_ui(f, &mut state)).unwrap();
+        let rendered = buffer_text(&term);
+        assert!(rendered.contains("Codex"));
+        assert!(rendered.contains("Press Enter to resume"));
+
         // With the (independent) summary popup open.
+        state.agent_selected = 0;
         state.agent_summary_open = true;
-        state.set_summary_pending("a1".to_string());
+        state.set_summary_pending(state.agent_sessions[0].cache_key());
         term.draw(|f| render_ui(f, &mut state)).unwrap();
     }
 
