@@ -4,6 +4,21 @@ on:
 permissions:
   contents: read
 jobs:
+  version-policy:
+    name: Version policy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Verify manifest and pull-request version policy
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: .github/scripts/verify-pr-version.sh
+
   test:
     name: Test - ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}

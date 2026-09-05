@@ -1,6 +1,5 @@
 /target
 /result
-.agent/worktrees/
 .serena
 .envrc
 .direnv

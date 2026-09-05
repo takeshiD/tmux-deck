@@ -3,22 +3,28 @@
 Stable releases are fully automated from a single `vX.Y.Z` tag. Do not create
 alpha, beta, or release-candidate tags: the release workflow rejects them.
 
-## One-time publisher setup
+## Choose publication targets
 
-The repository already uses the `takeshid` Cachix cache and has a
-`CACHIX_AUTH_TOKEN` repository secret. Its value cannot be inspected from
-GitHub, so confirm that it is a per-cache write token. Create the crates.io
-Trusted Publisher and verify the Cachix token once by running:
+GitHub release artifacts are always published after every required build
+succeeds. Registry publication is controlled independently with repository
+variables:
+
+| Variable | `true` means |
+| --- | --- |
+| `PUBLISH_CACHIX` | Build and push all supported Nix systems to `takeshid` |
+| `PUBLISH_CRATES_IO` | Publish the crate through OIDC trusted publishing |
+
+An unset variable behaves as `false`. Configure the intended targets and any
+required credentials by running:
 
 ```console
 ./scripts/setup-release-publishing.sh
 ```
 
-The wizard opens both service dashboards, walks through the exact values, and
-only replaces the Cachix secret if its scope cannot be confirmed. It does not
-request or store a crates.io API token. The GitHub `release` Environment must
-exist without required reviewers because pushing the tag is the approval
-operation.
+The wizard records both repository variables. When Cachix is enabled, confirm
+that the existing `CACHIX_AUTH_TOKEN` is a `takeshid`-scoped write token. When
+crates.io is enabled, register its GitHub Trusted Publisher; no long-lived API
+token is stored. The GitHub `release` Environment is needed only for crates.io.
 
 ## Preflight the runner matrix
 
@@ -30,7 +36,8 @@ Rust/Nix builds, but every publication job is skipped.
 
 1. Update `package.version` in `Cargo.toml` to the next stable version.
 2. Run `cargo check` to update the root package entry in `Cargo.lock`.
-3. Open and merge a release PR into the default branch.
+3. Open and merge a `release/*` PR into the default branch. Other pull requests
+   are rejected if they change the package version.
 4. From the merged commit, create and push the matching annotated tag:
 
    ```console
@@ -42,14 +49,15 @@ Rust/Nix builds, but every publication job is skipped.
 
 The workflow validates the tag, manifest, lockfile, and default-branch
 ancestry. It then completes all tests and native builds before publishing to
-crates.io and Cachix. GitHub Release is created only after both destinations
-finish.
+each enabled registry. GitHub Release is created only after the required builds
+and all enabled destinations finish. A disabled registry does not block it.
 
 ## Recover from a failed release
 
 Do not delete or recreate the tag. In the failed GitHub Actions run, choose
-**Re-run failed jobs**. The workflow verifies an existing crates.io package by
-checksum, repeats Cachix pushes safely, and replaces existing GitHub assets.
+**Re-run failed jobs**. When enabled, the workflow verifies an existing
+crates.io package by checksum, repeats Cachix pushes safely, and replaces
+existing GitHub assets.
 
 If the tag/version/ancestry gate fails, prepare a new version and tag instead of
 moving a published tag.

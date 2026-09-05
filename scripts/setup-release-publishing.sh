@@ -14,9 +14,9 @@ set -euo pipefail
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
   BOLD=$(tput bold); DIM=$(tput dim); RESET=$(tput sgr0)
-  BLUE=$(tput setaf 4); GREEN=$(tput setaf 2); YELLOW=$(tput setaf 3); RED=$(tput setaf 1)
+  BLUE=$(tput setaf 4); GREEN=$(tput setaf 2); YELLOW=$(tput setaf 3)
 else
-  BOLD=""; DIM=""; RESET=""; BLUE=""; GREEN=""; YELLOW=""; RED=""
+  BOLD=""; DIM=""; RESET=""; BLUE=""; GREEN=""; YELLOW=""
 fi
 
 # Author sets this at the top of the stages section.
@@ -184,39 +184,59 @@ finish() {
 # Replace the example below. Set TOTAL_STAGES to match the stages you write.
 # ──────────────────────────────────────────────────────────────────────────
 
-TOTAL_STAGES=2
+TOTAL_STAGES=3
 
 banner "tmux-deck trusted publishing setup"
 
-stage "crates.io: GitHub Trusted Publisher"
-say "Register the release workflow without creating a long-lived API token."
-open_url "https://crates.io/crates/tmux-deck/settings"
-step "Sign in as a tmux-deck owner and open Trusted Publishers."
-step "Choose GitHub as the publisher type."
-step "Set owner to: takeshiD"
-step "Set repository to: tmux-deck"
-step "Set workflow to: release.yml"
-step "Set environment to: release"
-step "Save the Trusted Publisher."
-confirm "Is the publisher listed with those exact values?" || {
-  warn "setup was not confirmed; re-run this wizard when ready"
-  exit 1
-}
+stage "Publication targets"
+PUBLISH_CRATES_IO=false
+PUBLISH_CACHIX=false
+if confirm "Publish releases to crates.io?"; then
+  PUBLISH_CRATES_IO=true
+fi
+if confirm "Publish releases to the takeshid Cachix cache?"; then
+  PUBLISH_CACHIX=true
+fi
+set_var PUBLISH_CRATES_IO "${PUBLISH_CRATES_IO}"
+set_var PUBLISH_CACHIX "${PUBLISH_CACHIX}"
 
-stage "Cachix: cache-scoped write token"
-say "Confirm that CI can push only to the takeshid cache."
-open_url "https://app.cachix.org/cache/takeshid"
-step "Open the cache settings and locate its auth or deployment tokens."
-if confirm "Is CACHIX_AUTH_TOKEN already backed by a takeshid-scoped write token?"; then
-  note "Keeping the existing GitHub Secret."
-else
-  step "Create a new token scoped to the takeshid cache with write access."
-  ask_secret CACHIX_AUTH_TOKEN "Paste the new Cachix write token:"
-  [[ -n "${CACHIX_AUTH_TOKEN}" ]] || {
-    warn "no token was entered; re-run this wizard when ready"
+stage "crates.io: GitHub Trusted Publisher"
+if [[ "${PUBLISH_CRATES_IO}" == true ]]; then
+  say "Register the release workflow without creating a long-lived API token."
+  open_url "https://crates.io/crates/tmux-deck/settings"
+  step "Sign in as a tmux-deck owner and open Trusted Publishers."
+  step "Choose GitHub as the publisher type."
+  step "Set owner to: takeshiD"
+  step "Set repository to: tmux-deck"
+  step "Set workflow to: release.yml"
+  step "Set environment to: release"
+  step "Save the Trusted Publisher."
+  confirm "Is the publisher listed with those exact values?" || {
+    warn "setup was not confirmed; re-run this wizard when ready"
     exit 1
   }
-  set_secret CACHIX_AUTH_TOKEN "${CACHIX_AUTH_TOKEN}"
+else
+  note "Skipped because PUBLISH_CRATES_IO=false."
+fi
+
+stage "Cachix: cache-scoped write token"
+if [[ "${PUBLISH_CACHIX}" == true ]]; then
+  say "Confirm that CI can push only to the takeshid cache."
+  open_url "https://app.cachix.org/cache/takeshid"
+  step "Open the cache settings and locate its auth or deployment tokens."
+  if confirm "Is CACHIX_AUTH_TOKEN already backed by a takeshid-scoped write token?"; then
+    note "Keeping the existing GitHub Secret."
+  else
+    step "Create a new token scoped to the takeshid cache with write access."
+    ask_secret CACHIX_AUTH_TOKEN "Paste the new Cachix write token:"
+    [[ -n "${CACHIX_AUTH_TOKEN}" ]] || {
+      warn "no token was entered; re-run this wizard when ready"
+      exit 1
+    }
+    set_secret CACHIX_AUTH_TOKEN "${CACHIX_AUTH_TOKEN}"
+  fi
+else
+  note "Skipped because PUBLISH_CACHIX=false."
 fi
 
 finish

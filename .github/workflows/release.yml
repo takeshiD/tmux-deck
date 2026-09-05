@@ -136,7 +136,7 @@ jobs:
 
   publish-crate:
     name: Publish crates.io
-    if: needs.validate.outputs.publish == 'true'
+    if: needs.validate.outputs.publish == 'true' && vars.PUBLISH_CRATES_IO == 'true'
     needs:
       - validate
       - preflight
@@ -233,7 +233,7 @@ jobs:
 
   publish-cachix:
     name: Publish Cachix - ${{ matrix.system }}
-    if: needs.validate.outputs.publish == 'true'
+    if: needs.validate.outputs.publish == 'true' && vars.PUBLISH_CACHIX == 'true'
     needs:
       - validate
       - preflight
@@ -270,9 +270,19 @@ jobs:
 
   github-release:
     name: Complete GitHub release
-    if: needs.validate.outputs.publish == 'true'
+    if: >-
+      always() &&
+      needs.validate.outputs.publish == 'true' &&
+      needs.preflight.result == 'success' &&
+      needs.rust-artifacts.result == 'success' &&
+      needs.nix-build.result == 'success' &&
+      (needs.publish-crate.result == 'success' || needs.publish-crate.result == 'skipped') &&
+      (needs.publish-cachix.result == 'success' || needs.publish-cachix.result == 'skipped')
     needs:
       - validate
+      - preflight
+      - rust-artifacts
+      - nix-build
       - publish-crate
       - publish-cachix
     runs-on: ubuntu-24.04
